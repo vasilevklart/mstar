@@ -51,9 +51,11 @@ class Glm52MLAAttention(MLAAttention):
         config: Glm52ModelConfig,
         comm_group: CommGroup | None = None,
         layer_idx: int | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__(config, comm_group, layer_idx, kv_key=KV_RESOURCE,
-                         attn_key=ATTN_RESOURCE, pos_key=POS_RESOURCE)
+                         attn_key=ATTN_RESOURCE, pos_key=POS_RESOURCE,
+                         reduce_results=reduce_results)
         # DSA indexer only on FULL layers — SHARED layers carry no indexer
         # weights in the checkpoint (they reuse the last FULL selection),
         # and a dormant module would sit uninitialized after ``to_empty``.
@@ -113,6 +115,9 @@ class Glm52MLAAttention(MLAAttention):
         # selected k/v rows is semantically identical; -1 excluded).
         mask = dsa_selection_to_mask(dsa_selection, q.shape[0], dtype=q.dtype, device=q.device)
         return masked_reference_attention(q, k, v, mask)
+
+    def _selects(self, dsa_selection=None) -> bool:
+        return self._dsa is not None
 
     def _select(self, hidden_states, q_c, position_ids, dsa_selection=None):
         # None-guarded here (not just inside _dsa_select) so the default

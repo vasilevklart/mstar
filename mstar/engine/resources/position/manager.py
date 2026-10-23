@@ -458,6 +458,13 @@ class RopeManager(PositionManager):
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
 
+    @property
+    def cos_sin_table(self) -> torch.Tensor | None:
+        """The fp32 ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` builds, each row
+        ``rotary_dim / 2`` cosines then as many sines, for a kernel that rotates inside a larger
+        fusion (``mla_prep``); None without ``rope_table_dtype``."""
+        return self._rope_table
+
     def _check_rope_table_args(
         self,
         rotary_dim: int,

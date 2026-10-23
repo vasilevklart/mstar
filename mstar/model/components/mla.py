@@ -2,7 +2,9 @@
 
 ``config`` carries the MLA dims: ``hidden_size``, ``num_attention_heads``, ``q_lora_rank``,
 ``kv_lora_rank``, ``qk_nope_head_dim``, ``qk_rope_head_dim``, ``qk_head_dim``, ``v_head_dim``,
-``padded_head_dim``, ``rms_norm_eps``, ``softmax_scale`` and ``mla_absorb``, the backend:
+``padded_head_dim``, ``rms_norm_eps``, ``softmax_scale`` and ``mla_absorb``, the backend, and
+optionally ``quant``, the checkpoint's ``QuantMethod``, which holds the projections it keeps
+quantized (``kv_b_proj`` is always dequantized, since absorption folds it):
 
 * absorbed: once the weights load, ``kv_b_proj`` folds into the query (``w_kc``) and the output
   (``w_vc``), and the two down projections into one GEMM. Attention runs over the cache's compressed
@@ -13,6 +15,10 @@ The decoupled RoPE is the position resource's (``pos_key``; the model's ``Positi
 its layout and table), at the positions the caller passes. A model's sparse
 attention plugs in by overriding ``_select`` and ``_attend_selected`` (absorbed) or ``_attend_naive``
 (naive); the keyword arguments ``forward`` takes beyond its own reach them unchanged.
+
+On CUDA the absorbed path runs the latent norms, both RoPEs and the cache write as two kernels
+(``mla_prep``, the same bits) wherever its widths qualify (DeepSeek-V3's, Kimi K2's and GLM-5.x's
+do).
 """
 from __future__ import annotations
 
@@ -24,7 +30,16 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
+from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, fp8_block_linear
 from mstar.model.components.norm import RMSNorm
+
+
+def _fused_prep_supported(q_lora_rank: int, kv_lora_rank: int, rope_dim: int) -> bool:
+    try:
+        from mstar.utils import mla_prep
+    except ImportError:  # no triton: the op-by-op prep serves
+        return False
+    return mla_prep.supports(q_lora_rank, kv_lora_rank, rope_dim)
 
 
 class MLAAttention(nn.Module):
@@ -37,7 +52,10 @@ class MLAAttention(nn.Module):
         kv_key: str,
         attn_key: str,
         pos_key: str,
+        reduce_results: bool = True,
     ) -> None:
+        """``reduce_results=False``: ``o_proj`` returns this rank's partial, for the caller to
+        reduce (with its residual add and norm)."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -58,21 +76,31 @@ class MLAAttention(nn.Module):
         self.padded_head_dim = config.padded_head_dim
         h = self.total_num_heads
 
-        self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        quant = getattr(config, "quant", None)
+        quant = quant if quant is not None and quant.keeps_quantized("linear") else None
+        self.quant = quant
+        kv_a_out = config.kv_lora_rank + config.qk_rope_head_dim
+        if quant is None:
+            self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+            self.q_b_proj = ColumnParallelLinear(
+                comm_group, config.q_lora_rank, h * self.qk_head_dim, bias=False)
+            self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, kv_a_out, bias=False)
+            self.o_proj = RowParallelLinear(
+                comm_group, h * config.v_head_dim, config.hidden_size,
+                bias=False, input_is_parallel=True, reduce_results=reduce_results)
+        else:
+            self.q_a_proj = quant.linear(config.hidden_size, config.q_lora_rank)
+            self.q_b_proj = quant.linear(
+                config.q_lora_rank, h * self.qk_head_dim, comm_group, shard=COLUMN)
+            self.kv_a_proj_with_mqa = quant.linear(config.hidden_size, kv_a_out)
+            self.o_proj = quant.linear(
+                h * config.v_head_dim, config.hidden_size, comm_group, shard=ROW,
+                reduce_results=reduce_results)
         self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.q_b_proj = ColumnParallelLinear(
-            comm_group, config.q_lora_rank, h * self.qk_head_dim, bias=False)
-
-        self.kv_a_proj_with_mqa = nn.Linear(
-            config.hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
         self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             comm_group, config.kv_lora_rank,
             h * (config.qk_nope_head_dim + config.v_head_dim), bias=False)
-
-        self.o_proj = RowParallelLinear(
-            comm_group, h * config.v_head_dim, config.hidden_size,
-            bias=False, input_is_parallel=True, reduce_results=True)
 
         self.layer_idx = layer_idx
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
@@ -81,10 +109,13 @@ class MLAAttention(nn.Module):
         self.softmax_scale_boost = math.sqrt(self.padded_head_dim) * self.softmax_scale
 
         self.mla_absorb = config.mla_absorb
+        self.mla_fused_prep = self.mla_absorb and _fused_prep_supported(
+            config.q_lora_rank, config.kv_lora_rank, self.qk_rope_head_dim)
         if self.mla_absorb:
             self.register_buffer("w_kc", None, persistent=False)  # (H_local, Dnope, L)
             self.register_buffer("w_vc", None, persistent=False)  # (H_local, Dv,    L)
             self.register_buffer("fused_qkv_a_proj_weight", None, persistent=False)  # (q_lora+L+Drope, hidden)
+            self.register_buffer("fused_qkv_a_proj_scale_inv", None, persistent=False)  # quantized
         # engine-built, bound once at load (bind_resources)
         self._kv_key, self._attn_key, self._pos_key = kv_key, attn_key, pos_key
         self._kv = None
@@ -95,6 +126,8 @@ class MLAAttention(nn.Module):
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
         self._pos = resources[self._pos_key]
+        # the fused prep rotates from the position resource's table (its rope_table_dtype)
+        self.mla_fused_prep = self.mla_fused_prep and getattr(self._pos, "cos_sin_table", None) is not None
 
     def _rope(
         self, position_ids: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor,
@@ -186,7 +219,28 @@ class MLAAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
 
-        fused = F.linear(hidden_states, self.fused_qkv_a_proj_weight)
+        if self.quant is None:
+            fused = F.linear(hidden_states, self.fused_qkv_a_proj_weight)
+        else:
+            fused = fp8_block_linear(
+                hidden_states, self.fused_qkv_a_proj_weight, self.fused_qkv_a_proj_scale_inv,
+                self.quant.block_size, use_reference=self.quant.reference)
+        if (self.mla_fused_prep and not self._selects(**sparse) and fused.is_cuda
+                and fused.dtype == torch.bfloat16):
+            attn_latent = self._fused_prep_and_attend(fused, position_ids)
+        else:
+            attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
+
+        out = torch.einsum("thl,hdl->thd", attn_latent, self.w_vc)
+        return self.o_proj(out.reshape(num_tokens, h * self.v_head_dim))
+
+    def _prep_and_attend(
+        self, fused: torch.Tensor, hidden_states: torch.Tensor, position_ids: torch.Tensor,
+        **sparse,
+    ) -> torch.Tensor:
+        """Norms, RoPE, cache write and attention over the latent, op by op."""
+        num_tokens = hidden_states.shape[0]
+        h = self.num_heads
         q_c, kv_a, k_pe = fused.split(
             [self.q_a_proj.out_features, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         # FlashInfer RMSNorm needs 64-byte input alignment; decode split views can
@@ -213,12 +267,36 @@ class MLAAttention(nn.Module):
         if selection is None:
             # dense: the paged kernel path over every cached row
             latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)
-            attn_latent = self._write_and_attend(q_nope, latent, None, q_pe=q_pe)
-        else:
-            attn_latent = self._attend_selected(selection, q_nope, q_pe, kv_c, k_pe, **sparse)
+            return self._write_and_attend(q_nope, latent, None, q_pe=q_pe)
+        return self._attend_selected(selection, q_nope, q_pe, kv_c, k_pe, **sparse)
 
-        out = torch.einsum("thl,hdl->thd", attn_latent, self.w_vc)
-        return self.o_proj(out.reshape(num_tokens, h * self.v_head_dim))
+    def _fused_prep_and_attend(self, fused: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """``_prep_and_attend`` in two kernels: q_a's norm before q_b, then kv_a's norm, both
+        RoPEs (from the position resource's cos/sin table) and the latent's cache write inside
+        the attention call."""
+        from mstar.utils import mla_prep
+
+        q_c = mla_prep.q_norm(fused, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
+        q = self.q_b_proj(q_c).view(fused.shape[0], self.num_heads, self.qk_head_dim)
+        q_nope = torch.einsum("thd,hdl->thl", q[..., : self.qk_nope_head_dim], self.w_kc)
+        return self._write_fused_and_attend(q_nope, q, fused, position_ids)
+
+    # outside dynamo for the layer index, as _write_and_attend
+    @torch.compiler.disable
+    def _write_fused_and_attend(self, q_nope, q, fused, position_ids):
+        from mstar.utils import mla_prep
+
+        layer = self._kv.layer_view(self.cache_layer_idx)
+        pages, offsets = self._kv.write_slots()
+        q_pe = mla_prep.kv_write_q_rope(
+            fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
+            self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
+        return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe)
+
+    def _selects(self, **sparse) -> bool:
+        """Whether this forward may select rows (the fused prep serves only dense attention)."""
+        del sparse
+        return False
 
     def _select(self, hidden_states, q_c, position_ids, **sparse) -> torch.Tensor | None:
         """The rows each query attends, or None for every cached row (the default)."""
@@ -254,6 +332,12 @@ class MLAAttention(nn.Module):
 
         self.fused_qkv_a_proj_weight = torch.cat(
             [self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight], dim=0).contiguous()
+        if self.quant is not None:
+            # q_a's rows end on a scale block boundary, so kv_a's blocks stack right after
+            assert self.q_a_proj.out_features % self.quant.block_size[0] == 0
+            self.fused_qkv_a_proj_scale_inv = torch.cat(
+                [self.q_a_proj.weight_scale_inv, self.kv_a_proj_with_mqa.weight_scale_inv],
+                dim=0).contiguous()
         self._release_absorbed_sources()
 
     @property
@@ -265,7 +349,11 @@ class MLAAttention(nn.Module):
 
     def _release_absorbed_sources(self) -> None:
         for name in self._ABSORBED_SOURCE_PROJS:
-            param = getattr(self, name).weight
+            proj = getattr(self, name)
+            if isinstance(proj, Fp8Linear):
+                proj.release()
+                continue
+            param = proj.weight
             # keep the Parameter (its weight_loader, dtype, device) and the
             # Linear's in/out_features the forward still reads; drop only the
             # storage — the same ``.data`` rebinding restore_fp32_params uses
