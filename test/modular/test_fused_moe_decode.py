@@ -1,6 +1,6 @@
-"""The shared small-batch fp8 MoE kernels (fused_moe.decode): the per-GPU tables and the
-SwiGLU switch reaching every launch, on any host; on CUDA, the unclamped path at a hidden size
-that is not a power of two vs an fp32 oracle, under each GPU's table."""
+"""The shared small-batch fp8 MoE kernels (fused_moe.decode): the swept tables, picked by
+arch and hidden size, and the SwiGLU switch reaching every launch, on any host; on CUDA, the
+unclamped path at a hidden size that is not a power of two vs an fp32 oracle, under each table."""
 from __future__ import annotations
 
 import sys
@@ -23,7 +23,7 @@ except ModuleNotFoundError:  # the conftest's triton stand-in has no triton.lang
         del sys.modules["triton.language.extra"], sys.modules["triton.language.extra.cuda"]
 
 BLOCK = (128, 128)
-TABLES = ["_H200", "_H100"]
+TABLES = ["_SWEPT_H200_HIDDEN_4096", "_SWEPT_H100_HIDDEN_6144"]
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA + triton")
 
 
@@ -51,7 +51,7 @@ def launches(monkeypatch):
 
 def _use(monkeypatch, table):
     tuning = getattr(decode, table)
-    monkeypatch.setattr(decode, "_tuning", lambda device: tuning)
+    monkeypatch.setattr(decode, "_tuning", lambda device, hidden: tuning)
     return tuning
 
 
@@ -68,17 +68,23 @@ def _host_layer(tokens, hidden=256, inter=256, experts=16, top_k=4):
             torch.stack([torch.randperm(experts)[:top_k] for _ in range(tokens)]))
 
 
-def test_tuning_follows_the_gpu_name(monkeypatch):
+def test_tuning_follows_the_arch_and_hidden_size(monkeypatch):
+    """Keyed by what the platform reports, never the GPU's marketing name: the table swept at
+    the hidden size, else the nearest swept one."""
     pick = decode._tuning.__wrapped__
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H100 80GB HBM3")
-    assert pick(torch.device("cuda", 0)) is decode._H100
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H200")
-    assert pick(torch.device("cuda", 0)) is decode._H200
-    assert pick(torch.device("cpu")) is decode._H200
+    h200, h100 = decode._SWEPT_H200_HIDDEN_4096, decode._SWEPT_H100_HIDDEN_6144
+    cuda = torch.device("cuda", 0)
+    monkeypatch.setattr(decode, "_arch", lambda device: "sm_90" if device.type == "cuda" else None)
+    assert pick(cuda, 6144) is h100 and pick(cuda, 4096) is h200
+    assert pick(cuda, 7168) is h100  # DeepSeek-V3's and Kimi K2's hidden: nearest sweep
+    assert pick(cuda, 2048) is h200
+    assert pick(torch.device("cpu"), 6144) is h100
+    monkeypatch.setattr(decode, "_arch", lambda device: "sm_100")
+    assert pick(cuda, 4096) is h200  # no sweep on this arch: the nearest hidden on any
 
 
 def test_tile_tables():
-    h200, h100 = decode._H200, decode._H100
+    h200, h100 = decode._SWEPT_H200_HIDDEN_4096, decode._SWEPT_H100_HIDDEN_6144
     assert decode._tiles(3, h200) == (dict(bj=8, bk=1024, bjs=32, bks=256, warps=4),
                                       dict(bn=32, bc=128, warps=4))
     assert decode._tiles(2, h200)[1] == dict(bn=32, bc=256, warps=8)
@@ -90,12 +96,12 @@ def test_tile_tables():
 
 
 def test_router_split_cuts_hidden_into_whole_steps():
-    assert decode._router_split(4096, decode._H200) == (16, 256)
-    assert decode._router_split(6144, decode._H200) == (12, 256)
-    assert decode._router_split(6144, decode._H100) == (12, 128)
-    assert decode._router_split(4096, decode._H100) == (8, 128)
-    assert decode._router_split(384, decode._H200) == (3, 128)
-    for table in (decode._H200, decode._H100):
+    assert decode._router_split(4096, decode._SWEPT_H200_HIDDEN_4096) == (16, 256)
+    assert decode._router_split(6144, decode._SWEPT_H200_HIDDEN_4096) == (12, 256)
+    assert decode._router_split(6144, decode._SWEPT_H100_HIDDEN_6144) == (12, 128)
+    assert decode._router_split(4096, decode._SWEPT_H100_HIDDEN_6144) == (8, 128)
+    assert decode._router_split(384, decode._SWEPT_H200_HIDDEN_4096) == (3, 128)
+    for table in (decode._SWEPT_H200_HIDDEN_4096, decode._SWEPT_H100_HIDDEN_6144):
         for hidden in (6144, 4096, 512, 384, 128):
             splits, bk = decode._router_split(hidden, table)
             assert hidden % (splits * bk) == 0
@@ -311,7 +317,7 @@ def test_router_at_hidden_6144(layer, table, tokens, monkeypatch, fp32_matmul):
 @pytest.mark.parametrize("tokens", [8, 16])
 def test_grouped_path_at_tp1_expert_width(tokens, monkeypatch, fp32_matmul):
     # one rank holding a whole expert (I = 2048): the down loop must not stage every block
-    tuning = _use(monkeypatch, "_H100")
+    tuning = _use(monkeypatch, "_SWEPT_H100_HIDDEN_6144")
     gen = torch.Generator(device="cuda").manual_seed(1)
     E, H, I = 8, 1024, 2048
 

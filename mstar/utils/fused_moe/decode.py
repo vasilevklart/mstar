@@ -1,7 +1,7 @@
 """Small-batch path of a block-fp8 MoE with a bf16 shared expert: a sigmoid top-k router,
 then the routed and shared experts, where the grouped-GEMM runner would mostly multiply padding.
 
-Up to a per-GPU token count (``_Tuning.pair_max_tokens``) gate/up and down are GEMV kernels
+Up to a swept token count (``_Tuning.pair_max_tokens``) gate/up and down are GEMV kernels
 over (token, expert) pairs; above it experts repeat across the batch, and grouped kernels read
 each expert's weights once. ``swiglu_limit`` picks the clamped SwiGLU or the plain one.
 """
@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
+from mstar.platforms import current_platform
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,15 +33,16 @@ class _Tuning:
     router: dict
 
 
-# Tiles from sweeps on each GPU: the H200 at hidden 4096, the H100 at hidden 6144.
-_H200 = _Tuning(
+# Tiles from two sweeps: on an H200 at hidden 4096 (GLM-5.3's shapes) and on an H100 at hidden
+# 6144 (GLM-5.2's). Both are sm_90, so `_tuning` picks by the hidden size, not the GPU.
+_SWEPT_H200_HIDDEN_4096 = _Tuning(
     pair_max_tokens=10,
     gate_up=((3, dict(bj=8, bk=1024, bjs=32, bks=256, warps=4)),
              (None, dict(bj=16, bk=256, bjs=16, bks=128, warps=4))),
     down=((2, dict(bn=32, bc=256, warps=8)), (None, dict(bn=32, bc=128, warps=4))),
     router=dict(bk=256, splits=16, warps=2),
 )
-_H100 = _Tuning(
+_SWEPT_H100_HIDDEN_6144 = _Tuning(
     pair_max_tokens=7,
     gate_up=((1, dict(bj=8, bk=512, bjs=32, bks=256, warps=2)),
              (3, dict(bj=8, bk=1024, bjs=32, bks=256, warps=4)),
@@ -49,12 +52,27 @@ _H100 = _Tuning(
 )
 
 
+# (arch, hidden) -> the swept tiles. Sweep a model's shapes on its GPU with
+# `benchmark/fp8_kernels/sweep_tiles.py moe-decode` and add the row.
+_TABLES = {
+    ("sm_90", 4096): _SWEPT_H200_HIDDEN_4096,
+    ("sm_90", 6144): _SWEPT_H100_HIDDEN_6144,
+}
+
+
 @functools.cache
-def _tuning(device: torch.device) -> _Tuning:
-    """The H100 table on an H100, the H200 one everywhere else."""
-    if device.type == "cuda" and "H100" in torch.cuda.get_device_name(device):
-        return _H100
-    return _H200
+def _arch(device: torch.device) -> str | None:
+    return current_platform.arch(device) if device.type == "cuda" else None
+
+
+@functools.cache
+def _tuning(device: torch.device, hidden: int) -> _Tuning:
+    """The table swept at ``hidden`` on this arch; else the one swept nearest to it on any arch."""
+    arch = _arch(device)
+    if (arch, hidden) in _TABLES:
+        return _TABLES[(arch, hidden)]
+    same_arch = [key for key in _TABLES if key[0] == arch] or list(_TABLES)
+    return _TABLES[min(same_arch, key=lambda key: (abs(key[1] - hidden), key[1]))]
 
 
 @triton.jit
@@ -635,7 +653,7 @@ def route(x, w, bias, *, top_k, scale, normalize):
     T, H = x.shape
     _check_router_tokens(T)
     assert x.is_contiguous() and w.is_contiguous()
-    tuning = _tuning(x.device)
+    tuning = _tuning(x.device, x.shape[1])
     part = torch.empty(_router_split(H, tuning)[0], T, w.shape[0], dtype=torch.float32,
                        device=x.device)
     topk_w = torch.empty(T, top_k, dtype=torch.float32, device=x.device)
@@ -678,7 +696,7 @@ def experts(x, w13, s13, w2, s2, shared_w13, shared_w2, topk_w, topk_ids, *,
     experts per token. ``swiglu_limit`` clamps gate from above and up to +-limit before the
     SwiGLU; None: no clamp. Above ``pair_max_tokens`` tokens ``x`` must be bf16."""
     _check_experts(x, w13, s13, w2, s2, shared_w13, shared_w2, block_size)
-    tuning = _tuning(x.device)
+    tuning = _tuning(x.device, x.shape[1])
     buf = _expert_buffers(x, topk_ids.shape[1], w13.shape[0], w13.shape[1] // 2,
                           tuning.pair_max_tokens)
     if x.shape[0]:
@@ -702,7 +720,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     assert gate_w.is_contiguous()
     T, H = x.shape
     _check_router_tokens(T)
-    tuning = _tuning(x.device)
+    tuning = _tuning(x.device, x.shape[1])
     part = torch.empty(_router_split(H, tuning)[0], T, gate_w.shape[0], dtype=torch.float32,
                        device=x.device)
     topk_w = torch.empty(T, top_k, dtype=torch.float32, device=x.device)
@@ -710,7 +728,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     buf = _expert_buffers(x, top_k, w13.shape[0], w13.shape[1] // 2, tuning.pair_max_tokens,
                           out)
     if T:
-        pdl = torch.cuda.get_device_capability(x.device)[0] >= 9
+        pdl = current_platform.has_cuda_capability(9, device=x.device)
         _launch_router(x, gate_w, bias, part, topk_w, topk_ids, scale, normalize, pdl, tuning)
         _launch_experts(x, topk_ids, topk_w, w13, s13, w2, s2, shared_w13, shared_w2, buf,
                         block_size, swiglu_limit, pdl, tuning)
