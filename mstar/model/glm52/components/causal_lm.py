@@ -19,6 +19,7 @@ class Glm52LanguageModel(nn.Module):
         self, config: Glm52ModelConfig, comm_group: CommGroup | None = None
     ) -> None:
         super().__init__()
+        self.comm_group = comm_group or CommGroup.trivial()
         self.embed_tokens = build_embedding(config, comm_group=comm_group)
         self.layers = nn.ModuleList(
             [
@@ -35,11 +36,13 @@ class Glm52LanguageModel(nn.Module):
     ) -> torch.Tensor:
         """Layer order IS the IndexShare order under dsa_long_context: each FULL
         layer's pick is the one the SHARED layers after it reuse, until the next
-        FULL layer (the DSA resource keeps it for the forward)."""
-        hidden_states = self.embed_tokens(input_ids)
+        FULL layer (the DSA resource keeps it for the forward). Each layer hands the next its
+        (FFN partial, residual); the final norm reduces the last one."""
+        hidden_states, residual = self.embed_tokens(input_ids), None
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, position_ids)
-        return self.norm(hidden_states)
+            hidden_states, residual = decoder_layer(hidden_states, position_ids, residual)
+        normed, _ = self.norm.forward_residual(hidden_states, residual, self.comm_group)
+        return normed
 
 
 class Glm52ForCausalLM(nn.Module):
@@ -69,11 +72,7 @@ class Glm52ForCausalLM(nn.Module):
         load_indexer = self.config.dsa_long_context
         loaded = load_glm52_hf_weights(
             self, weights, self.config.n_routed_experts,
-            quant_config=self.config.quantization_config,
-            fp8_experts=(
-                self.config.quantization_config is not None
-                and self.config.moe_fp8_resident
-            ),
+            quant=self.config.quant,
             num_hidden_layers=self.config.num_hidden_layers,
             load_indexer=load_indexer,
         )

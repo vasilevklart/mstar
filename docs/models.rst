@@ -59,7 +59,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        RVQ codec; user speech in, agent text and 22.05 kHz speech out.
    * - ``glm52``
      - ``zai-org/GLM-5.2-FP8``
-     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
+     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, TP8. Its fp8 block-scale weights stay
+       fp8 through the shared ``Fp8BlockQuant`` method and its kernels.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.

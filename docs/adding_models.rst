@@ -1211,6 +1211,60 @@ is built with a ``comm_group`` and ``tp_world_size > 1``, the loader slices the 
 tensor along that parameter's shard dimension before copying it. For this reason, one
 ``load_weights`` path serves both single-GPU runs and tensor-parallel runs without change.
 
+Quantized checkpoints
+~~~~~~~~~~~~~~~~~~~~~
+
+A quantized checkpoint names its format in ``config.json``'s ``quantization_config``.
+``quant_method_for(quantization_config)`` in ``mstar/model/components/quantization.py``
+returns the matching ``QuantMethod``, or None for a bf16 checkpoint. A format no method
+serves is refused at load. Put the method on your config (for example as a ``quant``
+property) and build every layer that holds checkpoint weights from it, rather than adding a
+per-kernel switch to the model:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Method call
+     - What the layer gets
+   * - ``keeps_quantized(role)``
+     - Whether a role's weights stay quantized: ``"linear"`` (attention projections and
+       dense MLPs), ``"routed_experts"``, ``"shared_expert"``. The rest load dequantized.
+   * - ``linear(in, out, comm_group, shard=REPLICATED|COLUMN|ROW, merged=1,
+       reduce_results=False)``
+     - A tensor-parallel linear over this rank's quantized shard, loading its scales.
+   * - ``gated_mlp(hidden, intermediate, comm_group, reduce_results=True)``
+     - A SwiGLU MLP over quantized gate/up and down weights.
+   * - ``routed_experts(num_experts, intermediate, hidden, comm_group)``
+     - The routed experts' quantized weights. Their ``forward(x, topk_weights,
+       topk_ids)`` returns this rank's unreduced partial, through kernels the method
+       resolves on the real device.
+   * - ``checkpoint_stream(weights, keep)``
+     - The checkpoint's tensors, with each weight ``keep`` rejects dequantized. Your
+       loader maps checkpoint names to roles for ``keep``.
+
+The shared components already do this. ``MLAAttention`` reads ``config.quant`` for its
+projections (``kv_b_proj`` always loads dequantized, since absorption folds it).
+``SharedExpertMoE`` (``components/shared_expert_moe.py``) is DeepSeek-V3's block: a
+noaux_tc router, routed experts and an ungated shared expert. GLM-5.x, Kimi K2 and
+DeepSeek V3.x share it, and it takes its experts from the method.
+
+``Fp8BlockQuant`` serves DeepSeek-V3's fp8 format: e4m3 weights with one fp32 scale per
+128 x 128 block. It keeps linears and routed experts fp8, and loads the shared expert as
+bf16, because the small-batch MoE kernels fuse it into the routed launch. Its kernels pick
+launch tiles from sweeps keyed by ``(arch, shape)``; a shape with no sweep takes a
+heuristic. ``benchmark/fp8_kernels/sweep_tiles.py`` sweeps a new model's shapes on its GPU.
+
+The deployment's one switch is ``model_kwargs.quant_kernels``:
+
+* ``auto`` (the default): the fastest path the device runs.
+* ``fused``: the fused kernels, or an error at load.
+* ``reference``: every quantized weight is dequantized per call, eager. This gives a bf16
+  copy's numerics, for parity checks.
+
+A new format (INT4, NVFP4, per-channel fp8) is a sibling ``QuantMethod`` subclass, chosen in
+``quant_method_for``.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs

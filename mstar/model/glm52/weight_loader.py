@@ -11,10 +11,9 @@ import torch
 from torch import nn
 
 from mstar.model.loader.base import StackedParamRule
-from mstar.utils.fp8_block import dequant_fp8_block_stream
 
 if TYPE_CHECKING:
-    from mstar.utils.fp8_block import Fp8BlockQuantConfig
+    from mstar.model.components.quantization import QuantMethod
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +27,29 @@ _EXPERT_BASE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)$")
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.")
 
+# The linears a quant method keeping "linear" holds quantized (checkpoint names). kv_b_proj is
+# not one: the absorbed MLA folds it into bf16 w_kc / w_vc.
+_LINEAR_BASE_RE = re.compile(
+    r"\.(self_attn\.(q_a_proj|kv_a_proj_with_mqa|q_b_proj|o_proj)"
+    r"|mlp\.(gate_proj|up_proj|down_proj))$"
+)
+_SHARED_EXPERT_BASE_RE = re.compile(r"\.mlp\.shared_experts\.(gate_proj|up_proj|down_proj)$")
+
 
 def _is_routed_expert_base(base: str) -> bool:
     return _EXPERT_BASE_RE.search(base) is not None
+
+
+def quantized_role(base: str) -> str | None:
+    """The quant-method role of a checkpoint weight (its name without ``.weight``), or None
+    for one that always loads dequantized."""
+    if _is_routed_expert_base(base):
+        return "routed_experts"
+    if _SHARED_EXPERT_BASE_RE.search(base) is not None:
+        return "shared_expert"
+    if _LINEAR_BASE_RE.search(base) is not None:
+        return "linear"
+    return None
 
 
 def glm52_name_remapper(name: str) -> str | None:
@@ -144,12 +163,13 @@ def build_glm52_read_plan(
 
     if load_indexer is None:
         load_indexer = bool(config.dsa_long_context)
-    fp8_experts = config.quantization_config is not None and config.moe_fp8_resident
+    quant = config.quant
+    fp8_experts = quant is not None and quant.keeps_quantized("routed_experts")
     shard_inter = config.moe_intermediate_size // tp_size
     keys: set[str] = set()
     specs: dict[str, tuple[int, int, int]] = {}
     if fp8_experts:
-        bo, bi = config.quantization_config.weight_block_size
+        bo, bi = quant.block_size
         assert shard_inter % bo == 0 and shard_inter % bi == 0, (
             f"per-rank intermediate {shard_inter} must be a multiple of the "
             f"scale block ({bo}, {bi}) for sliced reads"
@@ -191,21 +211,22 @@ def load_glm52_hf_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
     n_routed_experts: int,
-    quant_config: "Fp8BlockQuantConfig | None" = None,
-    fp8_experts: bool = False,
+    quant: "QuantMethod | None" = None,
     num_hidden_layers: int = 78,
     load_indexer: bool = True,
 ) -> set[str]:
     from mstar.model.loader import load_hf_weights
 
     weights = skip_phase_b_keys(weights, num_hidden_layers, load_indexer=load_indexer)
-    if quant_config is not None:
-        keep = _is_routed_expert_base if fp8_experts else None
-        weights = dequant_fp8_block_stream(weights, quant_config, keep_fp8=keep)
-    elif fp8_experts:
-        raise ValueError("fp8_experts=True requires a quant_config")
+    if quant is not None:
+        def keep(base: str) -> bool:
+            role = quantized_role(base)
+            return role is not None and quant.keeps_quantized(role)
+
+        weights = quant.checkpoint_stream(weights, keep)
     else:
         weights = _refuse_fp8(weights)
+    fp8_experts = quant is not None and quant.keeps_quantized("routed_experts")
 
     restore_fp32_params(module)
     return load_hf_weights(

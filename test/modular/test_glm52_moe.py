@@ -1,7 +1,7 @@
-"""GLM-5.2 MoE block: the noaux_tc router, fp8-resident expert dispatch vs
-the bf16 reference, the post-load dtype guards, the fused-allreduce path,
-and the end-to-end reduced fp8 load (whose checkpoint fabricator the
-indexer / MTP / read-plan suites reuse).
+"""GLM-5.2's MoE block (``SharedExpertMoE``): the noaux_tc router, fp8-resident expert
+dispatch vs the bf16 reference, kernel resolution, the post-load dtype guards, and the
+end-to-end reduced fp8 load (whose checkpoint fabricator the indexer / read-plan / quant
+suites reuse).
 """
 import importlib.util
 import sys
@@ -36,10 +36,15 @@ def _cpu_flashinfer_without_the_real_one(monkeypatch):
 
 
 from mstar.model.components.moe import NoAuxTcRouter  # noqa: E402
+from mstar.model.components.quantization import (  # noqa: E402
+    QUANT_KERNELS,
+    Fp8BlockExperts,
+    Fp8BlockQuant,
+)
+from mstar.model.components.shared_expert_moe import SharedExpertMoE  # noqa: E402
 from mstar.model.glm52._testing import fake_quantize_fp8_block  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.components.indexer import is_full_indexer_layer  # noqa: E402
-from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
 from mstar.model.glm52.weight_loader import (  # noqa: E402
     load_glm52_hf_weights,
@@ -132,9 +137,10 @@ def test_fp8_resident_dispatch_matches_bf16_dispatch():
     torch.manual_seed(1)
     cfg8 = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     cfg = Glm52ModelConfig.reduced()
-    block8 = Glm52SparseMoeBlock(cfg8)
-    block = Glm52SparseMoeBlock(cfg)
-    assert block8.fp8_experts and not block.fp8_experts
+    block8 = SharedExpertMoE(cfg8)
+    block = SharedExpertMoE(cfg)
+    assert isinstance(block8.experts, Fp8BlockExperts)
+    assert not isinstance(block.experts, Fp8BlockExperts)
 
     block8.gate.weight.data.normal_(0, 0.1)
     block8.gate.e_score_correction_bias.data.normal_(0, 0.5)
@@ -171,7 +177,7 @@ def _hf_routed(flat, topk_weights, topk_ids, expert_weights):
 
 
 def _bf16_block(cfg):
-    block = Glm52SparseMoeBlock(cfg)
+    block = SharedExpertMoE(cfg)
     for prm in block.parameters():
         if prm.dtype.is_floating_point:
             prm.data.normal_(0, 0.05)
@@ -192,7 +198,7 @@ def test_bf16_combine_keeps_fp32_routing_weights():
 
     x = (torch.randn(32, cfg.hidden_size) * 0.5).bfloat16()
     for blk in (block, block8):
-        if blk.fp8_experts:
+        if isinstance(blk.experts, Fp8BlockExperts):
             deq = [
                 tuple(
                     dequantize_fp8_block_weight(
@@ -209,7 +215,7 @@ def test_bf16_combine_keeps_fp32_routing_weights():
         topk_weights, topk_ids, _ = blk.gate(x)
         assert topk_weights.dtype == torch.float32
         ref = _hf_routed(x, topk_weights, topk_ids, deq) + blk.shared_expert(x)
-        assert torch.equal(blk(x), ref), f"fp8_experts={blk.fp8_experts}"
+        assert torch.equal(blk(x), ref), type(blk.experts).__name__
 
 
 def test_fused_dispatch_receives_fp32_routing_weights(monkeypatch):
@@ -227,7 +233,7 @@ def test_fused_dispatch_receives_fp32_routing_weights(monkeypatch):
 
     torch.manual_seed(6)
     block8 = _bf16_block(Glm52ModelConfig.reduced_fp8(block=BLOCK))
-    block8._use_fused = True
+    block8.experts.fused = True
     block8(torch.randn(4, block8.hidden_size).bfloat16())
     assert seen["dtype"] == torch.float32
 
@@ -256,74 +262,59 @@ def test_submodule_refuses_post_load_dtype_cast():
     assert moe.experts.gate_up_proj_fp8.dtype == torch.uint8
 
 
-def test_moe_quant_kernel_resolution():
-    """quant_kernel resolution: auto probes the device, an explicit triton ask
-    must not silently downgrade, and reference keeps the host loop."""
+def test_quant_kernels_resolution():
+    """auto probes the device, an explicit fused ask must not silently downgrade, and
+    reference keeps the host loop."""
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-    assert cfg.moe_quant_kernel == "auto"
-
-    block = Glm52SparseMoeBlock(cfg)
-    block.process_weights_after_loading("cpu")
-    assert block._use_fused is False
-
-    cfg_auto = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-    cfg_auto.moe_quant_kernel = "auto"
-    block_auto = Glm52SparseMoeBlock(cfg_auto)
-    block_auto.process_weights_after_loading("cpu")
-    assert block_auto._use_fused is False  # no CUDA here -> reference
-
-    cfg_triton = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-    cfg_triton.moe_quant_kernel = "triton"
-    block_triton = Glm52SparseMoeBlock(cfg_triton)
-    try:
-        block_triton.process_weights_after_loading("cpu")
-        raise AssertionError("explicit triton on CPU must not silently downgrade")
-    except RuntimeError:
-        pass
+    assert cfg.quant_kernels == "auto"
+    for kernels in ("auto", "reference"):
+        cfg.quant_kernels = kernels
+        block = SharedExpertMoE(cfg)
+        block.process_weights_after_loading("cpu")
+        assert block.fused is False  # no CUDA here -> reference
+    cfg.quant_kernels = "fused"
+    block = SharedExpertMoE(cfg)
+    with pytest.raises(RuntimeError, match="quant_kernels='fused'"):
+        block.process_weights_after_loading("cpu")
 
 
 def test_default_dispatch_is_fused_where_the_kernel_runs(monkeypatch):
     """The default resolves to the fused kernel when it can run and to the
     reference loop when it cannot; blocks that never see the load hook stay
     on reference."""
-    import mstar.model.glm52.components.moe as moe_mod
-
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-    assert Glm52SparseMoeBlock(cfg)._use_fused is False
+    assert SharedExpertMoE(cfg).fused is False
     for available in (True, False):
-        monkeypatch.setattr(moe_mod, "fused_fp8_available", lambda dev, block, a=available: a)
-        block = Glm52SparseMoeBlock(cfg)
+        monkeypatch.setattr(Fp8BlockQuant, "fused_available", lambda self, dev, a=available: a)
+        block = SharedExpertMoE(cfg)
         block.process_weights_after_loading("cpu")
-        assert block._use_fused is available
+        assert block.fused is available
 
 
 def test_fused_kernel_needs_its_scale_block():
     cpu, cuda = torch.device("cpu"), torch.device("cuda")
-    from mstar.model.glm52.components.moe import fused_fp8_available
+    assert not Glm52ModelConfig.reduced_fp8(block=(128, 128)).quant.fused_available(cpu)
+    assert not Glm52ModelConfig.reduced_fp8(block=BLOCK).quant.fused_available(cuda)
+    reference = Glm52ModelConfig.reduced_fp8(block=(128, 128))
+    reference.quant_kernels = "reference"
+    assert not reference.quant.fused_available(cuda)
 
-    assert not fused_fp8_available(cpu, (128, 128))
-    assert not fused_fp8_available(cuda, BLOCK)
 
-
-def test_unknown_moe_quant_kernel_is_refused_at_construction():
-    """A typo ("Triton", "fused") used to resolve to the reference loop and
-    serve eager behind a warning; the block refuses it up front."""
-    from mstar.model.glm52.components.moe import MOE_QUANT_KERNELS
-
-    assert MOE_QUANT_KERNELS == ("reference", "triton", "auto")
-    for bad in ("Triton", "fused", ""):
+def test_unknown_quant_kernels_are_refused():
+    """A typo ("Triton", "triton") used to resolve to the reference loop and serve eager
+    behind a warning; the method refuses it up front."""
+    assert QUANT_KERNELS == ("auto", "fused", "reference")
+    for bad in ("Triton", "triton", ""):
         cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-        cfg.moe_quant_kernel = bad
-        try:
-            Glm52SparseMoeBlock(cfg)
-            raise AssertionError(f"moe_quant_kernel={bad!r} must be refused")
-        except ValueError as exc:
-            assert repr(bad) in str(exc) and "reference" in str(exc)
-    # the accepted spellings still construct (resolution is tested above)
-    for ok in MOE_QUANT_KERNELS:
+        cfg.quant_kernels = bad
+        with pytest.raises(ValueError, match="quant_kernels"):
+            SharedExpertMoE(cfg)
+        with pytest.raises(ValueError, match="quant_kernels"):
+            Glm52ModelConfig(quant_kernels=bad)
+    for ok in QUANT_KERNELS:
         cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-        cfg.moe_quant_kernel = ok
-        Glm52SparseMoeBlock(cfg)
+        cfg.quant_kernels = ok
+        SharedExpertMoE(cfg)
 
 
 def test_cuda_graphs_return_with_fused_dispatch():
@@ -338,19 +329,19 @@ def test_cuda_graphs_return_with_fused_dispatch():
     sub.config = cfg
 
     lm = _torch.nn.Module()
-    lm.blk = Glm52SparseMoeBlock(cfg)
+    lm.blk = SharedExpertMoE(cfg)
     # object.__new__ skipped nn.Module.__init__, so bypass its __setattr__.
     object.__setattr__(sub, "language_model", lm)
 
-    lm.blk._use_fused = False
+    lm.blk.experts.fused = False
     assert sub.get_accelerator_graph_configs(_torch.device("cpu")) == []
-    lm.blk._use_fused = True
+    lm.blk.experts.fused = True
     assert len(sub.get_accelerator_graph_configs(_torch.device("cpu"))) == 2
 
 
 def test_autocast_then_restore_keeps_fp8_layout():
     cfg8 = Glm52ModelConfig.reduced_fp8(block=BLOCK)
-    block8 = Glm52SparseMoeBlock(cfg8)
+    block8 = SharedExpertMoE(cfg8)
     bytes_before = block8.experts.gate_up_proj_fp8.data.clone()
 
     block8.to(torch.bfloat16)  # the submodule-load autocast
@@ -473,26 +464,25 @@ def test_load_end_to_end_reduced_fp8():
     state, refs = _fabricate_checkpoint(cfg)
 
     loaded = load_glm52_hf_weights(
-        model, iter(state), cfg.n_routed_experts,
-        quant_config=cfg.quantization_config, fp8_experts=True,
+        model, iter(state), cfg.n_routed_experts, quant=cfg.quant,
         num_hidden_layers=cfg.num_hidden_layers,
     )
 
     # Completeness both ways: every model param got a tensor, nothing extra.
     assert loaded == set(dict(model.named_parameters()))
 
-    # Dense fp8 modules dequantize exactly (the bf16 -> fp32 copy is lossless).
+    # The quant method keeps the linears fp8: exact bytes.
     q_a = model.model.layers[0].self_attn.q_a_proj.weight
-    _, _, deq = refs["model.layers.0.self_attn.q_a_proj"]
-    assert torch.equal(q_a.data, deq.to(q_a.dtype))
+    w8, _, _ = refs["model.layers.0.self_attn.q_a_proj"]
+    assert torch.equal(q_a.data, w8.view(torch.uint8))
 
     # Dense-layer MLP landed in the fused gate_up param.
     mlp0 = model.model.layers[0].mlp
     inter = cfg.intermediate_size
-    _, _, gate_deq = refs["model.layers.0.mlp.gate_proj"]
-    _, _, up_deq = refs["model.layers.0.mlp.up_proj"]
-    assert torch.equal(mlp0.gate_up_proj.weight.data[:inter], gate_deq.float())
-    assert torch.equal(mlp0.gate_up_proj.weight.data[inter:], up_deq.float())
+    g8, _, _ = refs["model.layers.0.mlp.gate_proj"]
+    u8, _, _ = refs["model.layers.0.mlp.up_proj"]
+    assert torch.equal(mlp0.gate_up_proj.weight.data[:inter], g8.view(torch.uint8))
+    assert torch.equal(mlp0.gate_up_proj.weight.data[inter:], u8.view(torch.uint8))
 
     # Routed experts are fp8-resident: exact bytes and fp32 scales.
     moe = model.model.layers[1].mlp

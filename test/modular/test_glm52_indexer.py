@@ -241,8 +241,7 @@ def test_load_indexer_keys_land_dequantized_on_full_layer():
     # stream, this load would raise "unpaired".
     loaded = load_glm52_hf_weights(
         model, iter(state), cfg.n_routed_experts,
-        quant_config=cfg.quantization_config, fp8_experts=True,
-        num_hidden_layers=cfg.num_hidden_layers,
+        quant=cfg.quant, num_hidden_layers=cfg.num_hidden_layers,
     )
 
     # Completeness both ways still holds with the indexer params included.
@@ -278,8 +277,7 @@ def test_load_indexer_flag_off_skips_indexer_keys():
 
     loaded = load_glm52_hf_weights(
         model, iter(state), cfg.n_routed_experts,
-        quant_config=cfg.quantization_config, fp8_experts=True,
-        num_hidden_layers=cfg.num_hidden_layers, load_indexer=False,
+        quant=cfg.quant, num_hidden_layers=cfg.num_hidden_layers, load_indexer=False,
     )
 
     params = set(dict(model.named_parameters()))

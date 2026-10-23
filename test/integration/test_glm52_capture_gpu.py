@@ -20,6 +20,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.model.components.quantization import Fp8BlockExperts
 from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
 from mstar.model.submodule_base import ModelInputsFromEngine
@@ -32,10 +33,10 @@ DEVICE = torch.device("cuda:0")
 DTYPE = torch.bfloat16
 NODE = "LLM"
 KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 64, "page_size": 16}}}
-PROMPTS = {"a": list(range(3, 12)), "b": list(range(40, 45))}
-# W8A8 numerics follow the padded shape, so the fp8 arm's prompts fill the
-# prefill bucket and eager and replay run the same shapes
-BUCKET_PROMPTS = {"a": list(range(3, 19)), "b": list(range(40, 56))}
+# The prompts fill the prefill bucket, so eager and replay run the same shapes: W8A8 numerics
+# follow the padded shape, and so do the bf16 arm's at q_lora_rank 256 (with 9- and 5-token
+# prompts its eager and replayed streams part at the fourth token, fused MLA prep or not).
+PROMPTS = {"a": list(range(3, 19)), "b": list(range(40, 56))}
 MAX_TOKENS = 12
 # the scale block fused_experts_fp8 compiles for
 FP8_BLOCK = (128, 128)
@@ -43,16 +44,17 @@ FP8_BLOCK = (128, 128)
 
 def _latent_cfg(fp8: bool) -> Glm52ModelConfig:
     """The reduced model at the real latent shape: absorbed MLA with
-    kv_lora_rank 512 / rope 64, which FlashInfer's MLA kernel serves. The
-    fp8 variant's experts are one scale block wide, so the fused kernel
-    takes them."""
+    kv_lora_rank 512 / rope 64, which FlashInfer's MLA kernel serves, and
+    q_lora_rank 256, which the fused MLA prep takes and on which the fp8 q_a
+    rows end on a scale block. The fp8 variant's experts are one scale block
+    wide, so the fused kernel takes them."""
     if fp8:
         base = dataclasses.replace(
             Glm52ModelConfig.reduced_fp8(block=FP8_BLOCK), moe_intermediate_size=FP8_BLOCK[0])
     else:
         base = Glm52ModelConfig.reduced()
     cfg = dataclasses.replace(
-        base, mla_absorb=True, kv_lora_rank=512, qk_rope_head_dim=64,
+        base, mla_absorb=True, kv_lora_rank=512, qk_rope_head_dim=64, q_lora_rank=256,
         prefill_token_buckets=[16], prefill_capture_batch_sizes=[1],
     )
     assert flashinfer_mla_supports(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
@@ -75,7 +77,7 @@ def _load(tmp_path, monkeypatch, fp8: bool, **model_kwargs):
         model_path_hf="", config_variant="reduced_fp8" if fp8 else "reduced",
         checkpoint_path=str(tmp_path), tokenizer_mode="byte", **model_kwargs,
     )
-    cfg = dataclasses.replace(_latent_cfg(fp8), moe_quant_kernel=model.config.moe_quant_kernel)
+    cfg = dataclasses.replace(_latent_cfg(fp8), quant_kernels=model.config.quant_kernels)
     model.config = cfg
     ref = _build_reference(dataclasses.replace(cfg, quantization_config=None))
     if fp8:
@@ -230,9 +232,9 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
     assert model.config.kv_lora_rank == 512 and model.config.mla_absorb
     if fp8:
         moe = submodule.language_model.model.layers[1].mlp
-        assert moe.fp8_experts and moe._use_fused
+        assert isinstance(moe.experts, Fp8BlockExperts) and moe.fused
 
-    prompts = BUCKET_PROMPTS if fp8 else PROMPTS
+    prompts = PROMPTS
     eager = _Node(model, submodule, capture=False, prompts=prompts)
     eager_streams = eager.generate()
     eager.close()
@@ -248,3 +250,33 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
         assert len(stream) == MAX_TOKENS, (rid, stream)
         assert len(set(stream)) > 2, (rid, stream)
         assert captured_streams[rid] == stream, (rid, captured_streams[rid], stream)
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_capture_with_the_fused_mla_prep_matches_the_op_by_op_prep(tmp_path, monkeypatch, fp8):
+    """The fused MLA prep is on wherever its widths qualify (no switch, since it is the same
+    bits): captured streams with it equal the eager ones and those of the op-by-op prep."""
+    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    prompts = PROMPTS
+    streams = {}
+    for fused_prep in (False, True):
+        ckpt = tmp_path / f"fused{int(fused_prep)}"
+        ckpt.mkdir()
+        model, submodule = _load(ckpt, monkeypatch, fp8)
+        layers = submodule.language_model.model.layers
+        assert all(layer.self_attn.mla_fused_prep for layer in layers)
+        for layer in layers:
+            layer.self_attn.mla_fused_prep = fused_prep
+        if fused_prep:
+            eager = _Node(model, submodule, capture=False, prompts=prompts)
+            streams["eager"] = eager.generate()
+            eager.close()
+        node = _Node(model, submodule, capture=True, prompts=prompts)
+        assert node.cg.any_graphs and node.cg.dropped_buckets == []
+        streams[fused_prep] = node.generate()
+        node.close()
+
+    for rid, stream in streams[True].items():
+        assert len(stream) == MAX_TOKENS and len(set(stream)) > 2, (rid, stream)
+        assert stream == streams["eager"][rid], (rid, stream, streams["eager"][rid])
+        assert stream == streams[False][rid], (rid, stream, streams[False][rid])

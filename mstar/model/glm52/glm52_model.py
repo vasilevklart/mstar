@@ -42,6 +42,10 @@ from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
+# Each layer's all-reduce runs fused with the next add + RMSNorm up to this size; larger ones
+# reduce, add and norm apart.
+AR_FUSION_MAX_BYTES = 1 << 20
+
 
 class Glm52Model(Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
@@ -80,8 +84,13 @@ class Glm52Model(Model):
             self.config.dsa_long_context = True
             # Guard + KV sizing move from index_topk to the serving window.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
-        if "moe_quant_kernel" in kwargs:
-            self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
+        if "quant_kernels" in kwargs:
+            from mstar.model.components.quantization import QUANT_KERNELS
+
+            kernels = str(kwargs["quant_kernels"])
+            if kernels not in QUANT_KERNELS:
+                raise ValueError(f"quant_kernels={kernels!r} is not one of {QUANT_KERNELS}")
+            self.config.quant_kernels = kernels
         if "graph_compile" in kwargs:
             self.config.graph_compile = bool(kwargs["graph_compile"])
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
@@ -518,6 +527,12 @@ class Glm52Model(Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
+        if tp_group is not None and tp_group.world_size > 1:
+            # collective over the TP group; every rank builds the LLM here
+            dtype = language_model.model.norm.weight.dtype
+            tp_group.init_allreduce_fusion(
+                self.config.hidden_size, dtype,
+                max_tokens=AR_FUSION_MAX_BYTES // (self.config.hidden_size * dtype.itemsize))
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
         submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
@@ -577,8 +592,6 @@ class Glm52Model(Model):
         )
         if quant is not None:
             logger.info(
-                "Glm52Model: fp8 %s checkpoint (block %s) — dense dequant on "
-                "load, routed experts fp8-resident=%s.",
-                quant.fmt, quant.weight_block_size, self.config.moe_fp8_resident,
-            )
+                "Glm52Model: fp8 %s checkpoint (block %s): linears and routed experts stay fp8 "
+                "(quant_kernels=%s).", quant.fmt, quant.weight_block_size, self.config.quant_kernels)
             self.config.quantization_config = quant

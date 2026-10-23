@@ -130,14 +130,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     def _moe_resolved_fused(self) -> bool:
         """True iff the loaded MoE blocks resolved to the fused fp8 kernel."""
-        from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
+        from mstar.model.components.shared_expert_moe import SharedExpertMoE
 
         lm = getattr(self, "language_model", None)
         if lm is None:
             return False
         for module in lm.modules():
-            if isinstance(module, Glm52SparseMoeBlock):
-                return bool(getattr(module, "_use_fused", False))
+            if isinstance(module, SharedExpertMoE):
+                return module.fused
         return False
 
     def _moe_capture_blocked(self, tp_world_size: int) -> bool:
@@ -146,7 +146,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         """
         fp8_reference = (
             self.config.quantization_config is not None
-            and self.config.moe_fp8_resident
             and not self._moe_resolved_fused()
         )
         naive_tp = self.config.quantization_config is None and tp_world_size > 1
@@ -159,7 +158,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 "decode runs eager, which is far slower. %s",
                 "the reference MoE dispatch is active" if fp8_reference
                 else "naive TP MoE dispatch is active",
-                "moe_quant_kernel 'auto' or 'triton' serves the capturable "
+                "quant_kernels 'auto' or 'fused' serves the capturable "
                 "fused fp8 kernel." if fp8_reference
                 else "Serve the fp8 checkpoint to get the fused kernel.",
             )

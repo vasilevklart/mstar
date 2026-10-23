@@ -127,19 +127,13 @@ class Glm52ModelConfig:
 
     # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales
-    # (`weight_scale_inv`). Populated from config.json by Glm52Model.
+    # (`weight_scale_inv`). Populated from config.json by Glm52Model; it picks the
+    # quant method (`quant`), which holds the linears and routed experts fp8.
     quantization_config: Fp8BlockQuantConfig | None = None
-    # Keep routed experts FP8-resident (uint8 container + block scales);
-    # everything else dequantizes to bf16 on load. Disabling this dequantizes
-    # experts too — fine for reduced tests, but bf16 routed experts alone
-    # outsize a device at TP8 on the real 753B checkpoint.
-    moe_fp8_resident: bool = True
-    # Routed-expert dispatch for the fp8-resident path: "auto" = the fused
-    # W8A8 kernel (fused_experts_fp8, capture-safe) where it can run, else
-    # "reference"; "triton" = the fused kernel or an error; "reference" = the
-    # per-hit-expert dequant loop, the numerics anchor (uncapturable). W8A8
-    # activation quantization is the standard fp8 serving numerics, as in vLLM.
-    moe_quant_kernel: str = "auto"
+    # The quant method's kernels, as for every model (components/quantization.py): "auto",
+    # "fused" (or a load-time error) or "reference" (dequantized per call; the numerics
+    # anchor, eager).
+    quant_kernels: str = "auto"
     # torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False
     # (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that
     # would otherwise fail every capture and serve eager.
@@ -153,7 +147,18 @@ class Glm52ModelConfig:
     cache_latent_dim: int = field(init=False)
 
     def __post_init__(self):
+        from mstar.model.components.quantization import QUANT_KERNELS
+
         self.cache_latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        if self.quant_kernels not in QUANT_KERNELS:
+            raise ValueError(f"quant_kernels={self.quant_kernels!r} is not one of {QUANT_KERNELS}")
+
+    @property
+    def quant(self):
+        """The checkpoint's ``QuantMethod``, or None for a bf16 checkpoint."""
+        from mstar.model.components.quantization import quant_method_for
+
+        return quant_method_for(self.quantization_config, self.quant_kernels)
 
     @property
     def qk_head_dim(self) -> int:
