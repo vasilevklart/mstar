@@ -31,7 +31,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.utils import require_rust_extension
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
-from mstar.utils import cpus, knobs
+from mstar.utils import compile_bundle, cpus, knobs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -241,6 +241,8 @@ class Worker:
         if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
         step_cpus, process_cpus = self._plan_step_cpus(worker_ids, local_worker_devices)
+        if self.device.type == "cuda":
+            compile_bundle.log_startup(f"Worker {worker_id}", self.device.index)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
