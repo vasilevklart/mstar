@@ -2101,6 +2101,10 @@ methods are:
    this worker speculates into reads, nor the loop-back signal. Startup refuses a
    ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
    checked.
+   On a step whose forward set ``check_stop_buffers``, ``check_stop`` gets the request's
+   rows of those buffers under the forward's names, not the outputs ``postprocess``
+   renamed. That is the path the engine falls back to when ``check_stop_batched`` declines
+   or raises.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
