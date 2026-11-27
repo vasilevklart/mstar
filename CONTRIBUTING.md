@@ -8,6 +8,7 @@ need to read a rulebook first.
 - **Bug?** Open a [bug report](https://github.com/mstar-project/mstar/issues/new?template=bug_report.yml).
 - **Idea or feature?** Open a [feature request](https://github.com/mstar-project/mstar/issues/new?template=feature_request.yml).
 - **Want a model supported?** Open a [new model request](https://github.com/mstar-project/mstar/issues/new?template=new_model.yml).
+- **Security problem?** Report it privately, not as an issue: see [SECURITY.md](SECURITY.md).
 
 General questions are welcome too — a plain issue or an email to <atindra@cs.stanford.edu> is fine.
 
