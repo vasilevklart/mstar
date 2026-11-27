@@ -896,6 +896,41 @@ def test_wan22_cfg_parallel_rank_runs_its_branch_and_matches_one_gpu(rows, rank,
     assert group.gathers == (1 if guidance > 1.0 else 0)
 
 
+class _RopeReader(_BranchEcho):
+    """A dit stand-in with the real RoPE tables that records which devices hold one when it runs."""
+
+    def __init__(self):
+        super().__init__()
+        from mstar.model.wan22.components.dit import Wan22RoPE3D
+
+        self.rope = Wan22RoPE3D(attention_head_dim=12, max_seq_len=8)
+        self.devices_at_forward = None
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None):
+        self.devices_at_forward = set(self.rope._tables)
+        return super().forward(hidden_states, timestep, encoder_hidden_states, shard)
+
+
+@pytest.mark.parametrize("guidance", [5.0, 1.0])
+def test_wan22_rope_table_reaches_the_device_before_the_dit_runs(guidance):
+    """#1004: filled inside the compiled forward, the table dict changes between the first and
+    second call and fails a guard, so the whole DiT traces twice. The submodule fills it first."""
+    meta = torch.device("meta")
+    latents, ts = torch.zeros(1, 4, 2, 2, 2, device=meta), torch.zeros(1, 2, device=meta)
+    pos, neg = torch.zeros(1, 8, 16, device=meta), torch.zeros(1, 8, 16, device=meta)
+    dit = _RopeReader()
+    submodule = Wan22DitSubmodule(transformer=dit, config=Wan22Config(compile_dit=False))
+    submodule._noise_prediction(latents, ts, pos, neg, guidance)
+    assert dit.devices_at_forward == {torch.device("cpu"), meta}
+
+
+def test_wan22_noise_prediction_runs_a_dit_without_rope_tables():
+    latents, ts = torch.zeros(1, 4, 2, 2, 2), torch.zeros(1, 2)
+    pos = torch.ones(1, 8, 16)
+    submodule = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False))
+    assert torch.equal(submodule._noise_prediction(latents, ts, pos, -pos, 1.0), torch.ones_like(latents))
+
+
 @pytest.mark.parametrize("cfg_size,ok", [(None, True), (1, True), (2, True), (3, False), (4, False)])
 def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(cfg_size, ok):
     """CFG parallelism splits two branches; a larger dit instance would serve,

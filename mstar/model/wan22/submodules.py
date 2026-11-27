@@ -496,6 +496,12 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         else:
             encoder_hidden_states = text_embeds_pos
         transformer = self.transformer
+        # Copy the RoPE table to this device outside the compiled region: added to the dict
+        # inside it, the changed dict fails a guard on the next call and the whole DiT traces
+        # again (#1004: 31.5 s of a cold first video on an H200, 4.8 s warm).
+        rope = getattr(transformer, "rope", None)
+        if rope is not None:
+            rope.tables(hidden_states.device)
         if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
             transformer = self._eager_forward[1]
         out = transformer(
