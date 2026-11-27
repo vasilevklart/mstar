@@ -92,7 +92,7 @@ def test_other_import_failures_keep_the_generic_advice(monkeypatch, import_error
 
 def test_the_printed_swap_is_the_one_the_install_docs_give(monkeypatch):
     message = _start_error(monkeypatch, _NO_CUDART_12, "13.0")
-    docs = (Path(__file__).resolve().parents[2] / "docs" / "installation.rst").read_text()
+    docs = (Path(__file__).resolve().parents[2] / "docs" / "mintlify" / "installation.mdx").read_text()
     for command in ("uv pip uninstall mooncake-transfer-engine",
                     "uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13"):
         assert command in message and command in docs

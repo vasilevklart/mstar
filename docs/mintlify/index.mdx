@@ -1,38 +1,26 @@
 ---
 title: "M* documentation"
-description: "Serve any-to-any multimodal models with one disaggregated inference engine."
+description: "What M* serves, how a request moves through it, and where to start."
 ---
 
-**M\*** ("M-star") serves models built from structurally distinct components:
-vision encoders, transformer backbones, diffusion and flow heads, audio codecs,
-action generators, and world-model predictors. Their execution paths change with
-the input and the task.
-
-The core abstraction is the **graph walk**. Each model declares its computation as
-a dataflow graph of components, and each request is a walk over that graph. Logical
-graph structure is independent of physical placement: the same model runs on one
-GPU or across multiple GPUs by changing a YAML configuration.
-
-One runtime serves unified multimodal models, omni models, speech language models,
-vision-language-action policies, and world models through a **Python SDK**, an
-**OpenAI-compatible API**, and a native streaming endpoint.
+M\* (M-star) serves composite multimodal models, built from components such as vision encoders, transformer backbones, diffusion heads, audio codecs and action generators, with text, image, audio, video and robot actions in and out. Each model is a dataflow graph of its components, each request is a walk over that graph, and a YAML config places the components on GPUs.
 
 <CardGroup cols={2}>
-  <Card title="Install M*" icon="download" href="/installation">
-    Set up your environment and install the model dependencies.
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Install from source, serve BAGEL and send a first request.
   </Card>
-  <Card title="Run your first request" icon="bolt" href="/quickstart">
-    Start a server and generate text, images, or speech.
+  <Card title="Supported models" icon="table" href="/models">
+    Every model key with its GPUs, extra and endpoints.
   </Card>
-  <Card title="Explore the architecture" icon="diagram-project" href="/architecture">
-    Follow a request through the API server, conductor, workers, and engine.
+  <Card title="Serving" icon="server" href="/serving">
+    Custom configs, GPU placement, API keys and tensor transport.
   </Card>
-  <Card title="Guides and reference" icon="book-open" href="/reference">
-    Find model support, serving configuration, client APIs, and contributor guides.
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Processes, graph walks, state and accelerator graphs.
   </Card>
 </CardGroup>
 
-## From request to result
+## From request to result {#from-request-to-result}
 
 ```mermaid
 flowchart LR
@@ -43,6 +31,4 @@ flowchart LR
     Results --> Client
 ```
 
-The conductor coordinates graph walks across workers. Each worker runs ready
-components through an engine that handles batching, resource management, and
-accelerator graph capture. Learn more in the [architecture guide](/architecture).
+`mstar-server` serves the HTTP routes for the API server, which prepares each request and streams results back. The conductor runs each request's graph walks across the workers. Each worker runs the components placed on its GPU through an engine that batches requests, manages their state and captures accelerator graphs. [Architecture](/architecture) has the details.

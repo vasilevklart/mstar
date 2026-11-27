@@ -1,202 +1,102 @@
-<p align="center">
-  <img src="assets/mstar-logo.svg" alt="M*" width="300">
-</p>
+<p align="center"><img src="assets/mstar-logo.svg" alt="M*" width="300"></p>
 
-<h3 align="center">A universal serving system for composite, any-to-any multimodal models</h3>
+<h3 align="center">A serving system for composite, any-to-any multimodal models</h3>
 
-<p align="center">
-  <em>Models are dataflow graphs &nbsp;·&nbsp; requests are <strong>Walks</strong> &nbsp;·&nbsp; one runtime serves them all</em>
-</p>
+<p align="center"><a href="https://m-star-labs.mintlify.site/quickstart"><b>Quickstart</b></a> &nbsp;·&nbsp; <a href="https://m-star-labs.mintlify.site/models"><b>Models</b></a> &nbsp;·&nbsp; <a href="https://m-star-labs.mintlify.site"><b>Docs</b></a> &nbsp;·&nbsp; <a href="https://m-star.org/"><b>Blog</b></a> &nbsp;·&nbsp; <a href="https://arxiv.org/abs/2606.12688"><b>Paper</b></a></p>
 
-<p align="center">
-  <a href="#quickstart"><b>Quickstart</b></a> &nbsp;·&nbsp;
-  <a href="#supported-models"><b>Models</b></a> &nbsp;·&nbsp;
-  <a href="#how-it-works"><b>How it works</b></a> &nbsp;·&nbsp;
-  <a href="https://m-star.org/mstar/"><b>Docs</b></a> &nbsp;·&nbsp;
-  <a href="https://m-star.org/"><b>Blog</b></a> &nbsp;·&nbsp;
-  <a href="https://arxiv.org/abs/2606.12688"><b>Paper</b></a>
-</p>
+<p align="center"><a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-7b61ff.svg" alt="License: Apache 2.0"></a> <img src="https://img.shields.io/badge/python-3.12-22d3ee.svg" alt="Python 3.12"> <a href="https://m-star-labs.mintlify.site"><img src="https://img.shields.io/badge/docs-online-3b82f6.svg" alt="Docs"></a> <a href="https://arxiv.org/abs/2606.12688"><img src="https://img.shields.io/badge/paper-arXiv-b31b1b.svg" alt="Paper (arXiv)"></a></p>
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-7b61ff.svg" alt="License: Apache 2.0"></a>
-  <img src="https://img.shields.io/badge/python-3.12-22d3ee.svg" alt="Python 3.12">
-  <img src="https://img.shields.io/badge/modalities-text_image_audio_video_action-6a8cff.svg" alt="Modalities">
-  <a href="https://m-star.org/mstar/"><img src="https://img.shields.io/badge/docs-online-3b82f6.svg" alt="Docs"></a>
-  <a href="https://arxiv.org/abs/2606.12688"><img src="https://img.shields.io/badge/paper-arXiv-b31b1b.svg" alt="Paper (arXiv)"></a>
-</p>
-
----
-
-<p align="center">
-  <img src="assets/mstar_headline.png" alt="M* performance across models and modalities — M* matches or beats state-of-the-art inference systems" width="100%">
-</p>
-
-<p align="center">
-  <em>One runtime that matches or beats state-of-the-art inference systems. Full methodology and current numbers in the <a href="https://m-star.org/">blog post</a> and <a href="https://arxiv.org/abs/2606.12688">paper</a>.</em>
-</p>
-
-## What is M*?
-
-**M\*** (pronounced *"M-star"*) is a serving system for the new generation of **composite multimodal models** — models built from structurally distinct components (vision encoders, transformer backbones, diffusion and flow heads, audio codecs, action generators, world-model predictors) whose execution path changes with the input and the task.
-
-LLM serving stacks assume inference is a single autoregressive loop. Composite models broke that assumption. M\*'s core idea is the **Walk Graph**: a model is a dataflow graph of its components, and every request is a *Walk* over that graph. A single runtime serves unified multimodal models, omni models, speech LMs, vision-language-action policies, and world models — at or above the performance of engines specialized for each.
-
-**Fast** — per-component fast paths, matched to each component's bottleneck:
-- Paged attention (FlashInfer) and continuous batching for autoregressive backbones
-- CUDA-graph capture for encoders and decode
-- Classifier-free-guidance parallelism for diffusion / flow
-- Tensor parallelism and Ulysses sequence parallelism, composable as a TP × SP mesh per component
-- Sliding-window chunk streaming for audio codecs
-- Component-level disaggregation with pluggable tensor transport (shared memory, TCP, RDMA)
-
-**Flexible** — the abstraction mirrors the model:
-- One small Python file per model declares its component graph and its Walks
-- A YAML file maps components to GPUs at per-component, per-walk granularity — arbitrary disaggregation, no code changes
-- Text, image, audio, video, and robot actions, in and out
-- A **Python SDK**, an **OpenAI-compatible API**, and a native streaming endpoint
-
-> **Roadmap.** M\* is evolving toward *many-model, agentic* multimodal serving — routing requests across many models and tools within one graph-scheduled runtime.
+**M\*** (M-star) serves composite multimodal models, built from components such as vision encoders, transformer backbones, diffusion heads, audio codecs and action generators, with text, image, audio, video and robot actions in and out. Each model is a dataflow graph of its components, each request is a walk over that graph, and a YAML config places the components on GPUs.
 
 ## Quickstart
 
+You need Linux, an NVIDIA GPU, Python 3.12, [uv](https://docs.astral.sh/uv/), [rustup](https://rustup.rs) and a C/C++ compiler.
+
 ```bash
+git clone https://github.com/mstar-project/mstar.git
+cd mstar
 uv venv --python 3.12 --seed
 source .venv/bin/activate
-uv pip install --torch-backend=auto "mstar-ai[all]"   # install M* from PyPI
-mstar serve bagel          # one command — launch a server (default: http://localhost:8000)
+uv pip install --torch-backend=auto -e ".[bagel]"
+
+# Rust graph runtime and HTTP frontend (needs rustup)
+uv pip install maturin
+maturin develop --release -m rust/Cargo.toml
+cargo build --release --manifest-path rust/server/Cargo.toml
+
+mstar serve bagel
 ```
 
-The PyPI package is `mstar-ai` (`mstar-project` and `mstar-serve` install the same thing); the import package
-and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`,
-then build the [Rust extension and HTTP frontend](#rust-extension).
-Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/installation.rst`).
+The first start downloads the weights and compiles the model before the server listens, which can take minutes. In a second terminal with the same `.venv` active:
 
-To enable flash-attn support (recommended for BAGEL),
 ```bash
-# torch 2.10 built for CUDA 13.x (cu13); on a cu12 torch, build from source (docs/installation.rst)
-uv pip install \
-  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+curl http://localhost:8000/health
 ```
-
-Other models: `mstar serve flux2_klein` · `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve kokoro` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
-
-**Python SDK** — works for every model (text, image, audio, video):
 
 ```python
 from mstar import MStarClient
+
 client = MStarClient("http://localhost:8000")
-
-client.chat("What is the capital of France?").text          # text
-client.generate_image("a cat in a hat")                     # → PNG bytes   (FLUX.2 klein, BAGEL, Cosmos3)
-client.edit_image("make it a watercolor", "cat.png")        # → PNG bytes   (FLUX.2 klein, BAGEL)
-client.tts("Hello there", voice="tara").to_wav("out.wav")   # → speech      (Orpheus)
-
-for event in client.chat("Tell me a story", stream=True):   # streaming
-    print(getattr(event, "text", ""), end="", flush=True)
+print(client.chat("What is the capital of France?").text)
 ```
 
-**OpenAI-compatible API** — drop-in for `bagel`, `cosmos3`, `qwen3_omni`, `orpheus`, and `kokoro`:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
-
-client.chat.completions.create(model="bagel", messages=[{"role": "user", "content": "hi"}])
-client.audio.speech.create(model="orpheus", input="hi", voice="tara")   # text-to-speech
-client.images.generate(model="bagel", prompt="a cat")                   # image generation
-```
-
-Runnable scripts and `curl` examples live in [`examples/`](examples/). Power users can launch any
-deployment with an explicit config: `mstar-serve --config configs/<model>.yaml`.
-
-_Note_: The **first request(s) on a fresh environment can be slow** — often tens of seconds to a few minutes. mstar ``torch.compile``s the model on first use, and that compilation happens lazily on the first request that exercises each path.
+- Another model: install its extra and run `mstar serve <key>`. The [model matrix](https://m-star-labs.mintlify.site/models) gives each key's GPUs and extra.
+- Your own layout: `mstar serve <model> --config <path>`. See [Serving](https://m-star-labs.mintlify.site/serving).
+- PyPI has `mstar-ai` 0.2.1, which has neither the Rust runtime nor `mstar-server` and knows 14 of the 61 model keys. Install from source until the next release.
+- [Installation](https://m-star-labs.mintlify.site/installation) covers extras, CUDA matching, Docker and troubleshooting. Runnable scripts are in [`examples/`](examples/).
 
 ## Supported models
 
-| Model | Family | Input → Output | Endpoints |
-|-------|--------|----------------|-----------|
-| [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
-| [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
-| [Qwen3.5 0.8B–27B](https://huggingface.co/Qwen/Qwen3.5-4B) / [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Vision-language model | text, image → text (hybrid gated-DeltaNet attention) | `/v1/chat/completions`, `/generate` |
-| [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) *(Beta)* | Vision-language model | text, image → text (sliding-window and NoPE attention layers 3:1) | `/v1/chat/completions`, `/generate` |
-| [Nemotron VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B) *(Beta)* | Full-duplex speech LM | speech → text, speech (streamed) | `/generate` |
-| [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
-| [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) | Speech LM | text, reference audio → speech (streamed; weights under the Fish Audio Research License, non-commercial use only) | `/v1/audio/speech` |
-| [Qwen3-TTS 0.6B / 1.7B](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | Speech LM | text (+ voice instruction or reference audio) → speech (streamed; CustomVoice, VoiceDesign and Base variants) | `/v1/audio/speech` |
-| [Chatterbox / Multilingual / Turbo](https://huggingface.co/ResembleAI/chatterbox) | Speech LM | text, reference audio → speech (voice cloning; 23 languages in Multilingual) | `/v1/audio/speech` |
-| [OmniVoice](https://huggingface.co/k2-fsa/OmniVoice) | Masked-diffusion TTS | text, reference audio → speech (multilingual voice cloning) | `/v1/audio/speech` |
-| [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | TTS | text → speech (54 voices, sentence-streamed) | `/v1/audio/speech` |
-| [Whisper large-v3](https://huggingface.co/openai/whisper-large-v3) *(Beta)* | ASR | speech → text | `/v1/audio/transcriptions` |
-| [Higgs Audio v3 STT](https://huggingface.co/bosonai/higgs-audio-v3-stt) *(Beta)* | ASR | speech → text | `/v1/audio/transcriptions` |
-| [Omnilingual ASR CTC 300M–7B](https://huggingface.co/facebook/omniASR-CTC-300M) | ASR | speech → text (1,600+ languages) | `/v1/audio/transcriptions` |
-| [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
-| [Cosmos3 Policy DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | Robot policy | text, image, video → robot actions, video | `/generate`, `/v1/images/generations`, `/v1/videos/generations` |
-| [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) | 480p world model + VLM | text, image, video → image, video (streamed windows), robot actions, text | `/v1/chat/completions`, `/v1/images/generations`, `/v1/videos/generations`, `/generate`, `/generate/ws` |
-| [Pi0.5](https://huggingface.co/lerobot/pi05_base) | Vision-language-action | text, image, state → robot actions | `/generate` |
-| [V-JEPA 2 / 2-AC](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | World model | video (+ actions) → latents, rollouts | `/generate` |
-| [Waypoint-1.5](https://huggingface.co/Overworld/Waypoint-1.5-1B) | Interactive world model | controller input (mouse, buttons, scroll) → live video frames | `/generate` |
-| [LingBot-World-V2 1.3B](https://huggingface.co/robbyant/lingbot-world-v2-1.3b-causal-fast) | Interactive world model | text, image, camera trajectory → video (streamed chunks; weights CC-BY-NC-SA-4.0) | `/generate` |
-| [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | Video diffusion | text, image → video | `/v1/videos/generations`, `/generate` |
-| [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) *(Beta)* | Audio-video diffusion | text → video + stereo audio (8-step distilled; gated, LTX-2.x Community License) | `/v1/videos/generations`, `/generate` |
-| [FLUX.2 klein 4B / 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image diffusion | text, image → image (4-step distilled, editing; 4B Apache-2.0, 9B under the FLUX Non-Commercial License) | `/v1/images/generations`, `/v1/images/edits` |
-| [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image diffusion | text → image (8-step distilled) | `/v1/images/generations` |
+Every key serves the native `/generate` and `/generate/ws` endpoints and the Python SDK. The Endpoints column lists its OpenAI-compatible routes.
 
-Every model is reachable through the SDK and the native `/generate` endpoint; the OpenAI-compatible
-routes cover the chat, speech, transcription, image, and video models. Registry keys, configs and
-per-model notes are in [docs/models.rst](https://m-star.org/mstar/models.html).
+| Model | In → Out | Key | Endpoints |
+|---|---|---|---|
+| [Qwen3.5, Qwen3.8](https://m-star-labs.mintlify.site/models/qwen) | text, image, video → text | `qwen3_5_0.8b` `qwen3_5_2b` `qwen3_5_4b` `qwen3_5_9b` `qwen3_5_27b` `qwen3_8_27b` | `/v1/chat/completions` |
+| [GLM-5.2, GLM-5.3-Flash](https://m-star-labs.mintlify.site/models/glm) | text → text | `glm52` `glm5_next` | `/v1/chat/completions` |
+| [Command A+](https://m-star-labs.mintlify.site/models/command-a-plus) (experimental) | text, image → text | `command_a_plus` | native only |
+| [Muse Glimmer 30B](https://m-star-labs.mintlify.site/models/muse-glimmer) (beta) | text, image → text | `muse_glimmer` | `/v1/chat/completions` |
+| [Ripple-65B](https://m-star-labs.mintlify.site/models/ripple) (experimental) | text → text | `ripple_65b` | `/v1/chat/completions` |
+| [Phi-4-multimodal](https://m-star-labs.mintlify.site/models/phi4mm) (beta) | text, image, audio → text | `phi4mm` | `/v1/chat/completions` |
+| [Qwen3-Omni](https://m-star-labs.mintlify.site/models/qwen3-omni) | text, image, audio, video → text, speech | `qwen3_omni` | `/v1/chat/completions` `/v1/audio/speech` |
+| [MiniCPM-o 4.5](https://m-star-labs.mintlify.site/models/minicpm-o) (beta) | text, image, audio → text, speech | `minicpm_o` | native only |
+| [BAGEL](https://m-star-labs.mintlify.site/models/bagel) | text, image → text, image | `bagel` `bagel_cfg_parallel` | `/v1/chat/completions` `/v1/images/generations` `/v1/images/edits` |
+| [Kokoro-82M](https://m-star-labs.mintlify.site/models/kokoro) | text → speech | `kokoro` | `/v1/audio/speech` |
+| [Orpheus](https://m-star-labs.mintlify.site/models/orpheus) | text → speech | `orpheus` | `/v1/audio/speech` |
+| [Chatterbox](https://m-star-labs.mintlify.site/models/chatterbox) | text, reference audio → speech | `chatterbox` `chatterbox_multilingual` `chatterbox_turbo` | `/v1/audio/speech` |
+| [Fun-CosyVoice3](https://m-star-labs.mintlify.site/models/cosyvoice3) | text, reference audio → speech | `cosyvoice3` | `/v1/audio/speech` |
+| [Qwen3-TTS](https://m-star-labs.mintlify.site/models/qwen3-tts) | text, voice instruction or reference audio → speech | `qwen3_tts` `qwen3_tts_1p7b` `qwen3_tts_voicedesign` `qwen3_tts_base` | `/v1/audio/speech` |
+| [Fish Audio S2-Pro](https://m-star-labs.mintlify.site/models/fish-s2-pro) | text, reference audio → speech | `fish_s2_pro` | `/v1/audio/speech` |
+| [VoxCPM2](https://m-star-labs.mintlify.site/models/voxcpm2) | text, reference audio → speech | `voxcpm2` | `/v1/audio/speech` |
+| [OmniVoice](https://m-star-labs.mintlify.site/models/omnivoice) | text, reference audio → speech | `omnivoice` | `/v1/audio/speech` |
+| [NemotronLabs VoiceChat](https://m-star-labs.mintlify.site/models/nemotron-voicechat) (beta) | speech → text, speech (full duplex) | `nemotron_duplex` | `/v1/realtime` |
+| [Whisper, Qwen3-ASR](https://m-star-labs.mintlify.site/models/whisper-qwen-asr) | speech → text | `whisper_large` `whisper_large_v3_turbo` `qwen3_asr` `qwen3_asr_realtime` | `/v1/audio/transcriptions`, and `/v1/realtime` for Qwen3-ASR |
+| [Canary, Parakeet, Nemotron ASR](https://m-star-labs.mintlify.site/models/fastconformer-asr) | speech → text | `canary` `canary_qwen` `parakeet` `nemotron_asr` | `/v1/audio/transcriptions` |
+| [Omnilingual ASR](https://m-star-labs.mintlify.site/models/omnilingual-asr) | speech → text | `omnilingual_asr_ctc_300m` `omnilingual_asr_ctc_1b` `omnilingual_asr_ctc_3b` `omnilingual_asr_ctc_7b` | `/v1/audio/transcriptions` |
+| [Higgs Audio v3 STT](https://m-star-labs.mintlify.site/models/higgs-audio) (beta) | speech → text | `higgs_audio` | `/v1/audio/transcriptions` |
+| [FLUX.2 klein, Z-Image-Turbo](https://m-star-labs.mintlify.site/models/flux-z-image) | text, image → image | `flux2_klein` `flux2_klein_9b` `z_image_turbo` | `/v1/images/generations`, and `/v1/images/edits` for FLUX.2 klein |
+| [Cosmos3](https://m-star-labs.mintlify.site/models/cosmos3) | text, image, video → image, video, robot actions | `cosmos3` `cosmos3_droid` `cosmos3_edge` `cosmos3_edge_droid` `cosmos3_super` `cosmos3_super_i2v_4step` `cosmos3_super_t2i_4step` | `/v1/images/generations` `/v1/videos/generations`, and `/v1/chat/completions` for Edge |
+| [Wan2.2-TI2V-5B](https://m-star-labs.mintlify.site/models/wan22) | text, image → video | `wan22` | `/v1/videos/generations` |
+| [LTX-2.5](https://m-star-labs.mintlify.site/models/ltx2-5) (beta) | text → video with audio | `ltx2_5` | `/v1/videos/generations` |
+| [MiniMax-H3](https://m-star-labs.mintlify.site/models/minimax-h3) (beta) | text, image → video with audio | `minimax_h3` | `/v1/videos/generations` |
+| [Waypoint-1.5, LingBot-World](https://m-star-labs.mintlify.site/models/world-models) | text, image, controller input or camera path → video | `waypoint` `lingbot_world_1_3b` | native only |
+| [V-JEPA 2, V-JEPA 2-AC](https://m-star-labs.mintlify.site/models/world-models) | video, actions → latents, rollouts | `vjepa2` `vjepa2_ac` | native only |
+| [Pi0.5](https://m-star-labs.mintlify.site/models/world-models) | text, images, robot state → robot actions | `pi05` | native only; openpi WebSocket with `pi05_droid.yaml` |
+
+Hardware: M\* runs on Linux with NVIDIA GPUs. BAGEL also runs on Intel GPUs (XPU), and AMD Instinct support is partial. [Supported hardware](https://m-star-labs.mintlify.site/hardware) lists what is tested on each platform.
 
 ## How it works
 
-```
-HTTP / SDK  →  API Server  →  Conductor  →  Workers (one per GPU)  →  streaming results
-                                  │              │
-                          walks the graph,   own subgraphs; route tensors
-                          schedules walks    directly to one another
-```
-
-A model declares a **computation graph** of components and a set of named **Walks** (e.g.
-`prefill`, `decode`, `image_gen`). The **Conductor** turns each request into a walk over that graph
-and schedules it; **Workers** each own a subgraph on their GPU and stream tensors directly to one
-another. Logical graph structure is decoupled from physical placement, so the same model runs
-single-GPU or fully disaggregated by changing only the YAML `node_groups`. Four composable
-primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
-`StreamingGraphEdge` — express every model family above. See the [paper](https://arxiv.org/abs/2606.12688) for the full design.
-
-### Rust extension
-
-Serving needs the `mstar_rust` extension (vendored in [`rust/`](rust/)): the graph runtime is
-Rust, and every process sends its control messages on the extension's ZeroMQ transport. Each
-process logs it at startup (`control mesh transport: rust <version> from <path>`).
-From a checkout, build it with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
-`mstar serve` serves HTTP from the `mstar-server` binary ([`rust/server/`](rust/server/)); from a checkout, build it too:
-`cargo build --release --manifest-path rust/server/Cargo.toml`.
-The Linux wheels of `mstar-ai` on PyPI carry both, the extension with libzmq 4.3.4 statically linked under
-LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).
-See the [installation docs](https://m-star.org/mstar/installation.html) and
-[environment variables](https://m-star.org/mstar/environment_variables.html).
-
-## Performance
-
-Across every model we benchmark, M\* matches or beats the system specialized for that family — unified
-models (BAGEL), omni and speech models (Qwen3-Omni, Orpheus), and world models (Cosmos3, V-JEPA 2) — by executing
-only the components each request needs and giving each its own fast path: paged attention and continuous
-batching for autoregressive backbones, classifier-free-guidance parallelism for diffusion, chunk streaming
-for audio codecs, and persistent-cache loops for world-model rollouts.
-
-Benchmark numbers shift as systems evolve — ours and everyone else's — so rather than freeze figures here
-that go stale, we keep the current results and full methodology in the
-[blog post](https://m-star.org/) and the [paper](https://arxiv.org/abs/2606.12688).
+A model declares a graph of its components and named walks over that graph, such as BAGEL's `prefill_text`, `decode` and `image_gen`.
+The conductor turns each request into walks and schedules them across workers. Each worker runs the nodes placed on its GPU and sends tensors directly to the next worker.
+The config's `node_groups` map nodes to GPU ranks, so the same model runs on one GPU or split across several without code changes.
+`mstar-server`, a Rust binary, serves the HTTP routes, and the graph runtime is the Rust `mstar_rust` extension.
+See [Architecture](https://m-star-labs.mintlify.site/architecture) and the [paper](https://arxiv.org/abs/2606.12688).
 
 ## Contributing
 
-Issues and pull requests are welcome. Found a bug, or want a model or feature supported?
-**[Open an issue](https://github.com/mstar-project/mstar/issues).** To add a model yourself,
-follow the [Adding a New Model](https://m-star.org/mstar/adding_models.html) guide.
-PRs to `main` go through review and CI (`ruff`).
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). To add a model, follow [Adding a model](https://m-star-labs.mintlify.site/adding_models).
 
 ## Citation
-
-If you use M\* in your research, please cite:
 
 ```bibtex
 @article{mstar2026,
@@ -211,14 +111,9 @@ If you use M\* in your research, please cite:
 }
 ```
 
-From Stanford University & the University of Washington. Correspondence: `atindra@cs.stanford.edu`.
+From Stanford University and the University of Washington. Correspondence: `atindra@cs.stanford.edu`.
 
-## Acknowledgments
-
-M\* builds on ideas and proven primitives from the open-source community — paged attention and
-continuous batching ([vLLM](https://github.com/vllm-project/vllm)),
-[FlashInfer](https://github.com/flashinfer-ai/flashinfer) kernels, streaming speech serving
-(VoxServe), and RDMA tensor transport ([Mooncake](https://github.com/kvcache-ai/Mooncake)).
+M\* builds on [vLLM](https://github.com/vllm-project/vllm) (paged attention, continuous batching), [FlashInfer](https://github.com/flashinfer-ai/flashinfer) kernels, VoxServe (streaming speech serving) and [Mooncake](https://github.com/kvcache-ai/Mooncake) (RDMA tensor transport).
 
 ## License
 

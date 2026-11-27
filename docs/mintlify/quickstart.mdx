@@ -1,73 +1,75 @@
 ---
 title: "Quickstart"
-description: "Start a model server and send your first text, image, or speech request."
+description: "Install M* from source, serve BAGEL on one GPU, and send it a first request."
 ---
 
-This page serves a model and sends a first request. If you haven't installed `mstar` yet, see [Installation](/installation).
+You need Linux, one NVIDIA GPU, Python 3.12, [uv](https://docs.astral.sh/uv/), [rustup](https://rustup.rs) and a C/C++ compiler. [Installation](/installation) has the details.
 
-## 1\. Start a server {#start-a-server}
-
-The `mstar` CLI launches a server for a model with a sensible default config:
+## Install and start a server {#start-a-server}
 
 ```bash
+git clone https://github.com/mstar-project/mstar.git
+cd mstar
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+uv pip install --torch-backend=auto -e ".[bagel]"
+
+# Rust graph runtime and HTTP frontend (needs rustup)
+uv pip install maturin
+maturin develop --release -m rust/Cargo.toml
+cargo build --release --manifest-path rust/server/Cargo.toml
+
 mstar serve bagel
 ```
 
-It listens on `http://localhost:8000` by default. Other models:
+Leave it running. The first start downloads `ByteDance-Seed/BAGEL-7B-MoT` from Hugging Face and compiles the model before listening on port 8000.
+
+## Check health {#check-health}
+
+The `✓ mstar serving 'bagel'` line prints when startup begins, not when the server is ready. In a second terminal:
 
 ```bash
-mstar serve bagel_cfg_parallel   # BAGEL with CFG branches split across GPUs (faster image gen)
-mstar serve qwen3_omni           # omni: text/image/audio/video in, text/speech out
-mstar serve orpheus              # text-to-speech
-mstar serve pi05                 # vision-language-action (robotics)
-mstar serve vjepa2               # video world model
+curl http://localhost:8000/health
 ```
 
-Defaults vary by model: most fit on a single GPU, but some ship with multi-GPU layouts — `qwen3_omni` uses 2 GPUs and `bagel_cfg_parallel` uses 3 (the main branch plus the two classifier-free-guidance branches on their own GPUs). Choose GPUs and a port with `--gpus` / `--port`:
+The server is ready when this prints `{"status":"healthy"}`. Until then the connection is refused; errors show in the first terminal.
 
-```bash
-mstar serve qwen3_omni --gpus 0,1 --port 9000
-```
+## Send a request {#send-a-request}
 
-For custom layouts, disaggregation, and tensor parallelism, see [Serving](/serving).
-
-<Note>
-
-The **first request(s) on a fresh environment can be slow** — often tens of seconds to a few minutes. mstar `torch.compile`s the model on first use, and that compilation happens lazily on the first request that exercises each path. Subsequent requests run at full speed, and the compiled artifacts are cached on disk, so later runs and restarts warm up much faster. To avoid paying it on a real request, send a throwaway warmup request right after the server reports ready.
-
-</Note>
-
-## 2\. Send a request {#send-a-request}
-
-**Python SDK** — works for every model and modality. Each line below targets the model that supports it, so run the matching server first:
+In the second terminal, activate the same `.venv`, then run:
 
 ```python
 from mstar import MStarClient
 
 client = MStarClient("http://localhost:8000")
-
-print(client.chat("What is the capital of France?").text)              # text  (BAGEL / Qwen3-Omni)
-open("cat.png", "wb").write(client.generate_image("a cat in a hat"))   # image (BAGEL)
-client.tts("Hello there", voice="tara").to_wav("out.wav")             # speech (Orpheus)
+print(client.chat("What is the capital of France?").text)
 ```
 
-Streaming yields typed chunks (`TextChunk` / `ImageChunk` / `AudioChunk`):
+Stream the answer:
 
 ```python
+from mstar import MStarClient
 from mstar.client import TextChunk
 
+client = MStarClient("http://localhost:8000")
 for event in client.chat("Tell me a short story.", stream=True):
     if isinstance(event, TextChunk):
         print(event.text, end="", flush=True)
+print()
 ```
 
-**curl** — the native `/generate` endpoint works for every model:
+The native `/generate` endpoint takes form fields. `output_modalities` depends on the model: `text` here, `audio` for speech models, `image` for image models.
 
 ```bash
-curl -s http://localhost:8000/generate -F 'text=Hello, how are you?'
+curl -s http://localhost:8000/generate \
+  -F text='What is the capital of France?' -F output_modalities=text -F streaming=false
 ```
 
-**OpenAI-compatible API** — a drop-in client for `bagel`, `qwen3_omni`, and `orpheus`:
+For the OpenAI-compatible routes, install the client:
+
+```bash
+uv pip install openai
+```
 
 ```python
 from openai import OpenAI
@@ -80,10 +82,48 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-Runnable versions of all of these live in the repo's `examples/` directory (`sdk_chat.py`, `sdk_image.py`, `sdk_tts.py`, `openai_chat.py`, `openai_tts.py`, `curl.sh`). For the full client surface, see [Using a Server](/clients).
+[OpenAI coverage](/reference/http-api#openai-coverage) lists the routes each model serves.
 
-## 3\. Check health {#check-health}
+## Serve another model {#another-model}
+
+Install the model's extra, then serve its key:
+
+| Task | Key | GPUs | Extra |
+|---|---|---|---|
+| Text and image chat | `qwen3_5_4b` | 1 | `all` |
+| Omni: text, image, audio and video in; text and speech out | `qwen3_omni` | 2 | `qwen3_omni` |
+| Text to speech | `kokoro` | 1 | `kokoro` |
+| Speech recognition | `whisper_large_v3_turbo` | 1 | `asr` |
+| Image generation | `flux2_klein` | 1 | `flux2_klein` |
+| Video generation | `wan22` | 1 | `wan22` |
+| Robot policy | `pi05` | 1 | `pi05` |
 
 ```bash
-curl http://localhost:8000/health        # -> {"status": "healthy"}
+uv pip install --torch-backend=auto -e ".[kokoro]"
+mstar serve kokoro
 ```
+
+[Supported models](/models#matrix) lists all 61 keys. Some weights are gated on Hugging Face, for example the PaliGemma tokenizer that `pi05` loads and the `ltx2_5` checkpoint. Accept the license on the model page, then `export HF_TOKEN=<your token>` before `mstar serve`.
+
+## GPUs, port and API key {#options}
+
+```bash
+mstar serve qwen3_omni --gpus 0,1 --port 9000
+```
+
+`--gpus` sets `CUDA_VISIBLE_DEVICES` and must expose as many GPUs as the config uses.
+
+By default the server listens on all interfaces (`0.0.0.0`) and accepts requests without a key. To require one:
+
+```bash
+export MSTAR_API_KEY=replace-with-a-secret
+mstar serve bagel
+```
+
+`MStarClient` reads `MSTAR_API_KEY` from the environment; an OpenAI client takes it as `api_key`. `--host 127.0.0.1` keeps the server local. [CLI reference](/reference/cli#serve) lists every flag.
+
+## Startup time {#startup-time}
+
+<Note>
+Before it listens, the server loads the weights, compiles and captures the model, and runs any warmup requests in the config, so a first start can take minutes. Compiled kernels are cached under `~/.cache/mstar` and reused on later starts. `mstar serve bagel -O0` skips compile tuning for the fastest start. See [Cold start](/cold-start).
+</Note>

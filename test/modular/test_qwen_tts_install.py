@@ -68,7 +68,7 @@ def test_a_missing_qwen_tts_names_the_install_command(no_qwen_tts):
 
 
 def test_the_docs_show_the_same_command():
-    assert qwen3_tts_model.QWEN_TTS_INSTALL in (ROOT / "docs" / "installation.rst").read_text()
+    assert qwen3_tts_model.QWEN_TTS_INSTALL in (ROOT / "docs" / "mintlify" / "installation.mdx").read_text()
 
 
 @pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.dynamo-base"])

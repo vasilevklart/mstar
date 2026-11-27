@@ -14,10 +14,14 @@ mstar --help
 ```
 
 `mstar-project` and `mstar-serve` are alias packages (under
-`packaging/aliases/`) that carry no code and just depend on `mstar-ai`, so
-`pip install mstar-project` resolves to the same thing. They mirror mstar-ai's
-extras, so `pip install "mstar-project[all]"` forwards to `mstar-ai[all]`. Keep
-their `[project.optional-dependencies]` in sync when mstar-ai's extras change.
+`packaging/aliases/`) that carry no code and only depend on `mstar-ai`, so
+`pip install mstar-project` resolves to the same thing. They forward 17 of
+mstar-ai's 32 extras, `all` among them, so `pip install "mstar-project[all]"`
+installs `mstar-ai[all]`; an extra they do not list installs the bare engine.
+The docs and every install hint therefore name `mstar-ai`
+(`test/ci/test_install_hints.py` checks that each hint's extras exist on the
+name it uses). When you add an extra to
+mstar-ai, add it to both alias files too.
 PyPI treats `mstar-ai`, `mstar_ai`, `mstar.ai` and `MSTAR-AI` as one name.
 
 ## Default configs
@@ -40,10 +44,10 @@ extension (`rust/`) and the `mstar-server` HTTP frontend binary
 (`rust/server/`, installed into the environment's `bin/`). `setup.py` compiles
 both with setuptools-rust only when `CIBUILDWHEEL=1`; every other build,
 including `pip install -e .`, is pure Python, and a checkout builds the Rust
-parts with maturin and cargo (docs/installation.rst). pip picks the matching
-manylinux wheel and falls back to the pure one elsewhere, which can import
-mstar but cannot serve until the extension and `mstar-server` are built
-(docs/installation.rst).
+parts with maturin and cargo (docs/mintlify/installation.mdx). pip picks the
+matching manylinux wheel and falls back to the pure one elsewhere, which can
+import mstar but cannot serve until the extension and `mstar-server` are built
+(docs/mintlify/installation.mdx). Releases up to 0.2.1 have no Rust wheels.
 
 - **Compiler.** `rust-toolchain.toml` at the repo root pins the Rust version
   for CI, the release wheels and local builds. Bump it there.
@@ -92,6 +96,11 @@ release:
    and uploads them over Trusted Publishing (OIDC, no token stored in the
    repo); the Linux Rust wheels above go up in a job of their own. The `pypi`
    environment asks one of its reviewers to approve each publishing job first.
+4. Update the PyPI note in `README.md` (Quickstart) and in
+   `docs/mintlify/installation.mdx` (`#install-from-pypi`): the version, and
+   what that release lacks. Once a release carries the Rust wheels and every
+   `mstar serve` key, put the PyPI install first on both pages and in
+   `docs/mintlify/quickstart.mdx`.
 
 One-time PyPI setup: each project needs a pending Trusted Publisher (owner
 `mstar-project`, repo `mstar`, workflow `release.yml`, environment `pypi`).
