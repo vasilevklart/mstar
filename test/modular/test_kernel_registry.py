@@ -398,6 +398,34 @@ def test_shipped_tables_are_well_formed(path):
                     assert {"DOT", "BN", "BK", "SPLIT", "STAGES", "num_warps"} <= set(choice.config)
 
 
+# Qwen3.5-27B-FP8's block-fp8 linears at TP1 as fp8_linear keys (N, K, glu), from its config.json: hidden 5120,
+# 24 gated query heads (twice the rows) and 4 kv heads of 256, the delta net's 16 key and 48 value heads of 128,
+# intermediate 17408
+QWEN3_5_27B_TP1 = {
+    "qkv_proj": (2 * 24 * 256 + 2 * 4 * 256, 5120, 0),
+    "in_proj q|k|v|z": (2 * 16 * 128 + 2 * 48 * 128, 5120, 0),
+    "o_proj, out_proj": (5120, 24 * 256, 0),  # out_proj's K is 48 * 128, the same
+    "gate_up": (17408, 5120, 1),
+    "down_proj": (5120, 17408, 0),
+}
+
+
+def test_qwen3_5_27b_fp8_takes_its_h200_rows_at_decode(monkeypatch):
+    """On an H200 each of Qwen3.5-27B-FP8's linears at TP1 has a table entry, so no count from 1 to 32 tokens
+    runs the built-in rule's pick there, w8a16 at its generic tile."""
+    pytest.importorskip("triton")
+    from mstar.utils import dense_fp8
+
+    monkeypatch.setattr(registry, "device_key", lambda device: DeviceKey("NVIDIA H200", "sm_90"))
+    monkeypatch.setitem(dense_fp8._FI_OK, GPU, True)
+    monkeypatch.setitem(dense_fp8._W8A8_OK, GPU, True)
+    builtin = []
+    for name, (n, k, glu) in QWEN3_5_27B_TP1.items():
+        assert dense_fp8._table_rows(GPU, n, k, bool(glu)) is not None, name
+        builtin += [(name, m) for m in range(1, 33) if dense_fp8._choose(GPU, n, k, bool(glu), m) == ("w8a16", None)]
+    assert not builtin, builtin
+
+
 def test_the_moe_decode_sweep_refuses_bf16_experts_and_a_bf16_miss_names_no_sweep(fake_moe_decode_sweep, on_gpu):
     """moe_decode's sweep times the fp8 kernels only, so a bf16 entry is measured end to end: a bf16
     miss names no sweep command to run, and the sweep refuses bf16 rather than write rows for it."""

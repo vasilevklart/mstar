@@ -39,6 +39,143 @@
         "16": {"us": 8.09, "default_us": 9.84, "w8a16_us": 9.84, "flashinfer_us": 8.09, "cublas_us": 12.64},
         "32": {"us": 9.28, "default_us": 10.59, "w8a16_us": 10.59, "flashinfer_us": 9.28, "cublas_us": 12.73}
       }
+    },
+    {
+      "dtype": "float8_e4m3fn",
+      "shape": {"K": 5120, "N": 14336, "glu": 0},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-27", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=14336,K=5120,glu=0", "torch": "2.12.1+cu129", "triton": "3.7.1", "mstar": "8921c2563", "note": "Qwen3.5-27B-FP8 at TP1: the attention qkv_proj"},
+      "rows": {
+        "1": {"impl": "w8a16", "config": {"DOT": false, "BN": 16, "BK": 256, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
+        "128": {"impl": "flashinfer"},
+        "*": {"impl": "cublas"}
+      },
+      "measured": {
+        "1": {"us": 20.93, "default_us": 37.74, "w8a16_us": 20.93, "flashinfer_us": 23.43, "cublas_us": 31.44},
+        "2": {"us": 23.44, "default_us": 55.79, "w8a16_us": 26.38, "flashinfer_us": 23.44, "cublas_us": 31.37},
+        "4": {"us": 23.51, "default_us": 57.58, "w8a16_us": 49.66, "flashinfer_us": 23.51, "cublas_us": 29.39},
+        "8": {"us": 23.73, "default_us": 57.62, "w8a16_us": 33.82, "flashinfer_us": 23.73, "cublas_us": 29.44},
+        "16": {"us": 23.94, "default_us": 57.4, "w8a16_us": 33.12, "flashinfer_us": 23.94, "cublas_us": 29.8},
+        "24": {"us": 23.94, "default_us": 61.03, "w8a16_us": 41.14, "flashinfer_us": 23.94, "cublas_us": 29.75},
+        "32": {"us": 24.72, "default_us": 61.44, "w8a16_us": 37.0, "flashinfer_us": 24.72, "cublas_us": 30.16},
+        "48": {"us": 24.88, "default_us": 24.84, "w8a16_us": 49.99, "flashinfer_us": 24.83, "cublas_us": 29.71},
+        "64": {"us": 25.01, "default_us": 24.94, "w8a16_us": 51.05, "flashinfer_us": 25.16, "cublas_us": 29.75},
+        "128": {"us": 26.91, "default_us": 26.99, "w8a16_us": 192.53, "flashinfer_us": 27.09, "cublas_us": 28.96},
+        "256": {"us": 40.09, "default_us": 41.41, "w8a16_us": 368.02, "flashinfer_us": 41.72, "cublas_us": 40.09},
+        "512": {"us": 74.7, "default_us": 77.18, "w8a16_us": 718.22, "flashinfer_us": 77.34, "cublas_us": 74.7},
+        "1024": {"us": 126.87, "default_us": 126.19, "w8a16_us": 1392.83, "flashinfer_us": 128.4, "cublas_us": 126.74},
+        "2048": {"us": 244.24, "default_us": 245.57, "w8a16_us": 2771.56, "flashinfer_us": 252.33, "cublas_us": 244.67}
+      }
+    },
+    {
+      "dtype": "float8_e4m3fn",
+      "shape": {"K": 5120, "N": 16384, "glu": 0},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-27", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=16384,K=5120,glu=0", "torch": "2.12.1+cu129", "triton": "3.7.1", "mstar": "8921c2563", "note": "Qwen3.5-27B-FP8 at TP1: the delta net's in_proj (its q|k|v|z rows; the gate rows stay bf16)"},
+      "rows": {
+        "1": {"impl": "w8a16", "config": {"DOT": false, "BN": 16, "BK": 256, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
+        "128": {"impl": "flashinfer"},
+        "256": {"impl": "cublas"},
+        "512": {"impl": "flashinfer"},
+        "*": {"impl": "cublas"}
+      },
+      "measured": {
+        "1": {"us": 22.65, "default_us": 41.85, "w8a16_us": 22.65, "flashinfer_us": 25.65, "cublas_us": 37.35},
+        "2": {"us": 25.68, "default_us": 62.79, "w8a16_us": 27.53, "flashinfer_us": 25.68, "cublas_us": 37.51},
+        "4": {"us": 25.71, "default_us": 57.68, "w8a16_us": 51.76, "flashinfer_us": 25.71, "cublas_us": 31.5},
+        "8": {"us": 27.26, "default_us": 57.91, "w8a16_us": 37.48, "flashinfer_us": 27.26, "cublas_us": 37.99},
+        "16": {"us": 26.04, "default_us": 57.62, "w8a16_us": 36.77, "flashinfer_us": 26.04, "cublas_us": 33.32},
+        "24": {"us": 26.07, "default_us": 61.29, "w8a16_us": 42.8, "flashinfer_us": 26.07, "cublas_us": 38.05},
+        "32": {"us": 27.23, "default_us": 61.92, "w8a16_us": 40.18, "flashinfer_us": 27.23, "cublas_us": 36.63},
+        "48": {"us": 27.64, "default_us": 27.61, "w8a16_us": 50.81, "flashinfer_us": 27.45, "cublas_us": 33.65},
+        "64": {"us": 27.85, "default_us": 27.82, "w8a16_us": 51.6, "flashinfer_us": 27.92, "cublas_us": 33.69},
+        "128": {"us": 30.13, "default_us": 30.05, "w8a16_us": 217.67, "flashinfer_us": 30.12, "cublas_us": 31.51},
+        "256": {"us": 41.78, "default_us": 42.75, "w8a16_us": 418.1, "flashinfer_us": 42.87, "cublas_us": 41.78},
+        "512": {"us": 77.05, "default_us": 76.99, "w8a16_us": 817.77, "flashinfer_us": 77.08, "cublas_us": 76.91},
+        "1024": {"us": 142.91, "default_us": 142.25, "w8a16_us": 1594.91, "flashinfer_us": 145.26, "cublas_us": 142.55},
+        "2048": {"us": 276.89, "default_us": 276.9, "w8a16_us": 3146.46, "flashinfer_us": 286.2, "cublas_us": 277.54}
+      }
+    },
+    {
+      "dtype": "float8_e4m3fn",
+      "shape": {"K": 5120, "N": 17408, "glu": 1},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-27", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=17408,K=5120,glu=1", "torch": "2.12.1+cu129", "triton": "3.7.1", "mstar": "8921c2563", "note": "Qwen3.5-27B-FP8 at TP1: gate_up (SwiGLU)"},
+      "rows": {
+        "1": {"impl": "w8a16", "config": {"DOT": false, "BN": 8, "BK": 512, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
+        "2": {"impl": "w8a16", "config": {"DOT": false, "BN": 8, "BK": 256, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
+        "8": {"impl": "flashinfer"},
+        "16": {"impl": "w8a16", "config": {"DOT": true, "BN": 32, "BK": 128, "SPLIT": 4, "STAGES": 3, "num_warps": 4}},
+        "128": {"impl": "flashinfer"},
+        "*": {"impl": "cublas"}
+      },
+      "measured": {
+        "1": {"us": 48.73, "default_us": 71.69, "w8a16_us": 48.73, "flashinfer_us": 68.85, "cublas_us": 85.68},
+        "2": {"us": 63.46, "default_us": 114.06, "w8a16_us": 63.46, "flashinfer_us": 69.79, "cublas_us": 85.45},
+        "4": {"us": 70.27, "default_us": 80.43, "w8a16_us": 80.08, "flashinfer_us": 70.27, "cublas_us": 82.41},
+        "8": {"us": 70.39, "default_us": 80.15, "w8a16_us": 71.42, "flashinfer_us": 70.39, "cublas_us": 83.3},
+        "16": {"us": 70.49, "default_us": 80.31, "w8a16_us": 70.49, "flashinfer_us": 70.86, "cublas_us": 86.03},
+        "24": {"us": 72.52, "default_us": 89.17, "w8a16_us": 83.0, "flashinfer_us": 72.52, "cublas_us": 86.88},
+        "32": {"us": 74.35, "default_us": 89.74, "w8a16_us": 79.74, "flashinfer_us": 74.35, "cublas_us": 85.78},
+        "48": {"us": 69.27, "default_us": 69.02, "w8a16_us": 110.81, "flashinfer_us": 69.26, "cublas_us": 86.58},
+        "64": {"us": 70.09, "default_us": 69.7, "w8a16_us": 112.28, "flashinfer_us": 69.9, "cublas_us": 86.39},
+        "128": {"us": 76.72, "default_us": 77.05, "w8a16_us": 267.63, "flashinfer_us": 76.74, "cublas_us": 89.03},
+        "256": {"us": 114.58, "default_us": 117.35, "w8a16_us": 480.27, "flashinfer_us": 116.91, "cublas_us": 114.58},
+        "512": {"us": 184.07, "default_us": 201.69, "w8a16_us": 902.33, "flashinfer_us": 200.99, "cublas_us": 184.07},
+        "1024": {"us": 320.77, "default_us": 321.38, "w8a16_us": 1776.92, "flashinfer_us": 326.17, "cublas_us": 320.94},
+        "2048": {"us": 612.03, "default_us": 614.71, "w8a16_us": 3685.24, "flashinfer_us": 629.68, "cublas_us": 617.68}
+      }
+    },
+    {
+      "dtype": "float8_e4m3fn",
+      "shape": {"K": 6144, "N": 5120, "glu": 0},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-27", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=5120,K=6144,glu=0", "torch": "2.12.1+cu129", "triton": "3.7.1", "mstar": "8921c2563", "note": "Qwen3.5-27B-FP8 at TP1: the delta net's out_proj and the attention o_proj"},
+      "rows": {
+        "1": {"impl": "w8a16", "config": {"DOT": false, "BN": 8, "BK": 512, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
+        "512": {"impl": "flashinfer"},
+        "*": {"impl": "cublas"}
+      },
+      "measured": {
+        "1": {"us": 10.68, "default_us": 23.6, "w8a16_us": 10.68, "flashinfer_us": 13.97, "cublas_us": 21.28},
+        "2": {"us": 13.91, "default_us": 33.41, "w8a16_us": 15.15, "flashinfer_us": 13.91, "cublas_us": 21.36},
+        "4": {"us": 13.93, "default_us": 37.13, "w8a16_us": 24.93, "flashinfer_us": 13.93, "cublas_us": 18.82},
+        "8": {"us": 13.9, "default_us": 37.03, "w8a16_us": 20.33, "flashinfer_us": 13.9, "cublas_us": 18.96},
+        "16": {"us": 14.08, "default_us": 36.95, "w8a16_us": 19.99, "flashinfer_us": 14.08, "cublas_us": 19.4},
+        "24": {"us": 15.36, "default_us": 39.37, "w8a16_us": 22.59, "flashinfer_us": 15.36, "cublas_us": 19.95},
+        "32": {"us": 18.6, "default_us": 39.76, "w8a16_us": 21.55, "flashinfer_us": 18.6, "cublas_us": 20.23},
+        "48": {"us": 15.13, "default_us": 15.01, "w8a16_us": 27.42, "flashinfer_us": 15.06, "cublas_us": 20.93},
+        "64": {"us": 15.24, "default_us": 15.24, "w8a16_us": 27.39, "flashinfer_us": 15.25, "cublas_us": 21.84},
+        "128": {"us": 17.36, "default_us": 17.5, "w8a16_us": 108.89, "flashinfer_us": 17.45, "cublas_us": 23.69},
+        "256": {"us": 21.26, "default_us": 21.29, "w8a16_us": 169.48, "flashinfer_us": 21.29, "cublas_us": 26.17},
+        "512": {"us": 37.97, "default_us": 37.93, "w8a16_us": 320.46, "flashinfer_us": 37.91, "cublas_us": 44.74},
+        "1024": {"us": 68.07, "default_us": 67.96, "w8a16_us": 619.49, "flashinfer_us": 70.98, "cublas_us": 67.99},
+        "2048": {"us": 113.27, "default_us": 113.37, "w8a16_us": 1190.02, "flashinfer_us": 122.12, "cublas_us": 113.22}
+      }
+    },
+    {
+      "dtype": "float8_e4m3fn",
+      "shape": {"K": 17408, "N": 5120, "glu": 0},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-27", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=5120,K=17408,glu=0", "torch": "2.12.1+cu129", "triton": "3.7.1", "mstar": "8921c2563", "note": "Qwen3.5-27B-FP8 at TP1: down_proj"},
+      "rows": {
+        "1": {"impl": "w8a16", "config": {"DOT": false, "BN": 8, "BK": 512, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
+        "24": {"impl": "flashinfer"},
+        "32": {"impl": "cublas"},
+        "512": {"impl": "flashinfer"},
+        "*": {"impl": "cublas"}
+      },
+      "measured": {
+        "1": {"us": 25.3, "default_us": 65.54, "w8a16_us": 25.3, "flashinfer_us": 30.37, "cublas_us": 40.34},
+        "2": {"us": 30.5, "default_us": 116.32, "w8a16_us": 35.08, "flashinfer_us": 30.5, "cublas_us": 40.49},
+        "4": {"us": 30.95, "default_us": 101.38, "w8a16_us": 57.38, "flashinfer_us": 30.95, "cublas_us": 38.42},
+        "8": {"us": 30.33, "default_us": 100.66, "w8a16_us": 47.37, "flashinfer_us": 30.33, "cublas_us": 38.73},
+        "16": {"us": 31.0, "default_us": 100.27, "w8a16_us": 47.52, "flashinfer_us": 31.0, "cublas_us": 39.27},
+        "24": {"us": 34.26, "default_us": 106.86, "w8a16_us": 51.61, "flashinfer_us": 34.26, "cublas_us": 40.36},
+        "32": {"us": 40.12, "default_us": 108.01, "w8a16_us": 50.44, "flashinfer_us": 46.72, "cublas_us": 40.12},
+        "48": {"us": 35.03, "default_us": 35.11, "w8a16_us": 63.88, "flashinfer_us": 35.04, "cublas_us": 39.83},
+        "64": {"us": 34.99, "default_us": 34.95, "w8a16_us": 62.97, "flashinfer_us": 35.29, "cublas_us": 40.52},
+        "128": {"us": 40.14, "default_us": 40.03, "w8a16_us": 302.12, "flashinfer_us": 39.94, "cublas_us": 42.48},
+        "256": {"us": 54.71, "default_us": 54.64, "w8a16_us": 472.43, "flashinfer_us": 54.81, "cublas_us": 63.27},
+        "512": {"us": 103.63, "default_us": 103.57, "w8a16_us": 896.92, "flashinfer_us": 103.84, "cublas_us": 124.51},
+        "1024": {"us": 174.15, "default_us": 174.09, "w8a16_us": 1745.67, "flashinfer_us": 196.23, "cublas_us": 175.15},
+        "2048": {"us": 304.48, "default_us": 304.43, "w8a16_us": 3418.59, "flashinfer_us": 327.44, "cublas_us": 303.51}
+      }
     }
   ]
 }
