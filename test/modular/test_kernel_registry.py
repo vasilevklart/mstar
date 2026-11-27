@@ -281,6 +281,24 @@ def test_a_moe_gemm_row_launches_the_tiles_it_was_written_from():
     assert kernels._entry_tiles(entry) == ((), ((tuple(up.items()), tuple(down.items())),))
 
 
+@pytest.mark.parametrize("m", [1, 64, 512, 4096])
+def test_the_moe_gemm_sweep_searches_amd_tiles_at_two_stages_and_their_hip_options(m):
+    """On AMD GPUs the tiles run at two stages on one to eight warps, and each tile's HIP variants
+    keep matrix_instr_nonkdim within its row and column blocks. The NVIDIA space is the default."""
+    pytest.importorskip("triton")
+    from benchmark.kernels.moe_gemm import AMD_OPTIONS, amd_variants, candidates
+
+    amd = list(candidates(m, 8, amd=True))
+    assert amd and {c["num_stages"] for c in amd} == {2}
+    assert {c["num_warps"] for c in amd} == {1, 2, 4, 8}
+    assert list(candidates(m, 8)) == list(candidates(m, 8, amd=False))  # off ROCm
+    assert {c["num_warps"] for c in candidates(m, 8, amd=False)} == {4, 8}
+    for cfg in amd[:: max(1, len(amd) // 20)]:
+        variants = list(amd_variants(cfg))
+        assert variants and all(set(AMD_OPTIONS) <= set(v) and v.items() >= cfg.items() for v in variants)
+        assert all(v["matrix_instr_nonkdim"] <= min(cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"]) for v in variants)
+
+
 # --- the sweep end to end, its GPU work faked: what it writes, and what it refuses to ---------
 
 def _won(m, best):
