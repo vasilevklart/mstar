@@ -3,7 +3,7 @@ title: "Supported hardware"
 description: "Which GPUs M* runs on, what was tested, and what changes by GPU generation."
 ---
 
-M* serves on NVIDIA GPUs through CUDA. AMD Instinct support is partial, with no install path yet, and Intel GPUs serve BAGEL only.
+M* serves on NVIDIA GPUs through CUDA. AMD Instinct MI300X and MI325X are an AMD preview for the models listed under [AMD](#amd), and Intel GPUs serve BAGEL only.
 
 ## Platforms {#platforms}
 
@@ -14,11 +14,11 @@ M* serves on NVIDIA GPUs through CUDA. AMD Instinct support is partial, with no 
 | NVIDIA Blackwell Ultra | B300 | `sm_103` | Tested | [From source](/installation#install-from-source) |
 | NVIDIA Blackwell workstation | GeForce RTX 50 series, RTX PRO Blackwell | `sm_120` | Untested | [From source](/installation#install-from-source) |
 | NVIDIA Ampere and Ada | A100, L40S | `sm_80`, `sm_89` | Untested | [From source](/installation#install-from-source) |
-| AMD Instinct | MI300X | `gfx942` | Partial | Not documented yet |
+| AMD Instinct | MI300X, MI325X | `gfx942` | Preview | [AMD GPUs (ROCm)](/installation#rocm) |
 | Intel GPUs (XPU) | | | BAGEL only | [Docker](/installation#docker) |
 | CPU only | | | Not supported | |
 
-Tested means the repo holds a record of runs on that GPU: noise-floor rows in `benchmark/eval/e2e/calibration.yaml` (H200, B200), a tuned kernel table under `mstar/kernels/tables/` (H100, H200, GB200, B300), or a config whose comments size it for that GPU. It does not mean every model ran on it. Untested GPUs may work; for `sm_120` the repo records only Wan2.2's VAE decode memory fit, measured on an RTX 5090. A CPU-only machine runs the CPU test suite, not models.
+Tested means the repo holds a record of runs on that GPU: noise-floor rows in `benchmark/eval/e2e/calibration.yaml` (H200, B200), a tuned kernel table under `mstar/kernels/tables/` (H100, H200, GB200, B300), or a config whose comments size it for that GPU. It does not mean every model ran on it. Untested GPUs may work; for `sm_120` the repo records only Wan2.2's VAE decode memory fit, measured on an RTX 5090. A CPU-only machine runs the CPU test suite, not models. Preview means the install and the model list are documented for that GPU, and CI does not run on it.
 
 ## NVIDIA {#nvidia}
 
@@ -42,15 +42,66 @@ Kernel tables in `mstar/kernels/tables/` pick tuned kernels per GPU model, or pe
 
 ## AMD {#amd}
 
-AMD Instinct GPUs run through PyTorch's ROCm build. Support is partial:
+AMD preview. M\* runs on AMD Instinct MI300X and MI325X (`gfx942`) through PyTorch's ROCm build, with the same model code and configs as on NVIDIA. Other AMD GPUs are not supported. The install is in [AMD GPUs (ROCm)](/installation#rocm).
 
-- M* detects ROCm and reports the GPU's `gfx` architecture (see [Check your machine](#check-your-machine)).
-- The `dense` attention backend runs AITER's varlen kernel when the `aiter` package is installed.
-- The default attention backend (`auto`) resolves to FlashInfer on every platform, and FlashInfer is not built for ROCm, so a config that keeps the default has no paged attention kernel there.
-- Configs with `mps: true`, which most `_split` configs and `minicpm_o.yaml` set to share one GPU between workers, are refused off NVIDIA.
-- Workers send tensors through files instead of the shared-memory arena.
+### Models in the preview {#amd-models}
 
-No ROCm install path is documented yet.
+| Model keys | On AMD GPUs |
+|---|---|
+| `qwen3_5_0.8b`, `qwen3_5_2b`, `qwen3_5_4b`, `qwen3_5_9b` | Text and image input. Prefix caching is off, because AITER's gated DeltaNet kernels keep no state checkpoints. |
+| `qwen3_tts`, `qwen3_tts_1p7b`, `qwen3_tts_voicedesign` | Speech from text. |
+| `qwen3_omni` | Text and image input, text and speech output. |
+| `flux2_klein`, `z_image_turbo` | Images from text, and FLUX.2 klein's edits. |
+
+Other keys are not part of the preview. Not in it yet:
+
+- Audio and video input, so the speech recognition models, `qwen3_tts_base` and audio or video requests to the models above. Media decoding goes through torchcodec, which has no ROCm build.
+- AITER's fused MoE kernels. MoE layers run M\*'s Triton kernels.
+- The fused TP all-reduce and RMSNorm on AITER. AITER's release wheels round to bf16 by truncation on `gfx942` and fail the server's startup check, so TP runs RCCL and then a separate norm.
+- Speculative decoding.
+- MI355X (`gfx950`).
+- Configs with `mps: true`, which most `_split` configs and `minicpm_o.yaml` set to share one GPU between workers. They are refused off NVIDIA.
+
+### Kernels {#amd-kernels}
+
+Each engine resource picks its kernels when the server builds it. A resource whose `backend` is `auto`, the default, runs these:
+
+| Resource | NVIDIA | AMD (ROCm) |
+|---|---|---|
+| Paged attention | FlashInfer | AITER's unified attention. Sliding-window pools, and non-causal steps with more than one query per row (DiT denoise), run on AMD's FlashInfer build (`fa2`). |
+| Cross-attention | FlashInfer | AITER's unified attention |
+| Ragged attention (encoder towers) | FlashInfer, or the kernel the `ragged_attention` table picks | AITER's `flash_attn_varlen_func`, or AMD's FlashInfer without AITER |
+| Dense attention (`backend: dense`) | FlashAttention-3 (`fa3-fwd`) | AITER's `flash_attn_varlen_func` |
+| Gated DeltaNet (Qwen3.5) | FlashInfer | AITER, with FlyDSL for decode |
+| RMSNorm, fused add and RMSNorm, RoPE, sampling | FlashInfer | AMD's FlashInfer build |
+| TP all-reduce, add and RMSNorm | FlashInfer's fused all-reduce | RCCL, then a separate norm |
+| MoE routed experts | M\*'s Triton kernels and tuned tables | The same Triton kernels, with tables for MI300X and MI325X |
+
+A backend named in the config is used as named, and one that cannot run on the platform stops the server at startup. When neither AITER nor AMD's FlashInfer imports, the worker stops at startup and names what to install.
+
+Paged attention needs AMD's FlashInfer build at a power-of-two page size of 64 or less, where AITER's kernel reads past a row's last token without masking it. The default page size is 128.
+
+Accelerator graphs capture as on NVIDIA. AITER's chunked GDN prefill cannot be captured, so Qwen3.5's prefill buckets up to `linear_attn.max_captured_prefill_tokens` (512 by default) capture a sequential kernel, and larger ones run eagerly. Set it under the config's `resources:` block:
+
+```yaml
+resources:
+  linear_attn:
+    max_captured_prefill_tokens: 256
+```
+
+`MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1` counts those eager buckets as failed captures.
+
+### Picking GPUs {#amd-gpus}
+
+HIP reads `HIP_VISIBLE_DEVICES` before `CUDA_VISIBLE_DEVICES`. On ROCm, `mstar serve --gpus 0,1` sets both. Without `--gpus`, `mstar serve` refuses to start when the two name different GPUs.
+
+### Numerics {#amd-numerics}
+
+- hipBLASLt can give one row a slightly different result at a different batch size, so outputs that match bit for bit between a batched and a single-row run on NVIDIA may not on ROCm. Greedy output can differ between two server processes at near-tied tokens.
+- M\* sets torch's fp32 matmul precision to `high`, which on `gfx942` runs fp32 matmuls at reduced precision.
+- MIOpen's split-K implicit-GEMM conv solvers are not deterministic. On ROCm the conductor turns them off unless you set their variables ([Compilation](/environment_variables#compilation)).
+
+Workers send tensors through files instead of the shared-memory arena.
 
 ## Intel XPU {#intel-xpu}
 
@@ -80,4 +131,4 @@ nvidia-smi --query-gpu=name,compute_cap --format=csv
 python -c "from mstar.platforms import current_platform; print(current_platform, current_platform.arch())"
 ```
 
-The second command prints the platform M* resolved and its architecture: `CudaPlatform() sm_90` on an H100 or H200, `sm_100` on a B200, `sm_103` on a B300, `RocmPlatform() gfx942` on an MI300X, and `XpuPlatform() None` or `CpuPlatform() None` elsewhere.
+The second command prints the platform M* resolved and its architecture: `CudaPlatform() sm_90` on an H100 or H200, `sm_100` on a B200, `sm_103` on a B300, `RocmPlatform() gfx942` on an MI300X or MI325X (where `rocm-smi` replaces `nvidia-smi`), and `XpuPlatform() None` or `CpuPlatform() None` elsewhere.
