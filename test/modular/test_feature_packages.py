@@ -10,6 +10,8 @@ import yaml
 
 from mstar.model.omnivoice import omnivoice_model
 from mstar.model.omnivoice.omnivoice_model import OMNIVOICE_INSTALL, OmniVoiceModel
+from mstar.model.qwen3_tts import qwen3_tts_model
+from mstar.model.qwen3_tts.qwen3_tts_model import QWEN_TTS_INSTALL
 from mstar.validation import DeploymentError, validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -69,3 +71,43 @@ def test_omnivoice_workers_name_the_install_too(no_omnivoice):
         model.warmup_preprocess()
     with pytest.raises(ImportError, match=re.escape(OMNIVOICE_INSTALL)):
         model.get_submodule("backbone")
+
+
+@pytest.fixture
+def no_qwen_tts(monkeypatch):
+    real = qwen3_tts_model.importlib.metadata.distribution
+
+    def distribution(name):
+        if name == "qwen-tts":
+            raise qwen3_tts_model.importlib.metadata.PackageNotFoundError(name)
+        return real(name)
+
+    monkeypatch.setattr(qwen3_tts_model.importlib.metadata, "distribution", distribution)
+    qwen3_tts_model._load_qwen3_tts_codec_classes.cache_clear()
+    yield
+    qwen3_tts_model._load_qwen3_tts_codec_classes.cache_clear()
+
+
+@pytest.mark.parametrize("config_name, size", [("qwen3tts.yaml", "0b6"), ("qwen3tts_1p7b_split.yaml", "1b7")])
+def test_qwen3_tts_without_qwen_tts_is_refused_before_any_worker_starts(no_qwen_tts, config_name, size):
+    """The codec worker raised this only once it had started (17 s into a cold H200 start of
+    qwen3tts_1p7b); the conductor now refuses the deployment first."""
+    from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
+    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, codec_dtype
+
+    # as test_startup_graph_validation.py builds it: __init__ reads the checkpoint's files
+    model = object.__new__(Qwen3TTSModel)
+    model._submodule_cache = {}
+    model.config = Qwen3TTSModelConfig(tts_model_type="custom_voice", tts_model_size=size)
+    model.codec_dtype = codec_dtype("float32")
+    with pytest.raises(DeploymentError, match="no worker was started") as refused:
+        _validate(model, config_name)
+    assert [p for p in refused.value.problems if "qwen-tts package" in p and QWEN_TTS_INSTALL in p]
+    # the codec worker's own message names the same line
+    with pytest.raises(ImportError, match=re.escape(QWEN_TTS_INSTALL)):
+        qwen3_tts_model._load_qwen3_tts_codec_classes()
+
+
+def test_qwen3_tts_with_qwen_tts_passes_the_check(monkeypatch):
+    monkeypatch.setattr(qwen3_tts_model.importlib.metadata, "distribution", lambda name: object())
+    assert qwen3_tts_model.qwen_tts_problem() is None

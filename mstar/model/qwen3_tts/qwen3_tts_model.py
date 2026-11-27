@@ -236,6 +236,21 @@ def _adapt_tokenizer_module(module) -> None:
 #: extras cannot satisfy; only its source files are used, so its pins are skipped.
 QWEN_TTS_INSTALL = 'uv pip install --no-deps "qwen-tts==0.1.1"'
 
+
+def qwen_tts_problem() -> str | None:
+    """Why the codec can't load its speech tokenizer here, with the install line;
+    None when it can. The check `_load_qwen3_tts_codec_classes` makes, asked
+    before any worker starts."""
+    try:
+        importlib.metadata.distribution("qwen-tts")
+    except importlib.metadata.PackageNotFoundError:
+        return (
+            "Qwen3-TTS needs the qwen-tts package for its speech tokenizer, and no extra installs it "
+            f"(its metadata pins transformers==4.57.3): {QWEN_TTS_INSTALL}"
+        )
+    return None
+
+
 #: Where transformers 5.21+ puts the flat Mimi checkpoint's encoder half (its
 #: ``conversion_mapping`` for ``MimiModel``); the quantizer keeps its names.
 _MIMI_NESTED_ENCODER = {
@@ -502,6 +517,12 @@ class Qwen3TTSModel(Model):
         # Each worker asks only for nodes assigned to it. Cache the resulting
         # wrappers so Talker and Codec weights are materialized at most once.
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse to start without qwen-tts, which every deployment's codec node
+        loads, before a worker spends its startup on the Talker's weights."""
+        if (problem := qwen_tts_problem()) is not None:
+            raise ValueError(problem)
 
     def _ensure_full_snapshot(self) -> str:
         """Make all weight files available immediately before worker loading."""

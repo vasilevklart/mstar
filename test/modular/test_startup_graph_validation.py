@@ -859,9 +859,13 @@ _QWEN3_TTS_VARIANTS = {
 
 
 def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.qwen3_tts import qwen3_tts_model
     from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
     from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, codec_dtype
     kind, size = _QWEN3_TTS_VARIANTS[name]
+    if monkeypatch is not None:
+        # the config is checked here, not whether this environment has qwen-tts (test_feature_packages.py)
+        monkeypatch.setattr(qwen3_tts_model, "qwen_tts_problem", lambda: None)
     return _bare(
         Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size),
         # get_node_resources sizes the codec state pool in this dtype
