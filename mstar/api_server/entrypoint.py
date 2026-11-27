@@ -36,10 +36,12 @@ from starlette.concurrency import run_in_threadpool
 from mstar.api_server import media_io, ws_frames
 from mstar.api_server.auth import (
     API_KEY_ENV,
+    SERVER_HOST_ENV,
     APIKeyGuard,
     APIKeyMiddleware,
     keep_api_key_from_children,
     resolve_api_key,
+    resolve_host,
     warn_if_no_api_key,
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
@@ -3131,7 +3133,10 @@ def main(argv: list[str] | None = None):
         description="mstar — launch API server and conductor from a config file"
     )
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument(
+        "--host", type=str, default=None,
+        help=f"Address to listen on (default: {SERVER_HOST_ENV}, else 0.0.0.0)",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--api-key", type=str, default=None,
@@ -3202,6 +3207,7 @@ def main(argv: list[str] | None = None):
              "rust/server/target/release)",
     )
     args = parser.parse_args(argv)
+    args.host = resolve_host(args.host)
     if args.python_frontend and (args.rust_frontend or args.rust_frontend_bin):
         parser.error("--python-frontend serves without mstar-server, so it takes no --rust-frontend(-bin)")
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
@@ -3340,9 +3346,10 @@ def main(argv: list[str] | None = None):
             )
 
             bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
-            # Forward --host to the Rust frontend (it binds 127.0.0.1 by
+            # Forward the host to the Rust frontend (it binds 127.0.0.1 by
             # default; --host 0.0.0.0 for the multi-node / container case).
-            os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
+            # Assigned, not setdefault: an inherited value must not beat --host.
+            os.environ[SERVER_HOST_ENV] = args.host
             model = api_server.model
             rust_proc = launch_rust_server(
                 rust_frontend_bin, model_name,
