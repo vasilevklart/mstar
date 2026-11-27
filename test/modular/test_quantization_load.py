@@ -23,7 +23,7 @@ from mstar.model.components.quant_linear import linear_format
 from mstar.model.loader import iter_safetensors_shards, load_weights_into
 from mstar.model.loader.quantization import UnservedQuantizationError
 from mstar.quantization.resolve import Action
-from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight, quantize_fp8_block_weight
 
 WEIGHTS = full_weights()
 # routers stay bf16, as in the released fp8 checkpoints
@@ -434,3 +434,78 @@ def test_a_fused_checkpoint_tensor_splits_its_scales_with_its_rows():
     assert torch.equal(proj.weight_scale_inv.view(torch.float32), torch.cat([h.chunk(2)[1] for h in scale.chunk(2)]))
     assert torch.equal(proj.weight.view(FP8_DTYPE).view(torch.uint8),
                        torch.cat([h.chunk(2)[1] for h in weight.view(torch.uint8).chunk(2)]))
+
+
+@pytest.mark.parametrize("kind", ["column", "row"])
+def test_a_scale_block_that_isnt_square_shards_along_its_own_axis(kind):
+    # every released checkpoint's block is 128 x 128, which hides a rows / columns mix-up in the units a scale
+    # is sharded by; a 64 x 128 block doesn't. Rank r holds its rows (column-parallel) or columns (row-parallel)
+    # of the weight and of the scales over them, and computes with them.
+    from quant_helpers import group
+
+    from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
+    from mstar.model.components.fp8_formats import Fp8BlockFormat
+
+    torch.manual_seed(0)
+    n, k, block = 256, 512, (64, 128)
+    # each tile's magnitude is its own, so no two scales are equal
+    w = (torch.randn(n, k) * torch.logspace(-2, 0, n)[:, None] * torch.logspace(0, -1, k)[None, :]).to(torch.bfloat16)
+    q, scale = quantize_fp8_block_weight(w, block)
+    assert scale.shape == (4, 4) and scale.unique().numel() == 16
+    fmt = Fp8BlockFormat.for_block(block)
+    dim = 0 if kind == "column" else 1
+    for rank in range(2):
+        with default_dtype(torch.bfloat16):
+            proj = (ColumnParallelLinear(group(rank, 2), k, n, bias=False) if kind == "column" else
+                    RowParallelLinear(group(rank, 2), k, n, bias=False, input_is_parallel=True, reduce_results=False))
+        proj.quant_prepare(fmt)
+        proj.weight.weight_loader(proj.weight, q)
+        proj.weight_scale_inv.weight_loader(proj.weight_scale_inv, scale)
+        assert proj.weight_scale_inv.shape == ((2, 4) if kind == "column" else (4, 2))
+        assert torch.equal(proj.weight, q.view(torch.uint8).chunk(2, dim)[rank])
+        assert torch.equal(proj.weight_scale_inv.view(torch.float32), scale.chunk(2, dim)[rank])
+        mine = dequantize_fp8_block_weight(q, scale, block).chunk(2, dim)[rank]
+        x = torch.randn(3, mine.shape[1], dtype=torch.bfloat16)
+        assert torch.equal(proj(x), F.linear(x, mine))
+
+
+def test_a_gpu_with_no_cuda_capability_serves_a_stored_checkpoint_dequantized(checkpoints, monkeypatch):
+    # ROCm's devices are "cuda" with no CUDA compute capability. The worker's plan runs no fp8 format there (None
+    # would mean "no GPU to check", a CPU load, and every format would pass): the stored layers load as bf16.
+    from types import SimpleNamespace
+
+    from mstar import platforms
+    from mstar.quantization.resolve import NO_CUDA_CAPABILITY
+    from mstar.quantization.scope import device_capability, node_scope, quant_methods
+
+    monkeypatch.setattr(platforms, "current_platform", SimpleNamespace(cuda_capability=lambda device=None: (9, 0)))
+    assert device_capability("cuda:0") == (9, 0)
+    monkeypatch.setattr(platforms, "current_platform", platforms.RocmPlatform())
+    assert device_capability("cuda:0") == NO_CUDA_CAPABILITY and device_capability("cpu") is None
+
+    model = SimpleNamespace(get_quantization_roots=lambda: [declaration(checkpoints["fp8"])])
+    with node_scope(model, "LLM", {}, "cuda:0") as scope:
+        root = build()
+        stream = iter_safetensors_shards(checkpoints["fp8"], quant_methods=quant_methods())
+        load_weights_into(root, stream, stacked_params=STACKED)
+        scope.finish(root)
+    (_, plan), = scope.plans.values()
+    assert {layer.action for layer in plan.layers.values()} == {Action.DEQUANT, Action.KEEP}
+    assert not state(root) and root.layers[0].mlp.gate_up_proj.weight.dtype == torch.bfloat16
+    with pytest.raises(ValueError, match="this GPU has no CUDA compute capability"):
+        with node_scope(model, "LLM", {"quantization": "fp8_block"}, "cuda:0") as scope:
+            load_weights_into(build(), iter_safetensors_shards(checkpoints["fp8"], quant_methods=quant_methods()),
+                              stacked_params=STACKED)
+
+
+def test_the_engine_manager_loads_every_node_under_its_quantization_scope():
+    # the worker's load loop needs a deployment to run; its source must hand `load_submodule` the serving config
+    # (where the `quantization:` block is) and call `get_submodule` nowhere else, or a block is silently dropped
+    import inspect
+    import re
+
+    from mstar.worker.engine_manager import EngineManager
+
+    source = inspect.getsource(EngineManager.build)
+    assert re.search(r"load_submodule\(\s*model, name, model_config, device,", source)
+    assert ".get_submodule(" not in source

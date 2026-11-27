@@ -972,6 +972,21 @@ def test_a_bad_lora_value_is_reported_once_with_the_other_problems(tmp_path, blo
     assert problems[1] == "Resource spec kv nodes ['a', 'b'] must use the same parallel shape across replicas"
 
 
+# -- the quantization block ---------------------------------------------------
+
+
+@pytest.mark.parametrize("block,pattern", [
+    ("fp8_block", r"^quantization: _Model declares no quantizable layers on any placed node$"),
+    ({"nodes": {"llm": "fp8_block"}}, r"^quantization\.nodes\.llm: _Model declares no quantizable layers there$"),
+    ({"format": "fp7"}, r"^quantization\.format must be one of .*got 'fp7'$"),
+], ids=["format", "node", "unknown-format"])
+def test_a_quantization_block_the_model_cant_serve_is_refused_in_the_conductor(block, pattern, tmp_path):
+    """``mstar.quantization.validate``'s problems join the rest; the plan itself is tested with it
+    (``test_quantization_*``, ``test_qwen3_5_fp8_checkpoint``)."""
+    _refused(_Model(), _cfg(tmp_path, quantization=block), pattern)
+    assert _validate(_Model(), _cfg(tmp_path, quantization="auto")).worker_graphs
+
+
 # -- every problem at once ----------------------------------------------------
 
 
