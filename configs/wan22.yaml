@@ -40,3 +40,13 @@ node_groups:
       - dit
     ranks:
       - 0
+
+# Compile before the server reports ready, not on the first client's video: one
+# video at the default shape (1280x704, 81 frames, with CFG) traces the DiT and
+# the 720p VAE decode. Two steps, so anything the second step compiles lands here
+# too. On an H200 the first client video then takes the steady 21.6 s, not 178 s
+# cold or 39 s warm, and /health waits for the compile.
+warmup_requests:
+  - text: a red fox running through fresh snow
+    output_modalities: [video]
+    model_kwargs: {num_inference_steps: 2}
