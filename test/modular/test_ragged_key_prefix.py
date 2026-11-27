@@ -151,8 +151,11 @@ def capture(w, spans, key_lens):
 
 
 def dense_wrapper(**overrides):
+    from mstar.engine.resources.attn.dense import flash_attn_varlen_func
     from mstar.engine.resources.attn.ragged.dense_wrappers import DenseKeyPrefixPrefillWrapper
 
+    if flash_attn_varlen_func is None:  # the wrapper builds without it and fails at its first run
+        pytest.skip("no FA3 varlen kernel here: flash_attn_varlen_func did not import")
     kwargs = dict(num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=HEAD_DIM, device=DEVICE, q_data_type=DTYPE)
     kwargs.update(overrides)
     try:
