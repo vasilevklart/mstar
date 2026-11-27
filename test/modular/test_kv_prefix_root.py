@@ -31,7 +31,7 @@ import torch
 
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
-from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources import NodeResourceSpec, StepAllowance
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -133,6 +133,7 @@ def _kv(dtype=torch.float32, **overrides) -> KVManager:
     return KVManager(
         cfg=PagedKVConfig(**cfg), name=KV, joint_comm_group=None,
         transfer_engine_info=None, device=torch.device("cpu"), dtype=dtype,
+        host_allowance=StepAllowance(),
     )
 
 
