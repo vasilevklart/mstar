@@ -1,6 +1,8 @@
 # Preemption under KV pressure
 
-Since M* has no admission control today, requests take pages as they prefill and decode, and free them only when they finish. Once every running request in a full pool needs another page, none can finish, and all wait until clients time out (#307).
+Status: implemented. A1 and R1 to R4 landed as #869 to #873, followed by A2, which lets a request pass the queue head (#887), and preemptible requests borrowing the pages guaranteed requests haven't written (#1415). The code is in [admission.py](../../mstar/worker/admission.py), [preemption.py](../../mstar/worker/preemption.py) and [rebuild.py](../../mstar/worker/rebuild.py); section 9 lists what is left. "Today" below means the behavior before this work.
+
+Before this design, M* had no admission control: requests took pages as they prefilled and decoded, and freed them only when they finished. Once every running request in a full pool needed another page, none could finish, and all waited until clients timed out (#307).
 
 Earlier PR (#400) proposed admission control that reserves each request's worst case --- its prompt plus `max_tokens`. It removes the stall completely, but induces severe HoL blocking (e.g. chats queue behind image requests): their TTFT p50 rose from 0.45 s to 17.7 s. Whether this fragments the pool was never measured, but it is nonetheless based on a banker check which felt too strict.
 

@@ -507,8 +507,8 @@ def test_the_lint_reads_all_five_reference_packages():
 def test_a_model_package_is_ported_or_on_the_frozen_list(package):
     assert package in PORTED + UNPORTED, (
         f"{package} is a new model package that is not on the state contract. Declare its state in `declare_state`, "
-        "reach the engine only through `mstar.engine.state`, and add it to PORTED. Step 2a of docs/adding_models.rst "
-        "shows how. UNPORTED only shrinks, as section 2 of AGENTS.md says."
+        "reach the engine only through `mstar.engine.state`, and add it to PORTED. Step 2a of "
+        "docs/mintlify/adding_models.mdx shows how. UNPORTED only shrinks, as section 2 of AGENTS.md says."
     )
 
 

@@ -1,0 +1,80 @@
+---
+title: "Legacy resource specs"
+description: "How the nine packages that predate the state contract declare resources by hand, for anyone maintaining one of them."
+---
+
+<Warning>
+
+This page applies only to the packages on `UNPORTED` in `test/modular/test_state_lint.py`: `cosmos3`, `cosyvoice3`, `glm52`, `glm5_next`, `lingbot_world`, `minicpm_o`, `muse`, `ripple` and `waypoint`. A new model package declares its state in `declare_state()` ([Step 2a](/adding_models#step-2a-declare-your-state)) and is listed in `PORTED`, where the lint refuses everything on this page. `UNPORTED` only shrinks: a package leaves it when its port lands.
+
+</Warning>
+
+One ported file keeps a hand-written spec under a named lint exception: MiniMax-H3's video decoder writes a `SeqShardSpec` in `get_node_resources`, since it has no arrays for a `SeqShard` to bracket (`ALLOWED_IN_FUNCTION` in `test/modular/test_state_lint.py`).
+
+## Hand-written specs {#hand-written-specs}
+
+`Model.get_node_resources()` returns a flat list of `NodeResourceSpec` objects, `[]` by default. Every spec has these members:
+
+- `resource_key` is the resource's name. The layers bind to it, `declare_step` keys its per-resource step by it, and a deployment tunes it under `resources:`. All three must agree.
+- `nodes` is the set of graph nodes that share the resource. Two nodes that name one key share one object, as BAGEL's `LLM` node and its CFG branch nodes share one KV pool. A node no spec names receives no resources.
+- `depends_on()` returns the keys of the specs this one is built against. `AttentionSpec`, `PositionSpec` and `DSASpec` depend on the `kv_cache` they name, and a missing dependency fails at load, not in a forward. `RaggedAttentionSpec` names no cache and depends only on its node's sequence shard, when it has one.
+- `combined_splits()` returns a `CombinedSplit` for each [combined walk](/adding_models#combined-walks) the spec runs on split kernels; the default is none. The engine reads only this hook to order a split walk's rows, so a spec whose config carries `splits` returns them here. `AttentionSpec` and `LinearAttnSpec` return their config's `splits`.
+
+The specs the contract also builds, and the `resources:` keys each takes, are on [State contract](/contributing/state-contract#resources). A hand-written spec takes the same keys. The specs below have no declaration yet, so only the unported packages use them:
+
+| Spec | What it builds | Used by |
+|----|----|----|
+| `KVSpec(config=PagedKVConfig(layout=KVLayout.MLA, ...))` | One Multi-head Latent Attention latent per token in place of K and V. It needs `kv_lora_rank` and `qk_rope_head_dim`, and sets `num_kv_heads` to 1 and `head_dim` to their sum. Every rank holds the whole latent; only `num_qo_heads` shards, and MLA attention needs it set to the model's query heads. | GLM-5.2, GLM-5.3-Flash |
+| `AttentionSpec` with `AttnBackend.FLASHINFER_MLA` | MLA over a `KVLayout.MLA` cache. It needs `sm_scale`, the softmax scale of the model's original qk head dim. Its `run` takes the absorbed query (`[tokens, heads, kv_lora_rank]`) with the rope part as `q_pe`, and returns the output in the latent space, so the layer applies `W_UV`. FlashInfer's kernel covers a 512-wide latent with a 64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch fallback, which cannot be captured. The layer is `MLAAttention` (`mstar/model/components/mla.py`); its config picks rotated decoupled dims (GLM-5.2) or none (GLM-5.3). | GLM-5.2, GLM-5.3-Flash |
+| `DSASpec(config=DSAConfig(kv_cache=..., topk=...))` | DeepSeek sparse attention over a `KVLayout.MLA` cache. A step declares `DSAStep()`. The indexer layers store their index keys (`store_keys`) and pick each query's top `topk` positions (`select`); a layer that reuses an earlier pick reads it with `shared_selection`. `attend` runs absorbed MLA over the picked latents. It is eager only, a prompt must fit in `topk`, and past `topk` a request decodes one row per step. | GLM-5.2 (`dsa_long_context`) |
+| `KVSpec(config=RingKVConfig(...))` | A fixed-capacity frame ring: `tokens_per_frame`, one `RingKVLayerConfig` per layer, and `num_sessions`, which a deployment tunes. `AttnBackend.FLEX` requires it. | Waypoint |
+| `RollingKVSpec(config=RollingKVConfig(...))` | Per-request sink and window K/V kept compacted in stream order, in one pool reserved at startup (`pool_tokens`), with no attention of its own. A step declares each row's `RollingPosition(written, sink, window)` in a `RollingKVStep`, writes with `write(layer, k, v)` and attends `window(layer)` with its own kernel. A request declares its size as `RollingKVReqConfig(tokens=sink + window)` from `get_request_resource_configs`, waits in arrival order for room, and takes one contiguous region. Eager only, and not sharded. Per-request state outside the store is bounded only by `max_concurrent_requests`, which LingBot-World requires to be 1. | LingBot-World |
+| `RaggedCrossAttentionSpec`, stepped by hand | One span of each request attends another: `RaggedCrossAttentionStep(segments=..., pairs=(("video", "text"), ("audio", "video")))`, each pair planned as its own layout, never causal. A layer calls `resource.run(q, k, v, label=cross_label(q_label, kv_label))`. One spec has one head geometry. `run(..., return_lse=True)` on FlashInfer also returns each query row's log-sum-exp (`[total_tokens, H]`, fp32), which merging attentions over disjoint keys needs. | LingBot-World, MiniCPM-o |
+| `RaggedBlockCausalAttentionSpec(config=..., block_size=...)` | Block-causal self-attention within each span, stepped with `AttentionStep(causal=False)`: a frame in block `b` sees blocks `0..b`. It runs FlashInfer's paged prefill over the packed keys viewed as one-token pages. | MiniCPM-o |
+| `BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...), block_size=...)` | The same mask over a paged KV cache. A step runs only new tokens, with `KVStep(commit=True)` and `AttentionStep(causal=False)`, and its new tokens start on a block. FlashInfer only. | CosyVoice3 |
+| `RaggedKeyPrefixAttentionSpec` | Self-attention within each span over a prefix of its keys, stepped with `KeyPrefixAttentionStep(key_lens=...)`, each length in `1..span`. | none |
+| `BoundedKVSpec(config=BoundedKVConfig(...))`, by hand | The bounded KV with what the contract's `Window` read doesn't set: a read-only `source` per row (`StreamPosition.source`), a `rel_bias` term, `SinkWindow(window_includes_step=True)`, `reverse_step_order` and `dtype=None`. The model calls `attend(layer_idx, q, k, v, source, plan)` and declares each row's position in a `BoundedKVStep`. | MiniCPM-o's token2wav (`mstar/model/components/token2wav/resources.py`) |
+| `LinearAttnSpec` with the KDA variant | Kimi delta attention: fused Triton kernels on CUDA, a torch reference elsewhere. A layer calls it through `KDACallable` (`mstar/engine/resources/convenience.py`). A pool built with `DeltaNetGeometry.to_blocks(speculative_tokens=k)` also runs verify steps (`LinearAttnStep(speculative=True)`), and `KDACallable.set_prefix_len` settles each one's accepted drafts. The layer is `ParallelKimiDeltaAttention` over `KDAConfig`; with `full_rank_output_gate` the resource runs the torch reference. Where the fused kernels run, activations other than bf16 or a forget-gate bound below -5 fail at load. The torch reference's prefill can't be captured (`KDAManager.prefill_capturable` is False), so the model leaves those buckets out. | GLM-5.3-Flash |
+
+The specs the contract builds take more fields when written by hand:
+
+- `PositionSpec(config=PositionConfig(kv_cache=...))`: `scheme` is `PosScheme.SEQUENTIAL` or `PosScheme.BLOCK`, and the RoPE parameters are `rope_theta`, `rope_scale`, `low_freq_factor`, `high_freq_factor`, `old_context_len`, `interleave`, `rotary_dim` and `rope_table_dtype`. Layers rotate with `apply_qk(q, k, label)`; `pos_ids=` rotates at positions the model passes, and `k=None` rotates one tensor.
+- `SamplerSpec(vocab_size=..., enable_repetition_penalty=...)`: `enable_min_p`, `max_repetition_window`, `min_tokens_stop_ids` and `enable_top_p_first` are capabilities of the same kind as the penalty.
+- `RecurrentStateSpec(config=RecurrentStateConfig(...))`: `blocks` names a shape and dtype for each piece, `num_layers` copies of each, `max_slots` slots with slot 0 the sink. `declare_step` gives each row a `RecurrentStep` segment with span 1 or more, and the forward reads its rows with `pool.gather(name, start=...)` and writes them back with `pool.scatter_(name, value)`, which need the sink, so leave `disable_sink_slot` unset.
+
+`correct_len(rid, label, delta)` on the paged KV moves a stream's length between steps, never between a step's admit and commit. A speculative verify step commits its whole block, and the next `declare_step` takes its rejected tail back (`delta < 0`) before admit. The caller also calls the position resource's `correct_len`, which doesn't move by itself. A cache with KV groups refuses it. GLM-5.2's MTP is the user, until draft-verify is an engine resource.
+
+## Steps {#steps}
+
+A hand-written spec takes a `ResourceStep` under `SubmoduleStep.steps`, keyed by its `resource_key`:
+
+- `KVStep(commit=, eager_write=, pre_forks=, post_forks=)`, `AttentionStep(causal=, context_only=)`, `PositionStep(pos_ids=, advance=)` and `SamplerStep(apply_penalty=, prefill_tracked_tokens=)`. `context_only=True` has the queries attend the stored context alone; only the MLA backend reads it.
+- The contract's `ArrayStep` fields map onto these: `keep=False` is `KVStep(commit=False)`, `forks` are `pre_forks` and `post_forks`, `placeholders` is `sink`, `eager_add` is `eager_write`, and `fixed_layout` is `AttentionStep(fixed_layout=True)`.
+- `SubmoduleStep(combined_labels={("main", "cfg_img"): "cfg_batched"})` packs several labels into one plan, as batched classifier-free guidance does. Every `ResourceStep` gets the mapping, positions take their packing from the KV plan, and `PositionStep` keys its `pos_ids` by the combined label. On the contract a step lists the labels label-major in its segments instead.
+- A cacheless tower's step is an `AttentionStep` whose `segments` are the whole layout. A label with no segment raises rather than reusing the previous plan. A tower captured as a piecewise region declares this in the region's `declare_step` and names no `KVStep`.
+- `declare_step` returning `None` means that the submodule manages its own resources.
+
+## Binding resources {#binding}
+
+- The forward reads `engine_inputs.resources`, keyed by `resource_key`.
+- At load the engine calls `submodule.bind_node_resources(resources)`, which stores the resources and calls `bind_resources(resources)` on every module in `self.modules()` that defines it. A layer names its keys in its constructor, `ParallelAttention(..., attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE)`, so a key its node lacks fails at bind.
+- `AttentionCallable` (`mstar/engine/resources/convenience.py`) wraps the KV write and the attention call. The label and the layer index are cursors on the resources rather than arguments, because an integer argument makes inductor specialize on it and retrace the frame per layer:
+
+```python
+def forward(self, query_sequence: torch.Tensor, *, label: str) -> torch.Tensor:
+    self.layers[0].self_attn.attend.bind_step(label)
+    for layer_idx, decoder_layer in enumerate(self.layers):
+        decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+        query_sequence = decoder_layer(hidden_states=query_sequence)
+    return self.norm(query_sequence)   # the runner advances the cache, from the step
+```
+
+- A layer that writes K/V in a fused kernel of its own asks `kv.write_target(layer_idx, label)` for `(layer cache, page of each token, slot in page of each token, number of tokens to write)`, NHD layout only. Tokens past that number are the plan's padding.
+- A cacheless layer attends through the ragged resource's `run(q, k, v, label=None)`. A compiled caller breaks at `run`; with `RaggedAttentionConfig(compile_op=True)` it traces as the `mstar::ragged_attention` custom op instead, which costs startup time and capture memory where the region is also captured.
+- A sequence shard is the submodule's `sequence_shard`, bound with its resources: `shard.scatter(label, *xs, dim=None)`, `shard.gather(label, x)` and `shard.split_range(label)`.
+- `ModelInputsFromEngine.per_request_states` is a `Mapping` resolved on first read, and `PiecewiseCallInputs.resources` is `engine_inputs.resources`.
+
+## Layouts and capture {#layouts}
+
+- `process_prompt` returns a `LabelLayout` per label under `kv_layout` in its metadata, rather than `state_layout`. It adds the `RetentionPolicy` its committing steps declare, and `max_growth`: the most slots `growth` writes in all, for loops that end before their caps, as Nemotron's do.
+- A packed piecewise region over a hand-written ragged spec passes `attn_key` instead of a `declare_step`. The config then declares one non-causal segment per row, or under `one_row_per_step` one per length of its row.
