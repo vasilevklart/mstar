@@ -44,7 +44,7 @@ A `Platform` says what the hardware is and how to start a process on it:
 
 - **Identity:** `name`, `is_cuda()` and friends for error text and for what really is about the vendor, `arch()`.
 - **Capabilities:** what a device can do (section 5).
-- **Process start:** `process_env_defaults()`, applied before the first device call because runtimes read their environment at init; PCI addresses of the visible devices.
+- **Process start:** `process_env_defaults()`, applied before the first device call because runtimes read their environment at init; PCI addresses of the visible devices. Today the defaults applied are those of the platform torch was built for, so an out-of-tree platform's are not applied yet.
 - **Compilation:** `inductor_overrides()` for codegen settings on that stack.
 - **Collectives:** today the process-group backend is torch's default for the device type (`mstar/distributed/communication.py`).
 
@@ -54,7 +54,7 @@ Rules that keep it small:
 
 1. **Facts and names, not kernels.** A platform answers questions; it does not hold implementations.
 2. **Ask a capability, not a vendor.** `not current_platform.is_rocm()` reads as "NVIDIA" while there are two vendors and silently puts a third on NVIDIA's path. `capabilities().nvidia_triton_extras` says what the code needs.
-3. **Decide once, when a resource is built, and log it.** Never inside a forward that is compiled or captured.
+3. **Decide once, when a resource is built, and log it.** A slot is never resolved inside a forward that is compiled or captured. A capability may be asked there: Dynamo folds the answer into the graph.
 4. **Refuse with a reason.** A path with nothing that runs on this platform is a startup error naming the platform and what is missing, not NVIDIA's implementation by default.
 5. **A small hook budget.** A hook is added when two packages need the same answer. A question only one resource asks is that resource's `check`.
 
@@ -64,24 +64,17 @@ Rules that keep it small:
 
 `mstar.platforms.capabilities.capabilities(device=None, platform=None)` returns an immutable `Capabilities`. Every default is the conservative answer, so a CPU device, and a platform M\* knows nothing about, get the safe path.
 
-| Field | Meaning | Default | Read by |
-|---|---|---|---|
-| `streams` | `torch.Stream` and `torch.Event` order and overlap work | `False` | none yet |
-| `graphs` | `GraphMode.CAPTURE`: stream capture and replay; `NONE`: eager | `NONE` | none yet |
-| `triton` | Triton kernels launch here | `False` | none yet |
-| `nvidia_triton_extras` | libdevice, inline PTX, `triton.language.extra.cuda` | `False` | GLM-5-next's fused decode kernels |
-| `pdl` | programmatic dependent launch (NVIDIA sm_90 and newer) | `False` | the fused MoE decode chain |
-| `pinned_host_memory` | pinned host buffers for async copies | `False` | the block-causal attention planner |
-| `host_register` | page-lock an existing host mapping for the device | `False` | none yet; the SHM arena is next |
-| `device_ipc` | device memory can be shared across processes | `False` | none yet; the KV handoff is next |
-| `fp8_dtype` | the e4m3 format the GPU multiplies natively | `None` | none yet; block-FP8 weights are next |
-| `block_scaled` | block-scaled GEMM formats, of `mxfp8` and `nvfp4` | empty | none yet; `Platform.has_block_scaled_gemm` answers today |
+| Field | Meaning | Default | NVIDIA | AMD | Intel | Read by |
+|---|---|---|---|---|---|---|
+| `nvidia_triton_extras` | libdevice, inline PTX, `triton.language.extra.cuda` | `False` | `True` | `False` | `False` | GLM-5-next's fused decode kernels |
+| `pdl` | programmatic dependent launch | `False` | from sm_90 | `False` | `False` | the fused MoE decode chain |
+| `pinned_host_memory` | host tensors can be pinned for async copies to the device | `False` | `True` | `True` | `True` | the block-causal attention planner |
 
-How a question is answered: a CPU device gets the defaults on every platform. Otherwise the platform's own `capabilities(device)` method answers, then a builder registered for its name (`register_capabilities`). The in-tree builders give NVIDIA streams, capture, Triton and its extras, PDL from sm_90, and FP8 from sm_89; AMD streams, capture, Triton, pinned memory, device IPC, and `float8_e4m3fnuz` on gfx942 or `float8_e4m3fn` on gfx950; Intel streams, capture and pinned memory, with Triton off until it is measured on M\*'s kernels.
+A field is added with the first code that reads it, so the table is short. Facts that code already asks elsewhere stay where they are: `Platform.arch()`, `has_cuda_capability()` and `has_block_scaled_gemm()` on the platform, and `DeviceCapability` for what torch's runtime for a device type offers (streams, a graph backend) without touching the device.
 
-Answers are cached per platform instance and device. Building one for a GPU reads its compute capability or architecture, which initializes the runtime, so code that runs before the first device call asks the registry's `built_for` instead. Under `torch.compile`, Dynamo calls `capabilities` at trace time and folds the answer into the graph.
+How a question is answered: a CPU device gets the defaults on every platform. Otherwise the platform's own `capabilities(device)` method answers, then a builder registered for its name (`register_capabilities`), which is how the in-tree platforms answer; a platform with neither gets the defaults.
 
-A field appears only once code in the repository reads it.
+Answers are cached per platform instance and device. Answering for an NVIDIA GPU reads its compute capability, which initializes the runtime, so this is for worker-side code once the device is chosen. Under `torch.compile`, Dynamo calls `capabilities` at trace time and folds the answer into the graph.
 
 ## 6. Strategy slots
 
@@ -89,9 +82,9 @@ A **strategy slot** (`mstar/platforms/strategy.py`) holds the implementations of
 
 ```python
 PAGE_COPIER = StrategySlot("kv.page_copier", reference="torch")
-PAGE_COPIER.register("libcudart", lambda: CudartCopier(), platforms={"cuda"}, verify=_round_trips)
-PAGE_COPIER.register("cuda.bindings", lambda: CudaBindingsCopier(), platforms={"cuda"}, verify=_round_trips)
-PAGE_COPIER.register("libamdhip64", lambda: HipCopier(), platforms={"rocm"}, verify=_round_trips)
+PAGE_COPIER.register("libcudart", lambda: CudartCopier(), platforms={"cuda"}, verify=_verify)
+PAGE_COPIER.register("cuda.bindings", lambda: CudaBindingsCopier(), platforms={"cuda"}, verify=_verify)
+PAGE_COPIER.register("libamdhip64", lambda: HipCopier(), platforms={"rocm"}, verify=_verify)
 PAGE_COPIER.register("torch", lambda: TorchCopier())
 
 copier = PAGE_COPIER.resolve().impl
@@ -108,7 +101,7 @@ An implementation declares the platforms it is for (`"rocm"`, or `"rocm:gfx950"`
 
 Each one passed over is kept in `Resolved.skipped` with its reason, so the resource can log why it got what it got. A factory that raises `ImportError`, `OSError`, `AttributeError` or `RuntimeError` counts as unavailable; any other exception is a bug and propagates.
 
-**Every slot has a torch reference.** It defines the semantics, it is what a new platform runs before anyone writes a kernel for it, and it is what tuning sweeps compare candidates against (`Tolerance` in `mstar/kernels/registry.py`).
+**A slot should have a torch reference.** It defines the semantics, it is what a new platform runs before anyone writes a kernel for it, and it is what tuning sweeps compare candidates against (`Tolerance` in `mstar/kernels/registry.py`). A slot built without one refuses on a platform it has no implementation for (step 4).
 
 Proposed:
 
@@ -126,7 +119,7 @@ Once there is more than one slot, this table should be generated from the regist
 
 ## 7. Configuration
 
-- **A non-default strategy** is named in the serving YAML, as attention backends are today (`resources: {attn: {backend: xpu_paged}}` in `configs/bagel_xpu_cfg_tp2.yaml`); left out, `AUTO` is the platform's default.
+- **A non-default implementation** is named in the serving YAML, as attention backends are today (`resources: {attn: {backend: xpu_paged}}` in `configs/bagel_xpu_cfg_tp2.yaml`); left out, `AUTO` is the platform's default. No strategy slot reads the YAML yet; `resolve(requested=...)` is where a configured name goes.
 - **Layout differences per platform** (proposed): `platform_overrides:` in the serving config.
 - **Environment variables** are for what has to be known before the first device call: `MSTAR_PLATFORM` (which platform) and `MSTAR_KERNEL_TABLES` (tuned tables). Both are documented in `docs/environment_variables.rst`.
 - **Not configuration:** capability facts, which come from the hardware, and per-op switches for ops that are normally fused.
@@ -137,7 +130,7 @@ A package outside the tree adds a platform through the `mstar.platforms` entry-p
 
 Selection (`mstar.platforms.registry.select_platform`, which `resolve_platform` asks):
 
-1. `MSTAR_PLATFORM` names the platform. Only that plugin is loaded, so no other vendor's SDK is imported. An unknown name is an error that lists the known ones.
+1. `MSTAR_PLATFORM` names the platform. Only that plugin is loaded, so no other vendor's SDK is imported. An unknown name is an error that lists the known ones, and so is a platform this torch is not built for (`rocm` on a CUDA build).
 2. Unset: the in-tree accelerators, in the order M\* always used (CUDA or ROCm, told apart by `torch.version.hip`, then XPU).
 3. Then the installed plugins whose devices are available. Exactly one wins; more than one is an error that asks for `MSTAR_PLATFORM`.
 4. Then `cpu`.
@@ -167,7 +160,7 @@ class MyAccelPlatform(Platform):
     name = "myaccel"
 
     def capabilities(self, device=None):
-        return Capabilities(streams=True, pinned_host_memory=True)
+        return Capabilities(pinned_host_memory=True)
 
 
 def platform_entry():
@@ -176,6 +169,8 @@ def platform_entry():
     return PlatformEntry("myaccel", MyAccelPlatform, device_type="myaccel",
                          built_for=lambda: True, available=lambda: torch.myaccel.is_available())
 ```
+
+An entry's `factory` should be a plain constructor. `torch.compile` traces it whenever a compiled forward asks `current_platform`, as it traces the in-tree platforms' constructors; the selection itself is not traced.
 
 Its tests can run on a CPU with `mstar.platforms.testing`:
 
@@ -221,7 +216,7 @@ For hardware that is reachable only through a network API. A graph node hosted b
 
 ## 12. Testing
 
-- **The contract test** (`test/modular/test_platform_contract.py`) runs a `FakePlatform` through each slot and gate, and each must reach a reference or a refusal that names the platform. A path that still reaches NVIDIA's implementation is written as a strict expected failure naming its fix, so the list of them is the porting checklist; today it holds `AUTO` attention.
+- **The contract test** (`test/modular/test_platform_contract.py`) runs a `FakePlatform` through each slot and gate, and each must reach a reference or a refusal that names the platform. A path where an unknown platform still gets an in-tree one's treatment is written as a strict expected failure naming its fix, so the list of them is the porting checklist; today it holds `AUTO` attention and the process environment defaults.
 - **Conformance** (proposed): each implementation against its slot's reference, at its tolerance, on each platform it registers for.
 - **Hardware tests** run per platform. CI has no accelerator today, so a change that runs on a device reports which hardware it was run on.
 
