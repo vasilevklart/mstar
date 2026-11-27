@@ -1,0 +1,104 @@
+---
+title: "Cold start"
+description: "What M* does before it accepts requests, how to keep compile work across restarts, and what the first startup errors mean."
+---
+
+A first start loads weights, compiles and captures every accelerator graph and runs the config's warmup requests, all before the port opens. A restart with a warm compile cache skips most of the compile work.
+
+## Startup sequence {#startup-sequence}
+
+`mstar serve <model>` runs these steps in order:
+
+1. Resolves the config and prints `mstar serving '<model>' on http://localhost:8000` with example calls. Nothing listens yet.
+2. Finds the `mstar-server` binary, and exits at once if none is usable (skipped with `--python-frontend`).
+3. Starts the conductor, which checks the config and starts one worker per rank.
+4. Each worker loads its weights, then compiles and captures its accelerator graphs, until the log says `All workers ready`.
+5. Runs the config's `warmup_requests`, if any.
+6. Starts `mstar-server`, which binds the port and logs `mstar-server (Rust frontend) for model "<model>" on http://0.0.0.0:8000`.
+
+Wait for `/health`, not the banner:
+
+```bash
+until curl -sf http://localhost:8000/health; do sleep 5; done
+```
+
+Before the bind the connection is refused; after it, `/health` answers `{"status": "healthy"}`, or 503 while the backend does not answer. If a worker fails during setup, the server exits without binding, after `conductor process exited with ... before the workers finished setup`.
+
+## Compile levels {#compile-levels}
+
+`-O` sets how much Inductor tunes each captured forward's compile, through `MSTAR_COMPILE_LEVEL`. With `mstar-serve`, export the variable instead.
+
+| Level | `torch.compile` arguments | Effect |
+|----|----|----|
+| `-O0` | torch.compile's default | Inductor fusion and cuBLAS GEMMs, no tuning. Fastest start. |
+| `-O1` (default) | `options={"coordinate_descent_tuning": True}` | Coordinate descent tuning of the generated kernels. |
+| `-O2` | `mode="max-autotune-no-cudagraphs"` | Adds Inductor's GEMM template search. Slowest start. |
+
+```bash
+mstar serve qwen3_5_0.8b -O0
+```
+
+Some captured forwards pin their own compile mode (BAGEL's and pi05's pin `max-autotune-no-cudagraphs`), and `-O` does not change those. Each level compiles into the cache separately.
+
+### Warmup requests {#warmup-requests}
+
+A config's `warmup_requests` are `/generate` requests run before the bind, so no client pays for the first request of a shape. Each entry takes `text`, `files` (local or `hf://` paths), `output_modalities`, `model_kwargs` and `repeat`. A failing warmup is logged and skipped.
+
+```yaml
+warmup_requests:
+  - text: Hello, this is a short warmup.
+    output_modalities: [audio]
+    model_kwargs: {max_new_tokens: 32}
+```
+
+Shipped configs that set them: every `qwen3_5_*` config, `qwen3_8_27b_tp4`, `muse_glimmer`, `muse_glimmer_tp2`, `fish_s2_pro`, `cosmos3_edge`, `cosmos3_edge_dp2`, `cosmos3_edge_sp2`, `cosmos3_droid` and `cosmos3_edge_droid`.
+
+## Compile cache {#compile-cache}
+
+| Cache | Default location | Variable |
+|----|----|----|
+| Inductor graphs and autotune picks | `$XDG_CACHE_HOME/mstar/torchinductor` | `TORCHINDUCTOR_CACHE_DIR` |
+| Triton kernels | `<Inductor cache>/triton` | `TRITON_CACHE_DIR` |
+| FlashInfer JIT builds | `~/.cache/flashinfer` | `FLASHINFER_WORKSPACE_BASE` (default: home) |
+| Weights | `$XDG_CACHE_HOME/huggingface` | `HF_HOME` |
+
+`$XDG_CACHE_HOME` defaults to `~/.cache`. M\* sets the first two unless you export them, and the conductor logs both at startup (`Compile caches: Inductor ..., Triton ...`). Without a writable home, torch's `/tmp/torchinductor_<user>` is used.
+
+Inductor keys compiled graphs on the torch build and, on CUDA and ROCm, on the Triton build, the device and the CUDA or HIP version. `-O1`'s picks key on the kernel source, which names the compute capability and SM count but not the GPU model, so give each GPU model its own cache. No key covers `ptxas` or the driver: after changing either, delete the cache or set `TORCH_COMPILE_CACHE_KEY_TAG` to a new value.
+
+To keep the cache:
+
+- Restarts and reboots on one host reuse it.
+- In a container, put all four on a volume. `TRITON_CACHE_DIR` follows an exported `TORCHINDUCTOR_CACHE_DIR`:
+
+  ```bash
+  export TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor
+  export FLASHINFER_WORKSPACE_BASE=/cache
+  export HF_HOME=/cache/huggingface
+  mstar serve qwen3_5_0.8b
+  ```
+
+- Copy it to another machine only with the same torch, Triton and CUDA versions and GPU model.
+- On a network-mounted home or a volume that several hosts share, export `TORCHINDUCTOR_CACHE_DIR` to a node-local path and copy a warm cache in at job start.
+
+Nothing prunes the cache. Deleting it is safe and costs the next start's compile. To measure a cold start, point `TORCHINDUCTOR_CACHE_DIR` at an empty directory.
+
+## Startup errors {#startup-errors}
+
+| Message | Cause | Fix |
+|----|----|----|
+| `error: unknown model '<name>'` | Not a `mstar serve` key. | Use a key from [Supported models](/models). |
+| `the following arguments are required: model` | `--config` without a model name. | `mstar serve <model> --config <path>` |
+| `error: --config path not found`, or `FileNotFoundError` from `mstar-serve` | Wrong config path. | Fix the path. |
+| A `yaml` traceback, or `AttributeError: 'NoneType' object has no attribute 'get'` | Malformed or empty YAML. | A config is a YAML mapping with a `model:` key. |
+| `KeyError: "Unknown model name: 'dummy'. ..."` | No `model:` key (or, with another name, an unregistered one). | Set `model:` to a registry key. |
+| `ValueError: 'shm' is not a valid CommProtocol` | Lowercase protocol. | `SHM`, `TCP` or `RDMA`. |
+| `Mooncake TransferEngine is required for RDMA/TCP protocol` or `... initialize failed` | `mstar-serve` defaults to RDMA, which needs Mooncake and an RDMA NIC. | `--tensor-comm-protocol SHM` on one host, or `mstar serve <model> --config <path>`. |
+| `ModuleNotFoundError: No module named '...'` | The model's extra is missing. | Install the extra from [Supported models](/models): `uv pip install --torch-backend=auto -e ".[<extra>]"`. |
+| `Detected worker device type: cpu` | No GPU visible. | Check `nvidia-smi` and `CUDA_VISIBLE_DEVICES`. |
+| `Worker worker_1 (pid N) exited with ...` | Setup failed: fewer GPUs than the config's ranks (`--gpus 0` for a 2-GPU config), or out of memory. | Read the error above it; match `--gpus` to the config. |
+| `mstar-server: could not listen on http://0.0.0.0:8000`, exit code 3 | Port taken; found only after loading. | Another `--port`. |
+| `another mstar deployment already holds ...` | Two servers on one IPC socket prefix. | Another `--port` or `--socket-path-prefix`. |
+| `mstar-server binary not found` or `No mstar-server built from ...` | Frontend binary missing or stale. | Build it ([Installation](/installation#rust)) or run the command the error prints. |
+| `The graph runtime needs the mstar_rust extension` | Checkout without the Rust extension. | `uv pip install maturin`, then `maturin develop --release -m rust/Cargo.toml` |
+| `KeyError` or `OSError` from `getpass.getuser()` | Container user with no passwd entry and no `USER`. | `export USER=mstar` before `mstar serve`. |

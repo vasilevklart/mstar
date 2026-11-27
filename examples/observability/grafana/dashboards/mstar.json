@@ -3383,5 +3383,5 @@
       ]
     }
   ],
-  "description": "M* /metrics (mstar-serve --enable-metrics). Families are documented in docs/metrics.rst; data source uid prom (examples/observability/grafana/provisioning)."
+  "description": "M* /metrics (mstar-serve --enable-metrics). Families are documented in docs/mintlify/metrics.mdx; data source uid prom (examples/observability/grafana/provisioning)."
 }

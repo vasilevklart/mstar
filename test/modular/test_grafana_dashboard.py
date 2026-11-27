@@ -1,6 +1,6 @@
 """The Grafana dashboard in examples/observability queries only metric
-families that docs/metrics.rst documents, shows every one of them, and is
-laid out so Grafana loads it as written."""
+families that docs/mintlify/metrics.mdx documents, shows every one of them,
+and is laid out so Grafana loads it as written."""
 
 import json
 import re
@@ -21,12 +21,13 @@ NOT_METRICS = re.compile(
 IDENTIFIER = re.compile(r"(?<![\w:$])[A-Za-z_:][\w:]*\b(?!\s*\()")
 KEYWORDS = {"and", "or", "unless", "bool", "offset", "group_left", "group_right", "inf", "nan"}
 HISTOGRAM_SERIES = re.compile(r"_(bucket|sum|count)$")
-# A family entry in docs/metrics.rst: ``mstar_name{labels}`` on its own line.
-DOC_ENTRY = re.compile(r"^``(mstar_\w+)\{", re.M)
+DOC = "docs/mintlify/metrics.mdx"
+# A family entry in the metrics page: `mstar_name{labels}` <br /> on its own line.
+DOC_ENTRY = re.compile(r"^`(mstar_\w+)\{", re.M)
 
 
 def _documented() -> set[str]:
-    return set(DOC_ENTRY.findall((ROOT / "docs/metrics.rst").read_text()))
+    return set(DOC_ENTRY.findall((ROOT / DOC).read_text()))
 
 
 def _panels():
@@ -71,7 +72,7 @@ def test_metric_names_are_read_whole_from_an_expression(expr, names):
 
 def test_every_query_names_a_documented_family():
     undocumented = _queried() - _documented()
-    assert not undocumented, f"queried but not in docs/metrics.rst: {sorted(undocumented)}"
+    assert not undocumented, f"queried but not in {DOC}: {sorted(undocumented)}"
 
 
 def test_every_documented_family_has_a_panel():

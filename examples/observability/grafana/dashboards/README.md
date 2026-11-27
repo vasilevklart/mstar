@@ -8,7 +8,7 @@ Panels should use the provisioned data source, uid `prom`:
 "datasource": {"type": "prometheus", "uid": "prom"}
 ```
 
-The metric families are documented in `docs/metrics.rst`.
+The metric families are documented in `docs/mintlify/metrics.mdx`.
 
 `mstar.json` is the `M* serving` dashboard: one row per component (requests, request
 stages and output, data worker, conductor, engine workers, tensor transport, HTTP

@@ -2,19 +2,22 @@
 
 A local Docker Compose stack that scrapes an M\* server's `/metrics` with Prometheus and
 shows it in Grafana. The M\* server runs on the host, outside Docker. Every metric family
-is described in [`docs/metrics.rst`](../../docs/metrics.rst).
+is described in [`docs/mintlify/metrics.mdx`](../../docs/mintlify/metrics.mdx).
 
 ## Run it
 
-1. Start M\* on the host with metrics on (it needs the `metrics` extra,
-   `pip install 'mstar-ai[metrics]'`), and check that it answers:
+1. Start M\* on the host with metrics on (it needs the `metrics` extra next to the
+   model's own, e.g. `uv pip install --torch-backend=auto -e ".[kokoro,metrics]"` in a
+   checkout), and check that it answers:
 
    ```bash
-   mstar serve kokoro --enable-metrics        # or: mstar-serve --config ... --enable-metrics
+   mstar serve kokoro --enable-metrics        # your own config: mstar serve <model> --config <path> --enable-metrics
    curl -s localhost:8000/metrics | grep '^mstar_'
    ```
 
-   `--python-frontend` serves the same `/metrics` on the same port.
+   `--python-frontend` serves the same `/metrics` on the same port. `mstar-serve --config <path>` also
+   takes `--enable-metrics`, but it defaults to RDMA tensor transport; on one host add
+   `--tensor-comm-protocol SHM`.
 
 2. Start Prometheus and Grafana from the repository root:
 
