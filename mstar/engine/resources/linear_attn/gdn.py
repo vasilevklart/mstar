@@ -9,6 +9,7 @@ block as a plain tensor argument to ``run``.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Mapping
 
@@ -73,6 +74,25 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 }
 
 
+def _prefill_reads_pool(major: int, state_dtype: torch.dtype, has_sink: bool) -> bool:
+    """Whether the chunked prefill reads and writes the pool by slot (FlashInfer's
+    ``state_indices``) rather than a packed copy `GDNPrefillWrapper.run` gathers and scatters:
+    on SM90, over a pool the kernel reads as it is (fp32) and with a sink slot, since the kernel
+    has no skip for ``NO_SLOT``. Other archs keep the copies until someone checks theirs."""
+    return major == 9 and state_dtype in _PREFILL_STATE_DTYPES[9] and has_sink
+
+
+@functools.cache
+def _flashinfer_takes_sm90_state_indices() -> bool:
+    """FlashInfer 0.7.2's SM90 chunked kernel takes ``state_indices``; nothing older was checked."""
+    try:
+        import flashinfer
+        from packaging.version import Version
+    except ImportError:
+        return False
+    return Version(flashinfer.__version__) >= Version("0.7.2")
+
+
 class GDNManager(LinearAttnManager):
     supports_split_steps = True
     # the state is the recurrent pool's, which a drop zeroes
@@ -110,6 +130,11 @@ class GDNManager(LinearAttnManager):
         )
         self._check_state_dtype(state_dtype, geometry, has_sink)
         self._stage_prefill = gdn_stage_applies(device, geometry)
+        self._prefill_in_place = (
+            device.type == "cuda"
+            and _prefill_reads_pool(major, state_dtype, has_sink)
+            and _flashinfer_takes_sm90_state_indices()
+        )
 
         # See `build_cuda_graph_buffers`.
         self._cg_max_bs = 0
@@ -277,6 +302,7 @@ class GDNManager(LinearAttnManager):
                         if lease is not None else None
                     ),
                     stage_inputs=self._stage_prefill,
+                    state_in_place=self._prefill_in_place,
                 )
             elif is_decode:
                 store[key] = GDNDecodeWrapper(
@@ -301,6 +327,7 @@ class GDNManager(LinearAttnManager):
                     has_sink_state=self._has_sink,
                     null_slot_id=null_slot_id,
                     stage_inputs=self._stage_prefill,
+                    state_in_place=self._prefill_in_place,
                 )
         return store[key]
 

@@ -200,6 +200,7 @@ class GDNPrefillWrapper(GDNWrapper):
         accelerator_graph: bool=False,
         null_slot_id: int = 0,
         stage_inputs: bool = False,
+        state_in_place: bool = False,
     ):
         super().__init__(
             device=device,
@@ -211,7 +212,15 @@ class GDNPrefillWrapper(GDNWrapper):
             accelerator_graph=accelerator_graph,
             null_slot_id=null_slot_id,
         )
+        if state_in_place and (not has_sink_state or null_slot_id < 0):
+            # the kernel has no skip for NO_SLOT: a padding row on -1 would
+            # read and write the pool at -1
+            raise ValueError("GDNPrefillWrapper: state_in_place needs the pool's sink slot")
         self._has_sink_state = has_sink_state
+        # `GDNManager`'s `_prefill_reads_pool`: the chunked kernel reads and
+        # writes each row's slot of the pool (FlashInfer's `state_indices`),
+        # so `run` gathers and scatters no state
+        self._state_in_place = state_in_place
         # `gdn_stage_applies`: one kernel prepares q/k/v and the gates. It also
         # normalizes q and k and reads the strided views as they are.
         self._stage_inputs = stage_inputs
@@ -476,10 +485,28 @@ class GDNPrefillWrapper(GDNWrapper):
 
         slots = self._plan_state.slots.to(torch.int64)
 
-        # SM90 takes packed, sequence-ordered state (`state_indices` is
-        # SM100/SM103 only), so gather here and scatter back. A row that starts
-        # fresh, or a padding row on -1 (no sink), gathers zeros.
-        initial = gather_rows(state, slots, self._plan_state.has_state).to(self._prefill_dtype)
+        # Static per call site, so safe to branch on under capture. A head
+        # block of the pool (`GDNManager._ulysses` on more than one rank) is
+        # strided and keeps the copies, as does a pool the kernel can't read
+        # as it is.
+        in_place = (
+            self._state_in_place and state.is_contiguous() and state.dtype == self._prefill_dtype
+        )
+        if in_place:
+            # The kernel reads every row's slot, so a fresh row's is zeroed
+            # first, as the gather below reads it as zeros whatever it holds.
+            # A row with state aims the fill at the sink, which only padding
+            # rows read.
+            state.index_fill_(0, torch.where(self._plan_state.has_state, self._null_slot_id, slots), 0)
+            pool_args = dict(
+                initial_state=state, output_state=state, state_indices=self._plan_state.slots,
+            )
+        else:
+            # Packed, sequence-ordered state: gather here and scatter back. A
+            # row that starts fresh, or a padding row on -1 (no sink), gathers
+            # zeros.
+            initial = gather_rows(state, slots, self._plan_state.has_state).to(self._prefill_dtype)
+            pool_args = dict(initial_state=initial)
 
         # One spare row per batch row, so the token `plan` hands each padding
         # row is addressable even when the real batch fills the bucket exactly.
@@ -516,21 +543,23 @@ class GDNPrefillWrapper(GDNWrapper):
             g=alpha,
             beta=beta,
             scale=self._sm_scale,
-            initial_state=initial,
             output_final_state=True,
             cu_seqlens=self._plan_state.cu_seqlens,
             # ignored by this kernel (see `qk_l2norm_in_kernel`); q and k are
             # normalised by now
             use_qk_l2norm_in_kernel=False,
+            **pool_args,
             **snapshot_args,
         )
 
-        # static per pool, so safe to branch on under capture: without a sink a
-        # padding row carries -1, which `scatter_rows` points at a live row's slot
-        if self._has_sink_state:
-            state.index_copy_(0, slots, final.to(state.dtype))
-        else:
-            scatter_rows(state, slots, final)
+        # in place, the kernel has written each row's final into its slot
+        if not in_place:
+            # static per pool, so safe to branch on under capture: without a sink a
+            # padding row carries -1, which `scatter_rows` points at a live row's slot
+            if self._has_sink_state:
+                state.index_copy_(0, slots, final.to(state.dtype))
+            else:
+                scatter_rows(state, slots, final)
         if self._every:
             index = self._snapshot_index[:, : self._num_snapshots]
             state.index_copy_(0, index[2], checkpoints.index_select(0, index[0]).to(state.dtype))
@@ -711,6 +740,7 @@ class GDNMixedWrapper(GDNWrapper):
         # the chunked half's prompt rows under capture; eagerly, the step's own
         max_prefill_rows: int | None = None,
         stage_inputs: bool = False,
+        state_in_place: bool = False,
     ):
         super().__init__(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
@@ -731,7 +761,7 @@ class GDNMixedWrapper(GDNWrapper):
             qk_l2norm=qk_l2norm, prefill_dtype=prefill_dtype,
             num_tokens=num_tokens, bs=max_prefill_rows + 1 if accelerator_graph else None,
             has_sink_state=has_sink_state, accelerator_graph=accelerator_graph,
-            null_slot_id=null_slot_id, stage_inputs=stage_inputs,
+            null_slot_id=null_slot_id, stage_inputs=stage_inputs, state_in_place=state_in_place,
         )
         self._decode = GDNDecodeWrapper(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
