@@ -61,6 +61,7 @@ Other keys are not part of the preview. Not in it yet:
 - Speculative decoding.
 - MI355X (`gfx950`).
 - Configs with `mps: true`, which most `_split` configs and `minicpm_o.yaml` set to share one GPU between workers. They are refused off NVIDIA.
+- The shared-memory arena. Workers send tensors through files instead.
 
 ### Kernels {#amd-kernels}
 
@@ -100,8 +101,6 @@ HIP reads `HIP_VISIBLE_DEVICES` before `CUDA_VISIBLE_DEVICES`. On ROCm, `mstar s
 - hipBLASLt can give one row a slightly different result at a different batch size, so outputs that match bit for bit between a batched and a single-row run on NVIDIA may not on ROCm. Greedy output can differ between two server processes at near-tied tokens.
 - M\* sets torch's fp32 matmul precision to `high`, which on `gfx942` runs fp32 matmuls at reduced precision.
 - MIOpen's split-K implicit-GEMM conv solvers are not deterministic. On ROCm the conductor turns them off unless you set their variables ([Compilation](/environment_variables#compilation)).
-
-Workers send tensors through files instead of the shared-memory arena.
 
 ## Intel XPU {#intel-xpu}
 
