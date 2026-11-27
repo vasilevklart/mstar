@@ -993,7 +993,9 @@ class FlashInferMixedWrapper:
     prefill wrapper takes every token: the run as one row on the sink page,
     at most ``max_prefill_rows`` prompt rows, and a sink-page tail row over
     the bucket's padding. Both read the step's queries in place, at static
-    shapes, and the decode outputs overwrite the run's.
+    shapes, and the decode outputs overwrite the run's. ``prefill_wrapper``,
+    where given, is that prefill half (`FA3RaggedWrapper`, captured for
+    ``max_prefill_rows + 2`` rows and the bucket's tokens).
 
     A mixed step plans inline on the gpu thread, behind the step in flight,
     so every host array is staged page-locked: this wrapper's own and the
@@ -1024,6 +1026,7 @@ class FlashInferMixedWrapper:
         use_tensor_cores: bool = True,
         decode_wrapper: "FmhaDecodeWrapper | None" = None,
         sm_scale: float | None = None,
+        prefill_wrapper=None,
     ):
         from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -1063,11 +1066,19 @@ class FlashInferMixedWrapper:
             )
         # a row ahead of the prompt rows takes the decode run's tokens, and one
         # behind them the bucket's padding (see `plan`)
-        self._prefill = FlashInferPrefillWrapper(
-            workspace_buffer=prefill_workspace, batch_size=max_prefill_rows + 2,
-            max_total_tokens=max_total_tokens, max_num_pages=max_num_pages,
-            accelerator_graph=True, **kv,
-        )
+        if prefill_wrapper is not None:
+            if prefill_wrapper.batch_size != max_prefill_rows + 2:
+                raise ValueError(
+                    f"a prefill half captured for {prefill_wrapper.batch_size} rows; "
+                    f"this split plans {max_prefill_rows + 2}"
+                )
+            self._prefill = prefill_wrapper
+        else:
+            self._prefill = FlashInferPrefillWrapper(
+                workspace_buffer=prefill_workspace, batch_size=max_prefill_rows + 2,
+                max_total_tokens=max_total_tokens, max_num_pages=max_num_pages,
+                accelerator_graph=True, **kv,
+            )
         self._dec_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
         # the whole step's qo_indptr, which `select_last_hidden` reads
         self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)

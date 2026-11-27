@@ -1,5 +1,6 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
+import functools
 import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -62,6 +63,7 @@ class FlashInferManager(PlacedAttention):
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
         sm_scale: float | None = None,
+        prefill_backend: str = "flashinfer",
     ):
         super().__init__(kv_cache, device, dtype, kv_config)
         self._splits = {split.combined_walk: split for split in splits}
@@ -107,6 +109,10 @@ class FlashInferManager(PlacedAttention):
         self._step_qo: dict[str, torch.Tensor] = {}
         # walk -> whether its captured decode kernels see a row's length per replay
         self._repeat_walks: dict[str, bool] = {}
+        # "fa3": captured prompt rows on FA3's paged kernel where it runs (`_prefill_fa3`)
+        self._prefill_backend = prefill_backend
+        # (bucket, slot, label) -> the mask its FA3 kernel was captured with, which FA3 fixes
+        self._fa3_masks: dict[CGSlotKey, bool] = {}
 
     def bind_dependencies(self, resources) -> None:
         # the pool, built, has paged its groups for its placement (`PagedKVConfig.placed_groups`)
@@ -221,8 +227,57 @@ class FlashInferManager(PlacedAttention):
         # the window and scale shape every later layer's K/V
         return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
+    def fa3_prefill_refusal(self) -> str | None:
+        """Why this pool's captured prompt rows can't run on FA3's paged kernel here, or None."""
+        if self._placement is not None:
+            # a placed pool plans its own wrappers (`_context_parallel_wrapper`)
+            return "the pool is context-parallel"
+        if self._window_left >= 0:
+            return "the FA3 wrapper plans no sliding window"
+        if self._sm_scale is not None:
+            return f"the FA3 wrapper runs the kernel's default scale, not sm_scale {self._sm_scale}"
+        from mstar.engine.resources.attn.fa3_paged import fa3_paged_unavailable_reason
+
+        return fa3_paged_unavailable_reason(self._device, self._kv_config.head_dim, self._dtype)
+
+    @functools.cached_property
+    def _prefill_fa3(self) -> bool:
+        """Whether captured prompt rows run on FA3 (``prefill_backend: fa3``). Decided at the
+        first capture, once the pool is placed; a fallback to FlashInfer is warned of, once."""
+        if self._prefill_backend != "fa3":
+            return False
+        reason = self.fa3_prefill_refusal()
+        if reason is not None:
+            logger.warning(
+                "prefill_backend fa3 on attention over KV pool %r runs on FlashInfer: %s", self._kv_cache_name, reason,
+            )
+            return False
+        from mstar.engine.resources.attn.fa3_paged import FA3_TAIL_SAFE_PAGE_SIZE
+
+        page_size = self._group.page_size
+        if page_size > FA3_TAIL_SAFE_PAGE_SIZE:
+            logger.warning(
+                "prompt rows run on FA3 over %d-token pages: on pages of more than %d tokens FA3's paged kernel reads "
+                "a long prompt row's last page past its length, so a NaN or Inf an earlier request left in a reused "
+                "page would reach the row", page_size, FA3_TAIL_SAFE_PAGE_SIZE,
+            )
+        return True
+
+    def _fa3_kernel(self, rows: int, tokens: int, causal: bool):
+        """FA3's paged kernel (`FA3RaggedWrapper`) captured for ``rows`` rows of up to ``tokens``
+        queries, its page table wide enough for a row of the pool's context or of the bucket's
+        tokens (a padding row's sink pages)."""
+        from mstar.engine.resources.attn.fa3_paged import FA3RaggedWrapper
+
+        page_size = self._group.page_size
+        width = -(-max(self._kv_config.max_seq_len, tokens) // page_size)
+        return FA3RaggedWrapper(
+            page_size=page_size, table_width=width, device=self._device, batch_size=rows, max_tokens=tokens,
+            accelerator_graph=True, dtype=self._dtype, causal=causal,
+        )
+
     def _cg_wrapper(
-        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
+        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool, causal: bool = True,
     ) -> AttentionWrapper:
         """The captured-graph wrapper for one (bucket, slot, label).
 
@@ -239,10 +294,18 @@ class FlashInferManager(PlacedAttention):
         contributes several rows per request; using ``bucket.bs`` there
         under-allocates the wrapper's fixed buffers and every later plan()
         call overruns them with a "runtime batch size" mismatch.
+
+        With ``prefill_backend: fa3`` its prompt rows run on FA3 (`_prefill_fa3`), which fixes
+        ``causal`` at the first plan: a later plan with the other mask is refused.
         """
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is not None:
+            if self._fa3_masks.get(key, causal) != causal:
+                raise RuntimeError(
+                    f"capture {lease.bucket} of label {label!r} runs its prompt rows on FA3 with causal="
+                    f"{not causal}, which FA3 fixes at capture; this step plans causal={causal}"
+                )
             return wrapper
 
         bucket = lease.bucket
@@ -252,6 +315,7 @@ class FlashInferManager(PlacedAttention):
             "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
         }
         split = self._splits.get(bucket.graph_walk)
+        fa3 = False  # whether its prompt rows run on FA3
         if self._placement is not None:
             # the mixed wrapper is not used: the context wrapper takes rows of any length
             wrapper = self._context_parallel_wrapper(
@@ -261,16 +325,18 @@ class FlashInferManager(PlacedAttention):
         elif split is not None:
             # its own workspaces: both wrappers are planned for the one step
             decode_workspace = self._workspaces.get(f"{label}.split_decode", lease.slot)
+            max_prefill_rows = split.max_prefill_rows(self._max_rows_in_combined, num_rows)
+            fa3 = self._prefill_fa3
             wrapper = FlashInferMixedWrapper(
                 decode_workspace=decode_workspace,
                 prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.slot),
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
-                max_prefill_rows=split.max_prefill_rows(
-                    self._max_rows_in_combined, num_rows,
-                ),
+                max_prefill_rows=max_prefill_rows,
                 use_tensor_cores=self._decode_tensor_cores,
                 decode_wrapper=self._fmha_wrapper(decode_workspace, num_rows),
+                # the prompt rows plus the mixed wrapper's lead and tail sink rows
+                prefill_wrapper=self._fa3_kernel(max_prefill_rows + 2, bucket.num_tokens, causal) if fa3 else None,
                 **kv_kwargs,
             )
         elif one_token_rows(bucket.bs, bucket.num_tokens, force_prefill):
@@ -281,6 +347,8 @@ class FlashInferManager(PlacedAttention):
                 use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
+        elif fa3 := self._prefill_fa3:
+            wrapper = self._fa3_kernel(num_rows, bucket.num_tokens, causal)
         else:
             wrapper = FlashInferPrefillWrapper(
                 workspace_buffer=workspace,
@@ -289,6 +357,8 @@ class FlashInferManager(PlacedAttention):
                 accelerator_graph=True,
                 **kv_kwargs,
             )
+        if fa3:
+            self._fa3_masks[key] = causal
         self._cg_plan_states[key] = wrapper
         return wrapper
 
@@ -452,7 +522,7 @@ class FlashInferManager(PlacedAttention):
                 continue
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
-                wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
+                wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill, step.causal)
             else:
                 is_decode = one_token_rows(len(indptrs.qo_indptr) - 1, int(indptrs.qo_indptr[-1]), ctx.force_prefill)
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)

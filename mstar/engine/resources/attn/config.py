@@ -33,6 +33,16 @@ class AttnBackend(Enum):
     FLASHINFER_MLA = "flashinfer_mla"
 
 
+# the kernels a captured step's prompt rows run on (`AttentionConfig.prefill_backend`)
+PREFILL_BACKENDS = ("flashinfer", "fa3")
+
+
+def _prefill_backend(value) -> str:
+    if value not in PREFILL_BACKENDS:
+        raise ValueError(f"prefill_backend must be flashinfer or fa3, not {value!r}")
+    return value
+
+
 @dataclass
 class AttentionConfig:
     kv_cache: str # name of the KV cache
@@ -64,8 +74,14 @@ class AttentionConfig:
     # The KV layers a ``sliding_window`` attention runs, which a window shorter than the pool's
     # ``max_seq_len`` needs; the pool's other layers keep every token.
     layers: tuple[int, ...] | None = None
+    # FlashInfer only: the kernel a captured step's prompt rows run on, a split walk's prompt
+    # half and a multi-token bucket's rows. "fa3" is FlashAttention-3's paged kernel (the
+    # ``flash_attn_3`` wheel, Hopper) where it runs this pool, else FlashInfer's with a warning.
+    # Decode rows, eager steps and a context-parallel pool stay on FlashInfer either way.
+    prefill_backend: Literal["flashinfer", "fa3"] = "flashinfer"
 
     def __post_init__(self) -> None:
+        _prefill_backend(self.prefill_backend)
         if self.sliding_window is not None and (
             type(self.sliding_window) is not int or self.sliding_window <= 0
         ):
@@ -154,6 +170,7 @@ class AttentionSpec(NodeResourceSpec):
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
         decode_fmha: bool | None = None,
+        prefill_backend: str | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -169,6 +186,8 @@ class AttentionSpec(NodeResourceSpec):
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
         if decode_fmha is not None:
             self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
+        if prefill_backend is not None:
+            self.config.prefill_backend = _prefill_backend(prefill_backend)
 
 
 def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
