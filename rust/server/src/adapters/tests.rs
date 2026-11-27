@@ -365,7 +365,7 @@ fn the_tool_fields_clients_send_by_default_pass() {
             let mk = args.unwrap().model_kwargs;
             let sent: serde_json::Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
             for key in sent.as_object().unwrap().keys() {
-                // an adapter that serves tools keeps listed ones (tool_choice none renders them)
+                // an adapter that serves tools keeps listed ones (the model reads tool_choice none)
                 let kept = adapter.serves_tools() && fields.contains("get_weather") && key.starts_with("tool");
                 assert!(kept || !mk.contains_key(key), "{key} reached the backend from {fields} on {name}");
             }
