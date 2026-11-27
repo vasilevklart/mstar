@@ -1019,6 +1019,18 @@ def test_a_verify_row_declaring_another_span_fails_before_admit(monkeypatch, cap
     assert batch.verify_seq is None
 
 
+@pytest.mark.parametrize("k", [1, 3, 7])
+def test_the_step_ahead_budget_charges_a_verify_row_its_block(k):
+    """The scheduler takes each continuing row's `speculative_input_seq_len` off a step-ahead token budget
+    (`Speculator._continuing_seq_lens`). A verify row runs k + 1 tokens whatever it ran last and whatever the
+    submodule estimates (the toy repeats the last span), or a capped mixed step outgrows its envelope."""
+    eng = engine(k, oracle)
+    for prev in (-1, 1, 2, k + 1):
+        assert eng.speculative_input_seq_len(NODE, "decode", None, prev) == k + 1, prev
+    # off the verify walk, the submodule still answers
+    assert eng.speculative_input_seq_len(NODE, "prefill", None, 5) == 5
+
+
 def test_a_verify_step_times_its_cut_take_back_and_commit_under_fixed_names(monkeypatch):
     """Three nested timers (benchmark/worker_phases/README.md), one sample of
     the cut and of the commit a verify step, and the take-back pass on every

@@ -3863,6 +3863,11 @@ class Engine:
         self, node_name: str, graph_walk: str,
         fwd_info: CurrentForwardPassInfo | None, prev_seq_len: int,
     ) -> int | None:
+        draft = self._drafts.get(node_name)
+        if draft is not None and graph_walk == draft.walk:
+            # a verify row runs its block, which `prepare_inputs` holds it to: the step-ahead budget charges
+            # that, not the submodule's estimate, which can under-count and overrun a capped mixed step
+            return draft.decl.config.block
         return self._submodules[node_name].submodule.speculative_input_seq_len(
             graph_walk, fwd_info, prev_seq_len,
         )
