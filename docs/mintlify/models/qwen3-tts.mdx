@@ -101,7 +101,7 @@ Deployment settings:
 | `resources.codec_state.max_slots` | 257 | Codec streams plus one sink slot. A new stream past it waits for a slot. |
 | `resources.talker_kv.max_num_pages` | model default | Talker KV pool in pages of 128 tokens. |
 
-Benchmark the OpenAI route with the shared streaming client, which needs a checkout and the `eval` extra:
+Benchmark the OpenAI route with the shared streaming client, from the root of a checkout with the `eval` extra:
 
 ```bash
 python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \

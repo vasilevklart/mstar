@@ -5,7 +5,7 @@ description: "Measure a served model's latency, throughput and output quality wi
 
 `python -m benchmark.eval` measures a served model's latency, throughput and output quality from the same requests. Each results file records the commit, hardware, versions, load and judge settings, so another run can be compared on the same terms. The client can drive M\*, vLLM-Omni and SGLang-Omni. Two more pages cover [comparing a change with its base](/evaluation/compare) and [Full-Duplex-Bench v1.5](/evaluation/full-duplex).
 
-The runner lives in `benchmark/eval/` and is not in the wheel, so run it from a checkout ([Install from source](/installation#install-from-source)). Install its dependencies in the client environment:
+The runner lives in `benchmark/eval/` and is not installed as a package, even by an editable install, so run it from the root of a checkout ([Install from source](/installation#install-from-source)); from any other directory Python cannot find `benchmark`. Install its dependencies in the client environment:
 
 ```bash
 uv pip install --torch-backend=auto -e ".[eval]"

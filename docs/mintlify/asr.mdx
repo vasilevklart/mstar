@@ -155,7 +155,7 @@ Whisper, Qwen3-ASR and Higgs Audio cap the API server's torch threads at 4, and 
 
 ## Benchmarks and parity {#benchmarks-and-parity}
 
-The benchmarks need a checkout and the `asr` and `eval` extras. `benchmark.asr_data` downloads LibriSpeech test-clean from openslr.org and writes the first 200 utterances and one 10-minute long-form file under `--out`:
+The benchmarks run from the root of a checkout and need the `asr` and `eval` extras. `benchmark.asr_data` downloads LibriSpeech test-clean from openslr.org and writes the first 200 utterances and one 10-minute long-form file under `--out`:
 
 ```bash
 uv pip install --torch-backend=auto -e ".[asr,eval]"

@@ -3,7 +3,7 @@ title: "Compare a change with its base"
 description: "Check correctness, quality and performance of two revisions on the same hardware."
 ---
 
-`compare` serves two revisions on the same GPUs and checks their outputs, quality scores and performance against the limits below. Run it from a checkout with the `eval` extra installed ([Evaluation](/evaluation)). The serving environment needs each selected model's dependencies, GPUs and checkpoint access, and `cargo`, since each revision builds its own `mstar-server`; without `cargo` a model is skipped.
+`compare` serves two revisions on the same GPUs and checks their outputs, quality scores and performance against the limits below. Run it from the root of a checkout with the `eval` extra installed ([Evaluation](/evaluation)). The serving environment needs each selected model's dependencies, GPUs and checkpoint access, and `cargo`, since each revision builds its own `mstar-server`; without `cargo` a model is skipped.
 
 Start with Kokoro, using the current commit as the candidate:
 
