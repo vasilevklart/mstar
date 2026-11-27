@@ -141,6 +141,7 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+    from mstar.quantization.resolve import QuantizationRoot
 
 if TYPE_CHECKING:
     from mstar.engine.state import Array, Layout, Sampler, SampleSettings, SeqShard
@@ -842,6 +843,13 @@ class Model(ABC):
         opt-in LoRA spec. LoRA stands outside `declare_state`: adapters are weights that no request writes, and a
         request picks one by its kwargs."""
         return ()
+
+    def get_quantization_roots(self) -> "list[QuantizationRoot]":
+        """The weights roots whose linears a ``quantization:`` block may set, one per node that has one
+        (``mstar.quantization.resolve.QuantizationRoot``). The engine resolves each root's plan against the
+        deployment's block and the checkpoint, and carries it out around the node's own weight loader. Default:
+        none, so the block can't name this model's nodes and its checkpoints load as before."""
+        return []
 
     def declare_state(self) -> "list[Array | Sampler | SeqShard]":
         """The state the model keeps between steps, from which the engine builds the specs for it.

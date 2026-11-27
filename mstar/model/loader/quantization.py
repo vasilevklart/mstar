@@ -5,13 +5,17 @@ packed integer values, plus scales and sometimes zero points. A loader that know
 weights reads such a checkpoint without an error. fp8 values copy into bf16 parameters unscaled,
 and the scales and packed weights match no parameter, so the model serves garbage. The loader
 refuses instead, unless the caller names the checkpoint's ``quant_method`` as one it loads.
+
+``checkpoint_quantization`` is the one reader of what a checkpoint declares: this guard and
+``mstar.quantization`` (which serves some formats per layer) both read it.
 """
 from __future__ import annotations
 
 import json
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from pathlib import Path
-from typing import NamedTuple
+from types import MappingProxyType
+from typing import Any, NamedTuple
 
 
 class UnservedQuantizationError(ValueError):
@@ -21,6 +25,9 @@ class UnservedQuantizationError(ValueError):
 class CheckpointQuantization(NamedTuple):
     method: str  # the config's quant_method
     source: str  # the file that declares it
+    # the declaration as read, with ``quant_method`` set (ModelOpt's ``quantization`` block, the
+    # legacy files' whole contents)
+    config: Mapping[str, Any] = MappingProxyType({})
 
 
 # A quantized weight's parts besides its values (fp8 block and per-tensor scales, ModelOpt and
@@ -54,15 +61,22 @@ def checkpoint_quantization(path: str | Path) -> CheckpointQuantization | None:
         for section in (config, *(v for v in config.values() if isinstance(v, dict))):
             quant = section.get("quantization_config")
             if isinstance(quant, dict) and quant:
-                return CheckpointQuantization(str(quant.get("quant_method", "unknown")), str(root / "config.json"))
+                method = str(quant.get("quant_method", "unknown"))
+                return CheckpointQuantization(method, str(root / "config.json"), _declared(method, quant))
     modelopt = _read_json(root / "hf_quant_config.json")
     if isinstance(modelopt, dict) and isinstance(modelopt.get("quantization"), dict):
-        return CheckpointQuantization("modelopt", str(root / "hf_quant_config.json"))
+        return CheckpointQuantization(
+            "modelopt", str(root / "hf_quant_config.json"), _declared("modelopt", modelopt["quantization"]),
+        )
     for name, method, key in (("quantize_config.json", "gptq", "bits"), ("quant_config.json", "awq", "w_bit")):
         legacy = _read_json(root / name)
         if isinstance(legacy, dict) and key in legacy:
-            return CheckpointQuantization(method, str(root / name))
+            return CheckpointQuantization(method, str(root / name), _declared(method, legacy))
     return None
+
+
+def _declared(method: str, config: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({**config, "quant_method": method})
 
 
 def refuse_unserved_quantization(path: str | Path, quant_methods: Collection[str] = ()) -> None:

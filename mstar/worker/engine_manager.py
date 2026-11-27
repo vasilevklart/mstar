@@ -26,6 +26,7 @@ from mstar.model.base import (
     serving_resources,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.quantization.scope import load_submodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -476,8 +477,10 @@ class EngineManager:
                 extra["cfg_group"] = joint.cfg_group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
-            submodule = model.get_submodule(
-                name, device, tp_group=joint.tp_group,
+            # ``get_submodule`` under the node's quantization scope (``mstar.quantization``): a declared weights
+            # root loads as the plan says; every other node, as before
+            submodule = load_submodule(
+                model, name, model_config, device, tp_group=joint.tp_group,
                 autocast_dtype=autocast_dtype, **extra,
             )
             if submodule is None:
