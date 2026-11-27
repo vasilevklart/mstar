@@ -162,7 +162,7 @@ class _WanStubTransformer(nn.Module):
 
     dtype = torch.bfloat16
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None):
         return hidden_states * (timestep[:, None, :, None, None] * 1e-3 + encoder_hidden_states.mean())
 
 
