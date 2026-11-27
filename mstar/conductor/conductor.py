@@ -90,6 +90,11 @@ from mstar.validation.resources import streamed_partitions
 logger = logging.getLogger(__name__)
 request_log = logging.getLogger(REQUEST_LOGGER)
 
+_GRAMMAR_NOT_SERVED = (
+    "this deployment does not serve a JSON response_format or structured_outputs: they need a model "
+    "that serves them, with enable_grammar on its sampler"
+)
+
 
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
     """What the conductor needs of each walk to run a plan: the ``(name, node)``
@@ -815,6 +820,14 @@ class Conductor:
         a runtime load or unload is in flight for is refused
         (``LoraAdapterOps.refuse_request``).
         """
+        serving = {
+            spec.resource_key for spec in self._node_resources()
+            if isinstance(spec, SamplerSpec) and spec.enable_grammar
+        }
+        # before the model builds the request's grammar (`request_grammar`, on this loop), which a
+        # deployment that serves none shouldn't pay for
+        if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None and not serving:
+            raise ValueError(_GRAMMAR_NOT_SERVED)
         configs = self.model.get_request_resource_configs(input_modalities, output_modalities, model_kwargs)
         if any(isinstance(config, SampleSettings) for config in configs.values()):
             configs = sampling_configs(configs, self._declarations())
@@ -835,17 +848,10 @@ class Conductor:
         # as return_logprobs above: the model attached the grammar to a sampler whose spec enables it, or nothing
         # serves it (a model that doesn't declare STRUCTURED_OUTPUTS attaches none)
         with_grammar = {key for key, cfg in configs.items() if getattr(cfg, "grammar", None) is not None}
-        serving = {
-            spec.resource_key for spec in self._node_resources()
-            if isinstance(spec, SamplerSpec) and spec.enable_grammar
-        }
         if (model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None or with_grammar) and not (
             with_grammar and with_grammar <= serving
         ):
-            raise ValueError(
-                "this deployment does not serve a JSON response_format or structured_outputs: they need a model "
-                "that serves them, with enable_grammar on its sampler"
-            )
+            raise ValueError(_GRAMMAR_NOT_SERVED)
         lora_ops = getattr(self, "_lora_ops_cache", None)
         if lora_ops is not None:
             lora_ops.refuse_request(configs.values())

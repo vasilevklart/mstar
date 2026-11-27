@@ -564,6 +564,15 @@ def test_the_conductor_serves_structured_outputs_only_where_a_sampler_enables_it
     assert plain.grammar is None and plain.temperature == 0.3
 
 
+def test_a_deployment_without_enable_grammar_refuses_before_the_grammar_is_built(monkeypatch):
+    """The model builds the grammar on the conductor's loop, seconds for a deeply nested schema."""
+    built = []
+    monkeypatch.setattr(GrammarRequest, "grammar", lambda self: built.append(self.kind))
+    with pytest.raises(ValueError, match="does not serve a JSON response_format or structured_outputs"):
+        _conductor(False)._get_resource_configs(["text"], ["text"], {"structured_outputs": {"regex": "a+"}})
+    assert built == []
+
+
 @pytest.mark.parametrize("knob", [{"min_tokens": 4}, {"ignore_eos": True}], ids=str)
 def test_a_grammar_with_a_knob_that_bars_or_ignores_its_end_is_refused(knob):
     """A finished grammar allows only a stop token: ``min_tokens`` would bar
