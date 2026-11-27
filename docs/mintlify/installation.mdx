@@ -98,10 +98,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
 | `.[waypoint]` | Index-hosted Waypoint dependencies: `huggingface-hub`, `safetensors`, and `tensordict` for reference validation. The pinned TAEHV implementation must be installed separately as shown below; keeping its direct URL out of package metadata allows `m-star` to be published on PyPI. **Also needs** `flash-attn-4`, which is installed separately — see [flash-attn-4 (Waypoint, FA3 sm90 kernel)](/installation#flash-attn-4-waypoint-fa3-sm90-kernel). |
 | `.[asr]` | Speech recognition models: `transformers`, `flashinfer-python`, `safetensors`, `einops`, `soundfile` (WAV / FLAC / OGG / MP3 uploads), `torchcodec` (FFmpeg-backed decoding of the other formats), `huggingface-hub`, `mooncake-transfer-engine`, and `datasets` / `jiwer` for `benchmark/asr_eval.py`. |
 | `.[audio]` | `soundfile` — only needed to return **non-WAV** audio containers (mp3/flac/…) from the OpenAI/SDK audio surfaces. WAV/PCM output works without it. |
-| `.[audioseal]` | `audioseal` (`>=0.2,<0.3`, MIT code and weights) for the opt-in AudioSeal watermark on generated speech (Qwen3-TTS `audio_watermark`, see the Qwen3-TTS notes in [Supported Models](/models)). Not part of `.[all]`; a deployment that enables the watermark without it fails at startup with this install hint. The `python -m mstar.model.audio_watermark detect` CLI also needs `.[audio]`. |
+| `.[audioseal]` | `audioseal` (`>=0.2,<0.3`, MIT code and weights) for the opt-in AudioSeal watermark on generated speech (Qwen3-TTS `audio_watermark`, see the Qwen3-TTS notes in [Supported Models](/models)). Part of `.[all]`; a deployment that enables the watermark without it fails at startup with this install hint. The `python -m mstar.model.audio_watermark detect` CLI also needs `.[audio]`. |
 | `.[metrics]` | `prometheus-client` for `--enable-metrics` (Prometheus metrics at `/metrics`, see [Metrics](/serving#serving-metrics)). Part of `.[all]`, so the Docker images carry it. Without it, `--enable-metrics` stops the server at startup with this install hint. |
 | `.[dev]` | `ruff` + `pytest` for linting and the test suite. |
-| `.[all]` | The union of the index-hosted dependencies from every model extra above. Convenient for a machine that serves multiple models; heavier and slower to install than a single family's extra. It excludes the separately installed TAEHV, `flash-attn` and `qwen-tts` packages; see below, [flash-attn (LingBot-World)](/installation#flash-attn-lingbot-world) and [qwen-tts (Qwen3-TTS)](/installation#qwen-tts-qwen3-tts). |
+| `.[all]` | The union of the index-hosted dependencies from every model extra above. Convenient for a machine that serves multiple models; heavier and slower to install than a single family's extra. It also carries the serving features' extras (`metrics`, `vad`, `audioseal`). It excludes the separately installed TAEHV, `flash-attn`, `omnivoice` and `qwen-tts` packages; see below, [omnivoice (OmniVoice)](/installation#omnivoice-omnivoice), [flash-attn (LingBot-World)](/installation#flash-attn-lingbot-world) and [qwen-tts (Qwen3-TTS)](/installation#qwen-tts-qwen3-tts). |
 
 Combine extras as needed (keep `--torch-backend=auto` on every install):
 
@@ -163,7 +163,7 @@ Apart from `flash-attn` and `flash-attn-4`, these are installed by the extras ab
 uv pip install "git+https://github.com/k2-fsa/OmniVoice.git"
 ```
 
-It has to come from git rather than PyPI: the released package has no `omnivoice.models.omnivoice_flashinfer`, and that is the packed-attention forward mstar's graph calls, so a PyPI install fails at model load with `ImportError: cannot import name 'omnivoice_flashinfer'`. A direct git URL cannot live in `pyproject.toml` either, because PyPI rejects any `requires_dist` entry carrying one, which is why this is an install step and not a dependency. Verify with:
+It has to come from git rather than PyPI: the released package (0.2.1) has no `omnivoice.models.omnivoice_flashinfer`, and that is the packed-attention forward mstar's graph calls. Without `omnivoice`, or with PyPI's, `mstar serve omnivoice` refuses to start before any worker starts and prints the command above. A direct git URL cannot live in `pyproject.toml` either, because PyPI rejects any `requires_dist` entry carrying one, which is why this is an install step and not a dependency. Verify with:
 
 ```bash
 python -c "from omnivoice.models import omnivoice_flashinfer; print('ok')"
@@ -176,6 +176,8 @@ python -c "from omnivoice.models import omnivoice_flashinfer; print('ok')"
 ```bash
 uv pip install --no-deps "qwen-tts==0.1.1"
 ```
+
+Without it, a Qwen3-TTS deployment refuses to start before any worker starts and prints this command.
 
 `qwen-tts` pins `transformers==4.57.3` and `accelerate==1.12.0`. Installed with them, it can't share an environment with `diffusers>=0.40` (Wan 2.2, Cosmos3, FLUX.2 \[klein\]), which needs `huggingface-hub>=1.23`, or with OmniVoice (`transformers>=5.3`) or Qwen3-Omni (`transformers>=5.18`). Installing it after them downgrades their dependencies. mstar reads only the speech-tokenizer source files and runs them under transformers 4.57.3 or 5.x, so the package's own requirements are not needed. `pip check` still lists them (`transformers==4.57.3`, `accelerate==1.12.0`, `gradio`, `sox` and others) as unmet for `qwen-tts`; that is expected.
 

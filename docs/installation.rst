@@ -184,7 +184,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[audioseal]``
      - ``audioseal`` (``>=0.2,<0.3``, MIT code and weights) for the opt-in AudioSeal
        watermark on generated speech (Qwen3-TTS ``audio_watermark``, see the
-       Qwen3-TTS notes in :doc:`models`). Not part of ``.[all]``; a deployment that
+       Qwen3-TTS notes in :doc:`models`). Part of ``.[all]``; a deployment that
        enables the watermark without it fails at startup with this install hint.
        The ``python -m mstar.model.audio_watermark detect`` CLI also needs ``.[audio]``.
    * - ``.[metrics]``
@@ -197,9 +197,11 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[all]``
      - The union of the index-hosted dependencies from every model extra above.
        Convenient for a machine that serves multiple models; heavier and slower to
-       install than a single family's extra. It excludes the separately installed
-       TAEHV, ``flash-attn`` and ``qwen-tts`` packages; see below,
-       `flash-attn (LingBot-World)`_ and `qwen-tts (Qwen3-TTS)`_.
+       install than a single family's extra. It also carries the serving features'
+       extras (``metrics``, ``vad``, ``audioseal``). It excludes the separately
+       installed TAEHV, ``flash-attn``, ``omnivoice`` and ``qwen-tts`` packages; see
+       below, `omnivoice (OmniVoice)`_, `flash-attn (LingBot-World)`_ and
+       `qwen-tts (Qwen3-TTS)`_.
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -287,10 +289,11 @@ omnivoice (OmniVoice)
 
    uv pip install "git+https://github.com/k2-fsa/OmniVoice.git"
 
-It has to come from git rather than PyPI: the released package has no
+It has to come from git rather than PyPI: the released package (0.2.1) has no
 ``omnivoice.models.omnivoice_flashinfer``, and that is the packed-attention
-forward mstar's graph calls, so a PyPI install fails at model load with
-``ImportError: cannot import name 'omnivoice_flashinfer'``. A direct git URL
+forward mstar's graph calls. Without ``omnivoice``, or with PyPI's,
+``mstar serve omnivoice`` refuses to start before any worker starts and prints
+the command above. A direct git URL
 cannot live in ``pyproject.toml`` either, because PyPI rejects any
 ``requires_dist`` entry carrying one, which is why this is an install step
 and not a dependency. Verify with:
@@ -309,6 +312,9 @@ its dependencies:
 .. code-block:: bash
 
    uv pip install --no-deps "qwen-tts==0.1.1"
+
+Without it, a Qwen3-TTS deployment refuses to start before any worker starts and
+prints this command.
 
 ``qwen-tts`` pins ``transformers==4.57.3`` and ``accelerate==1.12.0``. Installed with
 them, it can't share an environment with ``diffusers>=0.40`` (Wan 2.2, Cosmos3,
