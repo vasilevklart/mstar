@@ -36,16 +36,17 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import (
     AttentionConfig,
     AttentionSpec,
-    AttentionStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import node_handles, state_steps
+from mstar.model.bagel.config import SAMPLER
 from mstar.model.submodule_base import ARNodeInputs
 
 requires_cuda = pytest.mark.skipif(
@@ -107,6 +108,16 @@ def _small_config():
     )
 
 
+def _declaring(config):
+    """Bagel with no checkpoint and its LLM on one node, for the state it declares."""
+    from mstar.model.bagel.bagel_model import BagelModel
+
+    model = BagelModel.__new__(BagelModel)
+    model.config = config
+    model._has_cfg_parallel = False
+    return model
+
+
 def _initialise(llm: torch.nn.Module) -> None:
     """Give every parameter a value, from the same seed on both sides.
 
@@ -152,7 +163,7 @@ class _Node:
         if cached:
             self.kv.enable_prefix_cache(ROOT, walks)
         self.rope = RopeManager(
-            config=PositionConfig(kv_cache="kv"), device=device, dtype=DTYPE,
+            config=PositionConfig(kv_cache="kv", rope_theta=config.rope_theta), device=device, dtype=DTYPE,
         )
         self.attn = AttentionManager.build(
             AttentionSpec(
@@ -167,17 +178,15 @@ class _Node:
                 )},
             ),
         )
-        self.runner = StepRunner(
-            {"kv": self.kv, "attn": self.attn, "rope": self.rope},
-            node_resources={NODE: ["kv", "attn", "rope"]},
-        )
-        # what NodeSubmodule.bind_resources does: each attention layer keeps
-        # its own references, resolved once
         resources = {"kv": self.kv, "attn": self.attn, "rope": self.rope}
+        self.runner = StepRunner(resources, node_resources={NODE: list(resources)})
+        # what the engine does at load: Bagel's handles over these resources, bound into each attention layer. The
+        # sampler goes unbuilt, since no step here samples.
+        self.handles = node_handles(_declaring(config), NODE, {**resources, SAMPLER: None})
         for module in self.llm.modules():
-            bind = getattr(module, "bind_resources", None)
+            bind = getattr(module, "bind_state", None)
             if bind is not None:
-                bind(resources)
+                bind(self.handles)
 
     def ingest(self, rid: str, tokens: list[int]) -> None:
         whole = len(tokens) // PAGE_SIZE
@@ -203,32 +212,28 @@ class _Node:
             return self._forward(rid, WALK, self.llm.model.embed_tokens(ids))
 
     def _forward(self, rid: str, walk: str, embeds: torch.Tensor) -> torch.Tensor:
-        """Run one step. An image block runs as Bagel's image walk does: every slot sits at
-        the stream's current position and attends the whole block, and the counter advances by one."""
+        """Run one step as the engine runs a declared one. An image block runs as Bagel's image walk does: every
+        slot sits at the stream's current position and attends the whole block, and the counter advances by one."""
         image = walk == IMAGE_WALK
-        rope = PositionStep(
-            pos_ids={"main": torch.full(
-                (len(embeds),), self.rope.position(rid, "main"),
-                dtype=torch.int32, device=self.device,
-            )},
-            advance=(1,),
-        ) if image else PositionStep()
-        step = SubmoduleStep(
-            steps={
-                "kv": KVStep(),
-                "attn": AttentionStep(causal=not image),
-                "rope": rope,
-            },
+        position_ids = torch.full(
+            (len(embeds),), self.rope.position(rid, "main"), dtype=torch.int32, device=self.device,
+        ) if image else None
+        step = state_steps(SubmoduleStep(
             segments=[Segment(rid, "main", len(embeds))],
-        )
-        ctx = StepContext(
-            request_ids=(rid,), graph_walk=walk, slot=0, capture=False,
-        )
-        step.set_ctx(ctx)
+            state={"kv": ArrayStep(position_ids=position_ids, advance=(1,) if image else None)},
+        ), self.handles, graph_walk=walk)
+        step.set_ctx(StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False))
         assert self.runner.admit(step).outcome.ok
         self.runner.plan(step)
-        hidden = self.llm(embeds, mode="und", label="main")
-        self.runner.commit(step)
+        # the engine's order: the calls stay open through the commit
+        step.begin_calls()
+        try:
+            hidden = self.llm(embeds, mode="und")
+            step.check_calls()
+            self.runner.commit(step)
+            step.commit_calls()
+        finally:
+            step.end_calls()
         return hidden.float()
 
     def ingest_layout(self, rid: str, parts: list) -> None:
