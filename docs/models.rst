@@ -711,11 +711,13 @@ them exactly. The ladder leaves out slack rungs above them (4352, 8704): such a
 deployment adds them to its own ladder, and without them a step just past a
 power of two pads to the next one and a step past 8192 runs eagerly. The
 serving config's ``prefill_token_buckets`` sets a deployment's own ladder per
-walk (see :doc:`serving`): ``configs/qwen3_5_9b*.yaml`` take the powers of two
-to 2048 for ``prefill_text`` and ``mixed``, and 1152-1792 for ``prefill_text``,
-since the LLM's 2048-token step budget (``MAX_BATCH_TOKENS``) caps both and at
-the default ``min_chunk_tokens`` no step passes it. Each bucket adds captures
-and startup time.
+walk (see :doc:`serving`): every shipped ``configs/qwen3_5_*.yaml`` takes the
+powers of two to 2048 for ``prefill_text`` and ``mixed``, and 1152-1792 for
+``prefill_text``, since the LLM's 2048-token step budget (``MAX_BATCH_TOKENS``)
+caps both and at the default ``min_chunk_tokens`` no step passes it. Each bucket
+adds captures and startup time: on the 0.8B (one H200, warm caches) the three
+rungs above 2048 cost 12 s of the start (ready 108.9 s with them, 96.7 s
+without), at the same throughput.
 
 On ``sp_size`` above 1 the LLM declares a sequence shard (``llm_shard``, its
 prefill and mixed walks; decode never splits, and its compiled frame keeps the

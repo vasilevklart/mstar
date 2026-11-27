@@ -4,6 +4,13 @@ max_seq_len: 32768
 # collects almost every step and runs a full collection every few hundred.
 knobs:
   gc_gen0_threshold: 50000
+# Captured text-prefill and mixed-step ladders, as in qwen3_5_0.8b.yaml: the
+# LLM's 2048-token step budget never replays Qwen3.5's 2176, 4096 and 8192
+# rungs, so the ladders stop at 2048 (see docs/serving.rst).
+prefill_token_buckets:
+  LLM:
+    prefill_text: [32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048]
+    mixed: [32, 64, 128, 256, 512, 1024, 2048]
 node_groups:
   - node_names: [vision_encoder]
     ranks: [0]
