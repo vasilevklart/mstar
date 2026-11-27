@@ -2672,9 +2672,8 @@ class Engine:
                 # path below would otherwise hide
                 logger.warning(
                     "batched check_stop failed (node=%s): %r; checking per request",
-                    batch.node_name, error,
+                    batch.node_name, error, exc_info=True,
                 )
-                logger.debug("batched check_stop traceback", exc_info=True)
                 batched = None
             if isinstance(batched, BatchedStopCheck):
                 if batched.withheld:

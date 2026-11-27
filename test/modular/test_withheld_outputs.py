@@ -140,6 +140,26 @@ def test_a_batched_check_that_declines_falls_back_per_row():
     assert stops == {DROP: {LOOP}} and batch.withheld_outputs == {DROP: ("frame",)}
 
 
+class _RaisingBatched(_Producer):
+    """A ``check_stop_batched`` with a bug in it."""
+
+    def check_stop_batched(self, request_ids, request_infos, host_rows):
+        raise ValueError("bad row index")
+
+
+def test_a_batched_check_that_raises_is_a_warning_with_its_traceback_and_falls_back_per_row(caplog):
+    host = {"token": torch.tensor([[3], [STOP_TOKEN]])}
+    submodule, batch = _RaisingBatched(), _batch()
+    with caplog.at_level("WARNING", logger="mstar.engine.engine"):
+        stops = _engine(submodule).check_stop_for_batch(batch, _outputs(), host_rows=HostRows((KEEP, DROP), host))
+
+    assert stops == {DROP: {LOOP}} and batch.withheld_outputs == {DROP: ("frame",)}
+    assert submodule.reads == [KEEP, DROP] and not batch.failed_requests
+    [record] = [r for r in caplog.records if "batched check_stop failed" in r.getMessage()]
+    assert record.levelname == "WARNING" and NODE in record.getMessage()
+    assert record.exc_info is not None and record.exc_info[0] is ValueError
+
+
 class _Communicator(BaseCommunicator):
     def send(self, entity_id, msg):
         pass
