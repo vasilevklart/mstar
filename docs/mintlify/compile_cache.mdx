@@ -37,12 +37,12 @@ A bundle root holds one directory per key; each is a bundle:
 
 ```text
 <root>/<product>/<torch-...-triton-...>/
-    manifest.json        the key, member count and size per tar, and one history entry per pack
+    manifest.json        the key, member count, size and sha256 per tar, and one history entry per pack
     inductor.tar         TORCHINDUCTOR_CACHE_DIR, less a Triton dir inside it
     triton.tar           TRITON_CACHE_DIR
     miopen.tar           MIOPEN_USER_DB_PATH (ROCm)
     miopen-kernels.tar   MIOPEN_CUSTOM_CACHE_DIR, only when it is a different directory
-    .append.lock         taken by every pack
+    .append.lock         taken by every pack, and shared by every unpack
 ```
 
 Each tar is uncompressed and holds its directory's files as `./<path>`, so it can be read and merged with plain `tar`. `unpack` and `pack` find these directories the way a server started from the same environment does: an exported variable, else M\*'s default for Inductor and Triton (`~/.cache/mstar/torchinductor` and its `triton` subdirectory, see [Compilation](/environment_variables#compilation)), else the library's own (MIOpen's `~/.config/miopen` and `~/.cache/miopen`). `mstar cache dirs` prints them.
@@ -71,7 +71,7 @@ A bundle is code. Inductor's entries are pickled graphs and Triton's are compile
 - A MIOpen database the directory already has is merged with the bundle's copy, the bundle's record winning where both have one, so the records only this host has stay.
 - Each file is written beside its name and renamed into place, and each directory is locked while it is written (`.mstar-unpack.lock` in it, which `pack` leaves out), so servers starting together on one host can unpack into the same caches.
 
-It exits with status 3 when `SRC` has no bundle for this stack, and `mstar serve --compile-bundle` then starts cold with a warning. A damaged bundle (a manifest or tar it can't read, or a tar holding fewer files than the manifest records) exits with status 1 and a `damaged bundle:` line, and `serve` stops. Nothing checks the files' contents, so a damaged byte inside one goes unnoticed. `unpack` leaves `mstar-bundle.json` in the Inductor directory, naming the bundle and its key.
+It exits with status 3 when `SRC` has no bundle for this stack, and `mstar serve --compile-bundle` then starts cold with a warning. A damaged bundle (a manifest or tar it can't read, or a tar holding fewer files than the manifest records or with another sha256) exits with status 1 and a `damaged bundle:` line before any of that tar's files are written, and `serve` stops; a bundle packed before checksums were recorded is unpacked without that check. `unpack` holds the bundle's `.append.lock` shared while it reads, so it waits for a pack in progress rather than reading a tar the manifest doesn't record yet. `unpack` leaves `mstar-bundle.json` in the Inductor directory, naming the bundle and its key.
 
 At startup each worker logs its stack key and what it found:
 

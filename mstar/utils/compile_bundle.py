@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import importlib
 import json
 import logging
@@ -39,6 +40,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,7 @@ class BundleMismatchError(RuntimeError):
 
 class DamagedBundleError(RuntimeError):
     """A bundle's manifest or a tar can't be read, or a tar holds fewer files
-    than its manifest records."""
+    than its manifest records or has another sha256."""
 
 
 @dataclass(frozen=True)
@@ -189,9 +191,15 @@ def _members(tar: Path) -> dict[str, tuple[int, int]]:
     return out
 
 
-def _add(tar: Path, src: Path, names: list[str]) -> None:
-    """Append ``names`` (relative to ``src``) to ``tar``, or create it. A copy is
-    written and renamed into place, so a reader never sees a partial tar."""
+def _sha256(f: BinaryIO) -> str:
+    f.seek(0)
+    return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def _add(tar: Path, src: Path, names: list[str]) -> str:
+    """Append ``names`` (relative to ``src``) to ``tar``, or create it, and
+    return its sha256. A copy is written and renamed into place, so a reader
+    never sees a partial tar."""
     tmp = tar.with_name(f"{tar.name}.{os.getpid()}")
     with tempfile.NamedTemporaryFile("wb", suffix=".list") as listing:
         listing.write(b"\0".join(n.encode() for n in names) + b"\0")
@@ -203,7 +211,10 @@ def _add(tar: Path, src: Path, names: list[str]) -> None:
             subprocess.run(["tar", "-rf" if tar.exists() else "-cf", str(tmp), "-C", str(src),
                             "--no-recursion", "--null", "-T", listing.name],
                            check=True, capture_output=True, text=True, env={**os.environ, "COPYFILE_DISABLE": "1"})
+            with open(tmp, "rb") as f:
+                digest = _sha256(f)
             os.replace(tmp, tar)
+            return digest
         except subprocess.CalledProcessError as exc:
             tmp.unlink(missing_ok=True)
             raise RuntimeError(
@@ -288,6 +299,30 @@ def _locked(path: Path) -> Iterator[None]:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+@contextlib.contextmanager
+def _shared(path: Path) -> Iterator[None]:
+    """Hold a bundle's append lock shared, so no pack runs on the bundle
+    meanwhile. Not held where the lock file can't be opened (a bundle this
+    user can't write that no pack has written to) or the filesystem refuses
+    flock, which a pack would refuse too."""
+    for mode in ("a", "r"):  # "a" creates it as pack does; "r" where only packers may write
+        try:
+            f = open(path, mode)
+        except OSError:
+            continue
+        with f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH)
+            except OSError:
+                break
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            return
+    yield
+
+
 def _write_json(path: Path, data: dict) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}")
     tmp.write_text(json.dumps(data, indent=1) + "\n")
@@ -315,7 +350,8 @@ def pack(root: Path, key: StackKey, dirs: dict[str, Path], kinds: list[str] | No
     bundle under ``root``: new files, and files whose size or mtime differ from
     the bundle's last copy (Inductor and Triton entries never change; MIOpen
     rewrites its databases in place, and a changed one is merged with the
-    bundle's copy). Run it with no server writing to the caches."""
+    bundle's copy). The manifest records each tar's file count, size and
+    sha256. Run it with no server writing to the caches."""
     bundle = root / key.path
     bundle.mkdir(parents=True, exist_ok=True)
     out = []
@@ -338,16 +374,20 @@ def pack(root: Path, key: StackKey, dirs: dict[str, Path], kinds: list[str] | No
                 # databases of the same size and mtime
                 with tempfile.TemporaryDirectory(dir=bundle) as tmp:
                     new = _merge_miopen(tar, src, sorted(files), have, Path(tmp))
-                    if new:
-                        _add(tar, Path(tmp) / "merged", new)
+                    sha = _add(tar, Path(tmp) / "merged", new) if new else None
             else:
                 new = sorted(n for n, stamp in files.items() if have.get(n) != stamp)
-                if new:
-                    _add(tar, src, new)
+                sha = _add(tar, src, new) if new else None
+            if sha is None and tar.exists():
+                with open(tar, "rb") as f:
+                    sha = _sha256(f)
             members = len(have.keys() | set(new))
             result = KindPack(kind, str(src), len(new), members, tar.stat().st_size if tar.exists() else 0)
             out.append(result)
-            manifest["kinds"][kind] = {"members": result.members, "tar_bytes": result.tar_bytes}
+            manifest["kinds"][kind] = {"members": result.members, "tar_bytes": result.tar_bytes, "sha256": sha}
+            if new:
+                # before the next kind, so a pack that fails partway leaves each tar it replaced recorded
+                _write_json(bundle / MANIFEST, manifest)
             log(f"{kind}: {result.added} files added from {src}, {result.members} in {tar.name} "
                 f"({result.tar_bytes / 2**30:.2f} GiB)")
         manifest["updated"] = _now()
@@ -414,7 +454,8 @@ class Extracted:
     kept: int  # files the cache dir already had
 
 
-def _extract(tar: Path, dest: Path, merge_dbs: bool, members: int | None = None) -> Extracted:
+def _extract(tar: Path, dest: Path, merge_dbs: bool, members: int | None = None,
+             sha256: str | None = None) -> Extracted:
     """Extract the last copy of each file in ``tar`` that ``dest`` lacks. A file
     ``dest`` has is kept, since Inductor and Triton entries never change once
     written; with ``merge_dbs`` (MIOpen, one file per database) it is merged
@@ -422,21 +463,26 @@ def _extract(tar: Path, dest: Path, merge_dbs: bool, members: int | None = None)
     written beside its name and renamed into place, so a server reading
     ``dest`` never sees part of one. tarfile rather than ``tar``, whose GNU and
     BSD builds disagree on skipping existing files. A tar holding fewer than
-    ``members`` files (its manifest's count) is refused before anything is
-    written."""
+    ``members`` files, or whose sha256 isn't ``sha256`` (its manifest's), is
+    refused before anything is written."""
     last: dict[str, tarfile.TarInfo] = {}
     added = merged = kept = 0
-    with tarfile.open(tar, "r:") as tf:
+    with open(tar, "rb") as raw, tarfile.open(fileobj=raw, mode="r:") as tf:
         while (m := tf.next()) is not None:
             tf.members.clear()
             if m.isfile() or m.issym():
                 last[m.name if m.name.startswith("./") else f"./{m.name}"] = m
         # tarfile reads an unreadable header after the first as the end of the
         # archive, so a tar cut at a header, or with a damaged one, ends early
-        # without an error. More is fine: pack renames a tar before it rewrites
-        # the manifest.
+        # without an error. More passes this check: a bundle from before
+        # checksums can hold a tar that a pack renamed into place and then
+        # stopped before rewriting the manifest.
         if members is not None and len(last) < members:
             raise DamagedBundleError(f"{tar} holds {len(last)} files, its manifest records {members}")
+        # tar checks only headers; this catches a damaged byte in a file's data.
+        # The open file is hashed, so the bytes checked are the bytes extracted.
+        if sha256 is not None and (got := _sha256(raw)) != sha256:
+            raise DamagedBundleError(f"{tar} has sha256 {got}, its manifest records {sha256}")
         for m in last.values():
             m = tarfile.data_filter(m, str(dest))  # refuses a path or link outside dest
             path = dest / m.name
@@ -484,27 +530,30 @@ def unpack(src: Path, key: StackKey, dirs: dict[str, Path], force: bool = False,
     if diff and not force:
         raise BundleMismatchError(
             f"{bundle} was built for {bkey.path}: {', '.join(diff)}; its entries would not be read")
-    # read before any tar is opened, so each tar holds at least what it records
-    recorded = (read_manifest(bundle) or {}).get("kinds", {})
     done: dict[str, str] = {}
-    for kind in KINDS:
-        tar = bundle / f"{kind}.tar"
-        if not tar.is_file():
-            continue
-        # MIOpen's kernel cache shares the database dir unless it has one of its own here
-        dest = dirs.get(kind) or (dirs.get("miopen") if kind == "miopen-kernels" else None)
-        if dest is None:
-            log(f"{kind}: no {kind} cache on this platform, left out")
-            continue
-        dest.mkdir(parents=True, exist_ok=True)
-        with _locked(dest / DEST_LOCK):
-            try:
-                n = _extract(tar, dest, merge_dbs=kind.startswith("miopen"),
-                             members=recorded.get(kind, {}).get("members"))
-            except tarfile.ReadError as exc:
-                raise DamagedBundleError(f"{tar}: {exc}") from exc
-        log(f"{kind}: {n.added} files added to {dest}, {n.merged} merged, {n.kept} already there")
-        done[kind] = str(dest)
+    # A pack renames each tar into place before it rewrites the manifest, so
+    # without the lock this could read a tar the manifest doesn't record yet.
+    with _shared(bundle / LOCK):
+        recorded = (read_manifest(bundle) or {}).get("kinds", {})
+        for kind in KINDS:
+            tar = bundle / f"{kind}.tar"
+            if not tar.is_file():
+                continue
+            # MIOpen's kernel cache shares the database dir unless it has one of its own here
+            dest = dirs.get(kind) or (dirs.get("miopen") if kind == "miopen-kernels" else None)
+            if dest is None:
+                log(f"{kind}: no {kind} cache on this platform, left out")
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            with _locked(dest / DEST_LOCK):
+                try:
+                    n = _extract(tar, dest, merge_dbs=kind.startswith("miopen"),
+                                 members=recorded.get(kind, {}).get("members"),
+                                 sha256=recorded.get(kind, {}).get("sha256"))
+                except tarfile.ReadError as exc:
+                    raise DamagedBundleError(f"{tar}: {exc}") from exc
+            log(f"{kind}: {n.added} files added to {dest}, {n.merged} merged, {n.kept} already there")
+            done[kind] = str(dest)
     dirs["inductor"].mkdir(parents=True, exist_ok=True)
     _write_json(dirs["inductor"] / MARKER, {
         "bundle": str(bundle), "key": asdict(bkey) if bkey else None, "unpacked": _now(), "kinds": done,

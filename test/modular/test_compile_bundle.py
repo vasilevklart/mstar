@@ -7,6 +7,7 @@ of ``./`` members, no manifest) reads as a bundle."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -330,19 +331,129 @@ def _cli_unpack(monkeypatch, src: Path, dirs: dict[str, Path]) -> None:
     args.func(args)
 
 
-def test_cli_unpacks_a_whole_bundle_and_one_that_grew_since_its_manifest(monkeypatch, tmp_path, capsys):
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_cli_unpacks_a_whole_bundle(monkeypatch, tmp_path, capsys):
     bundle, built = _six_triton_files(tmp_path)
+    kinds = json.loads((bundle / cb.MANIFEST).read_text())["kinds"]
+    assert {k: v["sha256"] for k, v in kinds.items()} == {k: _sha(bundle / f"{k}.tar") for k in built}
     out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
     _cli_unpack(monkeypatch, bundle, out)
     assert f"unpacked {bundle}" in capsys.readouterr().out
     assert len(list(out["triton"].rglob("k.cubin"))) == 6 and (out["inductor"] / cb.MARKER).is_file()
-    # a pack renames the tar into place before it rewrites the manifest, so an unpack beside it can see more
+
+
+def test_unpack_refuses_a_tar_with_a_byte_flipped_in_a_files_data(monkeypatch, tmp_path, capsys):
+    """tar checks only its headers, so nothing but the manifest's sha256 sees this."""
+    bundle, _ = _six_triton_files(tmp_path)
+    tar = bundle / "triton.tar"
+    want = _sha(tar)
+    with tarfile.open(tar) as tf:
+        at = tf.getmembers()[3].offset_data
+    data = bytearray(tar.read_bytes())
+    data[at] ^= 0xFF
+    tar.write_bytes(data)
+    with tarfile.open(tar) as tf:
+        assert len(tf.getmembers()) == 6
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    with pytest.raises(SystemExit) as exc:
+        _cli_unpack(monkeypatch, bundle, out)
+    assert exc.value.code == 1
+    printed = capsys.readouterr()
+    assert printed.err == f"damaged bundle: {tar} has sha256 {_sha(tar)}, its manifest records {want}\n"
+    assert "unpacked" not in printed.out
+    assert not (out["inductor"] / cb.MARKER).exists() and not list(out["triton"].rglob("k.cubin"))
+
+
+def test_a_bundle_packed_before_checksums_still_unpacks(monkeypatch, tmp_path, capsys):
+    bundle, built = _six_triton_files(tmp_path)
+    manifest = json.loads((bundle / cb.MANIFEST).read_text())
+    for entry in manifest["kinds"].values():
+        del entry["sha256"]
+    (bundle / cb.MANIFEST).write_text(json.dumps(manifest))
+    # and its triton.tar grew since the manifest, as an old pack stopped before rewriting it leaves one
     _write(built["triton"] / "NEW" / "k.cubin", "binary 6")
     cb._add(bundle / "triton.tar", built["triton"], ["./NEW/k.cubin"])
-    out = {"inductor": tmp_path / "o2" / "i", "triton": tmp_path / "o2" / "t"}
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
     _cli_unpack(monkeypatch, bundle, out)
     assert f"unpacked {bundle}" in capsys.readouterr().out
     assert len(list(out["triton"].rglob("k.cubin"))) == 7
+    # the next pack records each tar's sha256, even with nothing to add
+    _, res = cb.pack(tmp_path / "b", KEY, built, log=lambda _: None)
+    assert all(r.added == 0 for r in res)
+    kinds = json.loads((bundle / cb.MANIFEST).read_text())["kinds"]
+    assert {k: v["sha256"] for k, v in kinds.items()} == {k: _sha(bundle / f"{k}.tar") for k in built}
+
+
+def test_unpack_waits_for_a_pack_in_progress_and_unpacks_its_result(monkeypatch, tmp_path, capsys):
+    """A pack renames each tar into place before it rewrites the manifest. An
+    unpack reading between the two would find a tar whose sha256 the manifest
+    doesn't record; it holds the bundle's lock shared, so it waits instead."""
+    import threading
+
+    bundle, built = _six_triton_files(tmp_path)
+    _write(built["triton"] / "NEW" / "k.cubin", "binary 6")
+    renamed, go = threading.Event(), threading.Event()
+    write_json = cb._write_json
+
+    def pause_before_the_manifest(path, data):
+        if path.name == cb.MANIFEST and not go.is_set():
+            renamed.set()
+            go.wait(10)
+        write_json(path, data)
+
+    monkeypatch.setattr(cb, "_write_json", pause_before_the_manifest)
+    packer = threading.Thread(target=cb.pack, args=(tmp_path / "b", KEY, built), kwargs={"log": lambda _: None})
+    packer.start()
+    assert renamed.wait(10)
+    assert len(_names(bundle / "triton.tar")) == 7  # the new tar is in place, its manifest not yet written
+
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    monkeypatch.setattr(cb, "stack_key", lambda device=None: KEY)
+    monkeypatch.setattr(cb, "cache_dirs", lambda: out)
+    args = build_parser().parse_args(["cache", "unpack", str(bundle)])
+    codes = []
+
+    def unpack():
+        try:
+            args.func(args)
+            codes.append(0)
+        except SystemExit as exc:
+            codes.append(exc.code)
+
+    unpacker = threading.Thread(target=unpack)
+    unpacker.start()
+    unpacker.join(0.5)
+    assert unpacker.is_alive() and not (tmp_path / "o").exists()
+    go.set()
+    packer.join(10)
+    unpacker.join(10)
+    assert codes == [0], capsys.readouterr().err
+    assert len(list(out["triton"].rglob("k.cubin"))) == 7
+
+
+def test_a_pack_that_fails_partway_leaves_a_bundle_that_unpacks(monkeypatch, tmp_path):
+    """The manifest is rewritten after each tar a pack replaces, so a pack that
+    fails on triton.tar (a full disk, say) leaves the new inductor.tar recorded."""
+    bundle, built = _six_triton_files(tmp_path)
+    _write(built["inductor"] / "fxgraph" / "more", "graph 2")
+    _write(built["triton"] / "NEW" / "k.cubin", "binary 6")
+    add = cb._add
+
+    def fail_on_triton(tar, src, names):
+        if tar.name == "triton.tar":
+            raise RuntimeError(f"tar failed adding {len(names)} files")
+        return add(tar, src, names)
+
+    monkeypatch.setattr(cb, "_add", fail_on_triton)
+    with pytest.raises(RuntimeError, match="tar failed"):
+        cb.pack(tmp_path / "b", KEY, built, log=lambda _: None)
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    _cli_unpack(monkeypatch, bundle, out)
+    assert (out["inductor"] / "fxgraph" / "more").read_text() == "graph 2"
+    assert len(list(out["triton"].rglob("k.cubin"))) == 6
 
 
 @pytest.mark.parametrize("damage", ["cut at a header", "a header byte flipped"])
