@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import errno
 import getpass
 import http.client
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import urllib.request
@@ -195,6 +197,23 @@ def _starting(model: str, host: str, port: int) -> str:
         f"  Progress is in the log below. The client snippets print here when {base}/health answers.",
         "",
     ])
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    """Whether another process already listens on ``host:port``. The server
+    binds only after the model loads, minutes in; this check takes a moment."""
+    try:
+        family, kind, proto, _, addr = socket.getaddrinfo(
+            host or None, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)[0]
+        with socket.socket(family, kind, proto) as probe:
+            # as both frontends bind, so a port a stopped server left in TIME_WAIT is free
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(addr)
+    except OSError as e:
+        return e.errno == errno.EADDRINUSE
+    except (OverflowError, UnicodeError):
+        pass  # a bad port or host, which the server's own bind reports
+    return False
 
 
 def _healthy(url: str, timeout_s: float = 5.0) -> bool:
@@ -389,6 +408,10 @@ def _serve(args: argparse.Namespace) -> None:
 
     from mstar.api_server.auth import resolve_api_key
 
+    if _port_in_use(args.host, args.port):
+        sys.exit(f"error: port {args.port} is already in use, so the server could not listen on it "
+                 f"once the model has loaded.\n       Stop the process that holds it "
+                 f"(`ss -ltnp | grep :{args.port}` names it) or pass another --port.")
     # The server listens only after the weights load and the model compiles,
     # minutes later on a first start, so "serving" waits for /health.
     print(_starting(args.model, args.host, args.port), file=sys.stderr)

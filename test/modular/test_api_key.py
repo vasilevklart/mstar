@@ -211,6 +211,7 @@ def test_mstar_serve_forwards_the_key_and_never_prints_it(monkeypatch, capsys):
 
     monkeypatch.setattr(entrypoint, "main", lambda argv: seen.setdefault("argv", argv))
     monkeypatch.setattr(cli, "_announce_when_healthy", announce)
+    monkeypatch.setattr(cli, "_port_in_use", lambda host, port: False)  # whatever holds 8000 here
     cli.main(["serve", "kokoro", "--api-key", KEY])
     argv = seen["argv"]
     assert argv[argv.index("--api-key") + 1] == KEY
