@@ -35,11 +35,11 @@ BUILD_ERRORS = (ImportError, OSError, AttributeError, RuntimeError)
 class SkipKind(Enum):
     """Why a strategy was passed over."""
 
-    MISSING = "not registered"
-    PLATFORM = "not for this platform"
-    CHECK = "its check refused the target"
+    NOT_REGISTERED = "not registered"
+    OTHER_PLATFORM = "not for this platform"
+    CHECK_REFUSED = "its check refused the target"
     UNAVAILABLE = "building or verifying it raised"
-    WRONG = "its verify returned False"
+    VERIFY_FAILED = "its verify returned False"
 
 
 class Skip(NamedTuple):
@@ -139,9 +139,9 @@ class StrategySlot(Generic[T]):
         if self.reference is not None:
             reference = self._strategies.get(self.reference)
             if reference is None:
-                skipped.append(Skip(self.reference, SkipKind.MISSING, "the slot's reference is not registered"))
+                skipped.append(Skip(self.reference, SkipKind.NOT_REGISTERED, "the slot's reference is not registered"))
             elif not _for(reference, platform, target):
-                skipped.append(Skip(reference.name, SkipKind.PLATFORM, _not_for(reference, platform)))
+                skipped.append(Skip(reference.name, SkipKind.OTHER_PLATFORM, _not_for(reference, platform)))
             else:
                 impl, skip = _try(reference, target)
                 if skip is None:
@@ -153,9 +153,9 @@ class StrategySlot(Generic[T]):
         strategy = self._strategies.get(name)
         if strategy is None:
             known = ", ".join(self._strategies) or "none"
-            skip = Skip(name, SkipKind.MISSING, f"not registered; {self.name} has {known}")
+            skip = Skip(name, SkipKind.NOT_REGISTERED, f"not registered; {self.name} has {known}")
         elif not _for(strategy, platform, target):
-            skip = Skip(name, SkipKind.PLATFORM, _not_for(strategy, platform))
+            skip = Skip(name, SkipKind.OTHER_PLATFORM, _not_for(strategy, platform))
         else:
             impl, skip = _try(strategy, target)
             if skip is None:
@@ -195,12 +195,12 @@ def _not_for(strategy: _Strategy, platform: Platform) -> str:
 
 def _try(strategy: _Strategy[T], target: Any) -> tuple[T | None, Skip | None]:
     if strategy.check is not None and (reason := strategy.check(target)) is not None:
-        return None, Skip(strategy.name, SkipKind.CHECK, reason)
+        return None, Skip(strategy.name, SkipKind.CHECK_REFUSED, reason)
     try:
         impl = strategy.factory()
         verified = strategy.verify is None or strategy.verify(impl)
     except BUILD_ERRORS as e:
         return None, Skip(strategy.name, SkipKind.UNAVAILABLE, str(e) or type(e).__name__)
     if not verified:
-        return None, Skip(strategy.name, SkipKind.WRONG, "failed its verify")
+        return None, Skip(strategy.name, SkipKind.VERIFY_FAILED, "failed its verify")
     return impl, None

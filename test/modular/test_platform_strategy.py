@@ -121,9 +121,9 @@ def test_each_strategy_passed_over_is_recorded_with_why_in_order():
     resolved = slot.resolve(target="bf16 x 7", platform=FAKE)
     assert resolved.name == "torch"
     assert [(s.strategy, s.kind) for s in resolved.skipped] == [
-        ("refuses", SkipKind.CHECK),
+        ("refuses", SkipKind.CHECK_REFUSED),
         ("missing", SkipKind.UNAVAILABLE),
-        ("wrong", SkipKind.WRONG),
+        ("wrong", SkipKind.VERIFY_FAILED),
         ("raises_in_verify", SkipKind.UNAVAILABLE),
     ]
     assert resolved.skipped[0].reason == "can't run bf16 x 7"

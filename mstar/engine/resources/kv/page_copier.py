@@ -254,16 +254,20 @@ def _round_trips(copier: PageCopier) -> bool:
     return torch.equal(back[:, 1:], device[:, :3])
 
 
-# Each factory reads its class when called, so a test can swap one in.
+def _verify(copier: PageCopier) -> bool:
+    return _round_trips(copier)
+
+
+# Each factory reads its class when called, and `_verify` the round trip, so a test can swap one in.
 PAGE_COPIER: StrategySlot[PageCopier] = StrategySlot("kv.page_copier", reference="torch")
 PAGE_COPIER.register(
-    "libcudart", lambda: CudartCopier(), platforms={"cuda"}, verify=_round_trips,  # noqa: PLW0108 - late-bound
+    "libcudart", lambda: CudartCopier(), platforms={"cuda"}, verify=_verify,  # noqa: PLW0108 - late-bound
 )
 PAGE_COPIER.register(
-    "cuda.bindings", lambda: CudaBindingsCopier(), platforms={"cuda"}, verify=_round_trips,  # noqa: PLW0108 - late-bound
+    "cuda.bindings", lambda: CudaBindingsCopier(), platforms={"cuda"}, verify=_verify,  # noqa: PLW0108 - late-bound
 )
 PAGE_COPIER.register(
-    "libamdhip64", lambda: HipCopier(), platforms={"rocm"}, verify=_round_trips,  # noqa: PLW0108 - late-bound
+    "libamdhip64", lambda: HipCopier(), platforms={"rocm"}, verify=_verify,  # noqa: PLW0108 - late-bound
 )
 PAGE_COPIER.register("torch", lambda: TorchCopier())  # noqa: PLW0108 - late-bound
 
@@ -273,7 +277,7 @@ def make_page_copier() -> PageCopier:
     """The fastest copier that works here; `TorchCopier` off CUDA and ROCm."""
     resolved = PAGE_COPIER.resolve()
     for skip in resolved.skipped:
-        if skip.kind is SkipKind.WRONG:
+        if skip.kind is SkipKind.VERIFY_FAILED:
             logger.warning("KV page copies: %s returned wrong data; not using it", skip.strategy)
         else:
             logger.info("KV page copies: %s unavailable (%s)", skip.strategy, skip.reason)
