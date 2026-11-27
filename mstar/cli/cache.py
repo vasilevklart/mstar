@@ -1,4 +1,4 @@
-"""``mstar cache``: compile-cache bundles (docs/compile_cache.rst).
+"""``mstar cache``: compile-cache bundles (docs/mintlify/compile_cache.mdx).
 
     mstar cache key                  # this host's stack key, the bundle path a pack writes
     mstar cache dirs                 # the cache dirs a server started here reads and writes

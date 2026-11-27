@@ -16,7 +16,7 @@ bundles for several stacks::
 Each tar holds its directory's files as ``./<path>`` and is uncompressed, so
 packing into an existing bundle appends only the files it lacks or holds an
 older copy of, and unpacking keeps the last copy of each file. The layout and
-the matching rules are in docs/compile_cache.rst.
+the matching rules are in docs/mintlify/compile_cache.mdx.
 """
 
 from __future__ import annotations

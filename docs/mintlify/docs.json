@@ -21,7 +21,7 @@
       },
       {
         "group": "User guide",
-        "pages": ["serving", "metrics", "clients", "evaluation"]
+        "pages": ["serving", "compile_cache", "metrics", "clients", "evaluation"]
       },
       {
         "group": "Reference",

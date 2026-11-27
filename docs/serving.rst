@@ -1033,6 +1033,11 @@ next start's compile. On a quota-limited or network-mounted home (NFS), or a vol
 concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
 path and copy a warm cache in at job start.
 
+To give a new host or container these caches warm, pack them into a bundle for the stack
+on a host that has served the configs, and unpack it on the new one before serving
+(``mstar cache``; see *Compile-cache bundles* in the Mintlify docs,
+``docs/mintlify/compile_cache.mdx``).
+
 .. _host-idle:
 
 Host idle states

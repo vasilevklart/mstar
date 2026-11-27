@@ -361,6 +361,8 @@ In a container, mount these from a volume rather than only `~/.cache/huggingface
 
 The default trades torch's node-local `/tmp` for home. Nothing prunes the cache, and every upgrade, `-O` level and changed graph adds to it; it is safe to delete, which costs only the next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that concurrent jobs on several hosts share, export `TORCHINDUCTOR_CACHE_DIR` to a node-local path and copy a warm cache in at job start.
 
+To give a new host or container these caches warm, pack them into a bundle for the stack on a host that has served the configs, and unpack it on the new one before serving (see [Compile-cache bundles](/compile_cache)).
+
 ## Host idle states {#host-idle}
 
 A decode step hands work between a worker's main, GPU and plan threads several times, and every step's tokens go from the API server's message thread to the frontend. On a host whose idle cores drop into deep C-states each handoff to a sleeping core waits for it to wake, and a core that sleeps between handoffs stays at a low clock under the `powersave` governor, so a small model's step is mostly host time spent waking CPUs. Two knobs deal with it:
