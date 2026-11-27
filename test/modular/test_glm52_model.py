@@ -79,6 +79,25 @@ def test_glm52_registered():
     assert registry.HF_MODELS["glm52"]["model_path_hf"] == "zai-org/GLM-5.2-FP8"
 
 
+def test_glm53_is_wired_to_glm52():
+    """GLM-5.3 ships GLM-5.2's config.json geometry and tensor names, so it is the same
+    class behind its own key, and its TP8 config deploys as glm52_tp8.yaml does."""
+    import yaml
+
+    from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, TextChatAdapter
+    from mstar.cli.main import DEFAULT_CONFIGS, _repo_root
+    from mstar.model import registry
+
+    assert registry.MODEL_REGISTRY["glm53"] == registry.MODEL_REGISTRY["glm52"]
+    assert registry.model_init_kwargs("glm53")["model_path_hf"] == "zai-org/GLM-5.3"
+    assert isinstance(ADAPTER_REGISTRY["glm53"], TextChatAdapter)
+    configs = _repo_root() / "configs"
+    glm53 = yaml.safe_load((configs / DEFAULT_CONFIGS["glm53"]).read_text())
+    glm52 = yaml.safe_load((configs / DEFAULT_CONFIGS["glm52"]).read_text())
+    assert glm53.pop("model") == "glm53" and glm52.pop("model") == "glm52"
+    assert glm53 == glm52
+
+
 def test_glm52_graph_walks_are_one_node():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
