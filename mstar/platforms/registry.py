@@ -4,7 +4,7 @@ The four in-tree platforms are registered here. A package outside the tree adds 
 ``mstar.platforms`` entry-point group in its own ``pyproject.toml``::
 
     [project.entry-points."mstar.platforms"]
-    tpu = "mstar_tpu:platform_entry"
+    myaccel = "mstar_myaccel:platform_entry"
 
 The entry point's name is the platform's name, and it names a callable that returns a
 :class:`PlatformEntry`, or None when the package can't serve this host. Importing this module

@@ -138,8 +138,8 @@ def test_mstar_platform_names_a_registered_platform_even_on_a_gpu_host(build):
 
 def test_an_unknown_mstar_platform_is_an_error_that_lists_the_known_ones(install):
     install("dummy")
-    with pytest.raises(ValueError, match=r"MSTAR_PLATFORM='tpu' names no platform") as err:
-        select_platform({"MSTAR_PLATFORM": "tpu"})
+    with pytest.raises(ValueError, match=r"MSTAR_PLATFORM='myaccel' names no platform") as err:
+        select_platform({"MSTAR_PLATFORM": "myaccel"})
     for name in ("cpu", "cuda", "dummy", "rocm", "xpu"):
         assert name in str(err.value)
 
@@ -204,12 +204,12 @@ def test_a_plugin_that_returns_none_registers_nothing(install):
 
 
 def test_a_broken_plugin_is_skipped_in_a_scan_and_raises_when_named(install, caplog):
-    install("dummy", body="raise ImportError('no libtpu')")
+    install("dummy", body="raise ImportError('no libmyaccel')")
     with caplog.at_level(logging.WARNING, logger=registry.__name__):
         assert select_platform({}).name == "cpu"
-    assert "platform plugin dummy" in caplog.text and "no libtpu" in caplog.text
+    assert "platform plugin dummy" in caplog.text and "no libmyaccel" in caplog.text
     registry._LOADED.clear()
-    with pytest.raises(ImportError, match="no libtpu"):
+    with pytest.raises(ImportError, match="no libmyaccel"):
         select_platform({"MSTAR_PLATFORM": "dummy"})
 
 

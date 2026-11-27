@@ -9,7 +9,7 @@ A platform is **supported** when it is on `main`, installable from the docs, and
 | Platform | `MSTAR_PLATFORM` | Status |
 |---|---|---|
 | NVIDIA GPUs (CUDA) | `cuda` | Supported |
-| AMD GPUs (ROCm) | `rocm` | To be set by the maintainers at launch |
+| AMD GPUs (ROCm) | `rocm` | In progress: the platform and some kernels are on `main`, installation is not documented yet |
 | Intel GPUs (XPU) | `xpu` | Experimental, one model |
 | No accelerator | `cpu` | Tests and tooling |
 
