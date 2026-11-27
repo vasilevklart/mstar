@@ -8,9 +8,10 @@ runs at a fraction of the link's bandwidth. On CUDA and ROCm each run of pages
 adjacent in both caches is instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync``
 with the layer stride as its pitch: async, and run on the copy engines.
 
-`make_page_copier` picks the first copier that loads and passes a round trip,
-once per process: on CUDA `CudartCopier`, then `CudaBindingsCopier`, whose calls
-drop the GIL; on ROCm `HipCopier`; then `TorchCopier`.
+`make_page_copier` picks the first copier of the `PAGE_COPIER` slot that loads
+and passes a round trip, once per process: on CUDA `CudartCopier`, then
+`CudaBindingsCopier`, whose calls drop the GIL; on ROCm `HipCopier`; then the
+slot's reference, `TorchCopier`.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.platforms import current_platform
+from mstar.platforms.strategy import SkipKind, StrategySlot
 
 logger = logging.getLogger(__name__)
 
@@ -253,27 +254,35 @@ def _round_trips(copier: PageCopier) -> bool:
     return torch.equal(back[:, 1:], device[:, :3])
 
 
+# Each factory reads its class when called, so a test can swap one in.
+PAGE_COPIER: StrategySlot[PageCopier] = StrategySlot("kv.page_copier", reference="torch")
+PAGE_COPIER.register(
+    "libcudart", lambda: CudartCopier(), platforms={"cuda"}, verify=_round_trips,  # noqa: PLW0108 - late-bound
+)
+PAGE_COPIER.register(
+    "cuda.bindings", lambda: CudaBindingsCopier(), platforms={"cuda"}, verify=_round_trips,  # noqa: PLW0108 - late-bound
+)
+PAGE_COPIER.register(
+    "libamdhip64", lambda: HipCopier(), platforms={"rocm"}, verify=_round_trips,  # noqa: PLW0108 - late-bound
+)
+PAGE_COPIER.register("torch", lambda: TorchCopier())  # noqa: PLW0108 - late-bound
+
+
 @functools.cache
 def make_page_copier() -> PageCopier:
     """The fastest copier that works here; `TorchCopier` off CUDA and ROCm."""
-    if current_platform.is_cuda():
-        candidates = (CudartCopier, CudaBindingsCopier)
-    elif current_platform.is_rocm():
-        candidates = (HipCopier,)
-    else:
-        return TorchCopier()
-    for cls in candidates:
-        try:
-            copier = cls()
-            if _round_trips(copier):
-                logger.info("KV page copies: one 2D async memcpy a run of pages, via %s", cls.name)
-                return copier
-            logger.warning("KV page copies: %s returned wrong data; not using it", cls.name)
-        except (ImportError, OSError, AttributeError, RuntimeError) as e:
-            logger.info("KV page copies: %s unavailable (%s)", cls.name, e)
-    logger.warning(
-        "KV page copies: no 2D async memcpy binding works here, so offload "
-        "and reload fall back to copy_, which blocks the host and runs several "
-        "times slower"
-    )
-    return TorchCopier()
+    resolved = PAGE_COPIER.resolve()
+    for skip in resolved.skipped:
+        if skip.kind is SkipKind.WRONG:
+            logger.warning("KV page copies: %s returned wrong data; not using it", skip.strategy)
+        else:
+            logger.info("KV page copies: %s unavailable (%s)", skip.strategy, skip.reason)
+    if resolved.name != PAGE_COPIER.reference:
+        logger.info("KV page copies: one 2D async memcpy a run of pages, via %s", resolved.impl.name)
+    elif resolved.skipped:
+        logger.warning(
+            "KV page copies: no 2D async memcpy binding works here, so offload "
+            "and reload fall back to copy_, which blocks the host and runs several "
+            "times slower"
+        )
+    return resolved.impl

@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 
 from mstar.platforms import current_platform
+from mstar.platforms.capabilities import capabilities
 
 try:
     import triton
@@ -25,7 +26,7 @@ _ENABLED = True
 
 def fused_available(t: torch.Tensor) -> bool:
     # the kernels use NVIDIA's libdevice and PDL intrinsics
-    return _ENABLED and _HAS_TRITON and t.is_cuda and not current_platform.is_rocm()
+    return _ENABLED and _HAS_TRITON and t.is_cuda and capabilities().nvidia_triton_extras
 
 
 if _HAS_TRITON:

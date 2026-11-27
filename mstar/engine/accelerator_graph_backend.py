@@ -214,6 +214,23 @@ _GRAPH_BACKENDS: dict[str, type[AcceleratorGraphBackend]] = {
 }
 
 
+def register_graph_backend(
+    device_type: str, backend_cls: type[AcceleratorGraphBackend], *, replace: bool = False,
+) -> None:
+    """Capture and replay graphs on ``device_type``'s devices through ``backend_cls``.
+
+    ``DeviceCapability`` keeps the backend it found per device, so register before the
+    first ``DeviceCapability.of`` of a device of that type: a device looked up earlier
+    keeps running eagerly.
+    """
+    if device_type in _GRAPH_BACKENDS and not replace:
+        raise ValueError(
+            f"device type {device_type!r} already has graph backend "
+            f"{_GRAPH_BACKENDS[device_type].__name__}"
+        )
+    _GRAPH_BACKENDS[device_type] = backend_cls
+
+
 def get_accelerator_graph_backend(
     device: torch.device,
 ) -> AcceleratorGraphBackend:

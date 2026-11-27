@@ -23,6 +23,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from mstar.kernels import Impl, KernelOp, TableEntry, Tolerance, register
 from mstar.kernels.registry import on_reset
+from mstar.platforms.capabilities import capabilities
 
 
 @dataclasses.dataclass(frozen=True)
@@ -894,7 +895,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     buf = _expert_buffers(x, top_k, w13.shape[0], w13.shape[1] // 2, tuning.pair_max_tokens,
                           out)
     if T:
-        pdl = torch.cuda.get_device_capability(x.device)[0] >= 9
+        pdl = capabilities(x.device).pdl
         _launch_router(x, gate_w, bias, part, topk_w, topk_ids, scale, normalize, pdl, tuning)
         _launch_experts(x, topk_ids, topk_w, w13, s13, w2, s2, shared_w13, shared_w2, buf,
                         block_size, swiglu_limit, pdl, tuning)

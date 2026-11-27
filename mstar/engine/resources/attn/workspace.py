@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import torch
 
+from mstar.utils.device import DeviceCapability
+
 logger = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
@@ -88,19 +90,19 @@ class Workspace:
             raise RuntimeError(self._short(asked, why) + self._floor_hint(asked)) from cause
         size = -(-asked // _MIB) * _MIB
         device = self.tensor.device
-        if device.type == "cuda":
+        if DeviceCapability.of(device).is_accelerator:
             # any kernel still reading it is done before its memory goes back to the allocator
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
         # the old buffer goes first, which leaves room on a GPU that fits one but not both
         self.tensor.data = self.tensor.new_empty(0)
         try:
             self.tensor.data = torch.empty(size, dtype=torch.uint8, device=device)
-        except torch.cuda.OutOfMemoryError as oom:
+        except torch.OutOfMemoryError as oom:
             why = f"the GPU has no room to grow it: {oom}"
             try:
                 # back to what it held, which every plan made on it so far fitted
                 self.tensor.data = torch.empty(have, dtype=torch.uint8, device=device)
-            except torch.cuda.OutOfMemoryError:
+            except torch.OutOfMemoryError:
                 why += f"; nor to take back the {have} bytes it held"
             raise RuntimeError(self._short(asked, why)) from cause
         logger.info(

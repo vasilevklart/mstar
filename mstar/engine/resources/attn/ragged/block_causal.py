@@ -19,6 +19,7 @@ import torch
 from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim, zero_unplanned_rows
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.kv.plan import token_runs
+from mstar.platforms.capabilities import capabilities
 
 
 def block_causal_layout(
@@ -141,7 +142,7 @@ class RaggedBlockCausalWrapper:
         # fresh and pinned per plan: FlashInfer H2Ds these non-blocking, so a
         # reused source could be overwritten while its copy is in flight
         t = values if torch.is_tensor(values) else torch.tensor(values, dtype=torch.int32)
-        return t.pin_memory() if torch.cuda.is_available() else t
+        return t.pin_memory() if capabilities().pinned_host_memory else t
 
     @torch.compiler.disable
     def plan(self, seg_lens: list[int]) -> None:
