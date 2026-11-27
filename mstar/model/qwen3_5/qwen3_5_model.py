@@ -432,8 +432,9 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
                     "deployment asked for a vision_encoder node. Drop it from "
                     "`node_groups`."
                 )
+            # the loaders raise on any parameter they don't fill, so none needs an init
             tower = self._build(
-                lambda: Qwen3_5VisionModel(self.vision_config), dtype, device,
+                lambda: Qwen3_5VisionModel(self.vision_config), dtype, device, params_on_meta=True,
             )
             load_qwen3_5_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()
@@ -445,7 +446,7 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
 
         model = self._build(
-            lambda: Qwen3_5ForCausalLM(self.config, tp_group), dtype, device,
+            lambda: Qwen3_5ForCausalLM(self.config, tp_group), dtype, device, params_on_meta=True,
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
