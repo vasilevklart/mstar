@@ -15,12 +15,20 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import http.client
+import json
 import os
 import sys
+import threading
+import urllib.request
 from pathlib import Path
 
 import mstar
 from mstar.utils.socket_prefix import per_port_socket_prefix
+from mstar.utils.threads import Thread
+
+#: Seconds between the launcher's /health checks while the server starts.
+HEALTH_POLL_S = 2.0
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
@@ -137,12 +145,60 @@ def _resolve_config(model: str, override: str | None) -> str:
 
 
 def _client_host(host: str) -> str:
-    # 0.0.0.0 binds all interfaces but isn't a connectable address for clients.
-    return "localhost" if host in ("0.0.0.0", "") else host
+    # A wildcard binds every interface but isn't an address a client can connect to.
+    if host in ("0.0.0.0", "", "::"):
+        return "localhost"
+    return f"[{host}]" if ":" in host else host
+
+
+def _base_url(host: str, port: int) -> str:
+    return f"http://{_client_host(host)}:{port}"
+
+
+def _starting(model: str, host: str, port: int) -> str:
+    base = _base_url(host, port)
+    return "\n".join([
+        "",
+        f"  mstar: starting '{model}'; it listens on {base} once it is ready.",
+        "  Loading the weights and compiling can take several minutes on a first start.",
+        f"  Progress is in the log below. The client snippets print here when {base}/health answers.",
+        "",
+    ])
+
+
+def _healthy(url: str, timeout_s: float = 5.0) -> bool:
+    """Whether GET ``url`` answers 200 with ``{"status": "healthy"}``. (mstar-server's
+    /health waits up to 2 s for the API server to answer a ping.)"""
+    # No proxy: an http_proxy in the environment must not answer for this host.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout_s) as resp:
+            body = json.load(resp)
+    except (OSError, ValueError, http.client.HTTPException):
+        # not listening yet, a 503, or not our server
+        return False
+    return isinstance(body, dict) and body.get("status") == "healthy"
+
+
+def _announce_when_healthy(url: str, banner: str) -> threading.Event:
+    """Print ``banner`` to stderr once ``url`` reports healthy, from a daemon
+    thread. Setting the returned event stops the watch: the server exited."""
+    stop = threading.Event()
+
+    def watch() -> None:
+        while not stop.is_set():
+            if _healthy(url):
+                if not stop.is_set():
+                    print(banner, file=sys.stderr, flush=True)
+                return
+            stop.wait(HEALTH_POLL_S)
+
+    Thread(target=watch, name="mstar-serve-ready", daemon=True).start()
+    return stop
 
 
 def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> str:
-    base = f"http://{_client_host(host)}:{port}"
+    base = _base_url(host, port)
     # Never echo the key itself; the SDK reads MSTAR_API_KEY when not passed one.
     sdk_key = ", api_key=\"<your key>\"" if api_key_set else ""
     oai_key = "<your key>" if api_key_set else "none"
@@ -302,12 +358,19 @@ def _serve(args: argparse.Namespace) -> None:
 
     from mstar.api_server.auth import resolve_api_key
 
-    print(_next_steps(args.model, args.host, args.port,
-                      api_key_set=resolve_api_key(args.api_key) is not None), file=sys.stderr)
+    # The server listens only after the weights load and the model compiles,
+    # minutes later on a first start, so "serving" waits for /health.
+    print(_starting(args.model, args.host, args.port), file=sys.stderr)
+    banner = _next_steps(args.model, args.host, args.port,
+                         api_key_set=resolve_api_key(args.api_key) is not None)
 
     from mstar.api_server.entrypoint import main as serve_main
 
-    serve_main(argv)
+    stop_watching = _announce_when_healthy(f"{_base_url(args.host, args.port)}/health", banner)
+    try:
+        serve_main(argv)
+    finally:
+        stop_watching.set()
 
 
 def build_parser() -> argparse.ArgumentParser:

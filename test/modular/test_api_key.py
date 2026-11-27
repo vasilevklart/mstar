@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import threading
 
 import pytest
 
@@ -203,9 +204,15 @@ def test_mstar_serve_forwards_the_key_and_never_prints_it(monkeypatch, capsys):
     from mstar.cli import main as cli
 
     seen = {}
+
+    def announce(url, banner):  # the snippets print once /health answers
+        seen["banner"] = banner
+        return threading.Event()
+
     monkeypatch.setattr(entrypoint, "main", lambda argv: seen.setdefault("argv", argv))
+    monkeypatch.setattr(cli, "_announce_when_healthy", announce)
     cli.main(["serve", "kokoro", "--api-key", KEY])
     argv = seen["argv"]
     assert argv[argv.index("--api-key") + 1] == KEY
-    printed = capsys.readouterr().err
-    assert KEY not in printed and 'api_key="<your key>"' in printed
+    printed = capsys.readouterr().err + seen["banner"]
+    assert KEY not in printed and 'api_key="<your key>"' in seen["banner"]

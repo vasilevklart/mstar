@@ -14,6 +14,8 @@ def launched(monkeypatch):
     fake = types.ModuleType("mstar.api_server.entrypoint")
     fake.main = calls.append
     monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake)
+    # a server this machine already runs on the port must not answer the ready check
+    monkeypatch.setattr(cli, "_healthy", lambda url, timeout_s=5.0: False)
     return calls
 
 
