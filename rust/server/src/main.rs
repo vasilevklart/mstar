@@ -273,14 +273,80 @@ async fn main() {
         }
     };
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
-    axum::serve(listener, axum::ServiceExt::<Request<Body>>::into_make_service(app))
+    serve(listener, app, HEADER_READ_TIMEOUT, shutdown_signal()).await;
+    transcription::remove_local_uploads();
+}
+
+/// How long a client may take to send a request's headers, which also closes
+/// a keep-alive connection left idle that long: hyper's default, which it
+/// applies only once a timer is set.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serves HTTP/1.1, with upgrades for the WebSockets, until `shutdown`, then
+/// drains the open connections, as `axum::serve(..).tcp_nodelay(true)
+/// .with_graceful_shutdown(..)` did. `axum::serve` sets no timer, so hyper
+/// drops its header timeout, and a client that sends nothing, or its headers
+/// a byte at a time, holds a connection and its fd before the key is checked.
+/// HTTP/1.1 only, as before: axum's `http2` feature is off.
+async fn serve<S>(
+    listener: tokio::net::TcpListener,
+    app: S,
+    header_read_timeout: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()>,
+) where
+    S: tower::Service<Request<Body>, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    let (stop, stopped) = tokio::sync::watch::channel(());
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    accept_failed(e).await;
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
         // Disable Nagle: SSE/NDJSON streams write many small chunks, and
         // Nagle + delayed ACK turns each flush into a ~40 ms stall.
-        .tcp_nodelay(true)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
-    transcription::remove_local_uploads();
+        let _ = stream.set_nodelay(true);
+        let service = hyper_util::service::TowerToHyperService::new(tower::ServiceExt::map_request(
+            app.clone(),
+            |req: Request<hyper::body::Incoming>| req.map(Body::new),
+        ));
+        let mut stopping = stopped.clone();
+        tokio::spawn(async move {
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(header_read_timeout)
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades();
+            let mut conn = std::pin::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => return,
+                _ = stopping.changed() => conn.as_mut().graceful_shutdown(),
+            }
+            let _ = conn.await;
+        });
+    }
+    // stop accepting, ask every connection to finish, and wait until they have
+    drop(listener);
+    drop(stopped);
+    let _ = stop.send(());
+    stop.closed().await;
+}
+
+/// As `axum::serve` treats an accept error: a peer that went away is skipped,
+/// anything else (most often EMFILE) is logged and waited out for a second.
+async fn accept_failed(e: std::io::Error) {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    if !matches!(e.kind(), ConnectionAborted | ConnectionRefused | ConnectionReset) {
+        eprintln!("mstar-server: accept failed: {e}");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// Exits once the process that launched this one is gone (`mstar serve`
@@ -2080,6 +2146,39 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_connection_that_stalls_before_its_headers_end_is_closed() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(super::serve(listener, app, Duration::from_millis(200), async {
+            let _ = stopped.await;
+        }));
+        let get = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+
+        for sent in [&b""[..], &get[..get.len() - 2]] {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client.write_all(sent).await.unwrap();
+            let mut reply = Vec::new();
+            let closed = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut reply)).await;
+            assert!(closed.is_ok(), "still open 5 s after sending {:?}", String::from_utf8_lossy(sent));
+        }
+
+        // a complete request is served, and shutdown still drains the
+        // keep-alive connection it leaves open
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(get).await.unwrap();
+        let mut reply = [0u8; 12];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"HTTP/1.1 200");
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server).await.expect("shutdown did not drain").unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_speech_clip_is_removed_once_the_last_piece_is_done_with_it() {
         let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));

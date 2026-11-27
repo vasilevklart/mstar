@@ -32,6 +32,10 @@ libc = "0.2"
 http-body-util = "0.1"
 # Rewrites MSTAR_ROOT_PATH before routing; already in the tree through axum.
 tower = { version = "0.5", features = ["util"] }
+# The accept loop in `serve`, which sets the header-read timeout axum::serve
+# can't; already in the tree through axum.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 webpki-roots = "0.26"
 url = "2"

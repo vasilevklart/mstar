@@ -945,6 +945,8 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "mstar-rust",
  "ort",
