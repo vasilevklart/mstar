@@ -1,4 +1,4 @@
-"""[all] is the union of the model extras (docs/installation.rst), and the
+"""[all] is the union of the model extras (docs/mintlify/installation.mdx), and the
 Docker images install Kokoro's spaCy tagger next to it."""
 
 import re

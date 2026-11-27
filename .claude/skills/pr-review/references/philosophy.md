@@ -139,7 +139,7 @@ saying why"; invariant 9; C3, C16.
 - Does a model call transformers, diffusers or an upstream package at runtime for its main compute,
   or import private upstream functions?
 - For a new dependency: right `pyproject.toml` extra and in `all`; a floor or pin; in
-  `docs/installation.rst`; the body says why.
+  `docs/mintlify/installation.mdx`; the body says why.
 - Are new non-Python files listed in `package-data` (#377)? Is any API used that only exists in a
   torch newer than the floor?
 
@@ -152,7 +152,7 @@ fixes are never behind a flag, and a flag that stays is documented as a general 
 
 Maps to: invariants 2, 8, 9; B7, B9, B12.
 
-- For each new `MSTAR_*` env var: a row in `docs/environment_variables.rst`? Per-model (generalize)
+- For each new `MSTAR_*` env var: a row in `docs/mintlify/environment_variables.mdx`? Per-model (generalize)
   or an A/B leftover (delete)? Does it gate a bug fix (ungate it)?
 - A hard-coded backend, device, path or size in model code (`.to("cuda")`, `"fa2"`, `/mnt/<user>`,
   a checkpoint path in YAML)?
@@ -204,7 +204,7 @@ Maps to: AGENTS.md "Testing" (`CPU_TEST_PATHS` and `NOT_CPU_CORE` in
 
 ## 15. Write for the next model author
 
-A hook a model must implement isn't finished until `docs/adding_models.rst` says what it returns
+A hook a model must implement isn't finished until `docs/mintlify/adding_models.mdx` says what it returns
 and when. Comments are short, explain the non-obvious, and are written for someone who didn't see
 the debugging session. Names describe the general concept (`custom_pos_advance`, not
 `mrope_pos_advance`). Aggregates are typed.
@@ -212,7 +212,7 @@ the debugging session. Names describe the general concept (`custom_pos_advance`,
 Maps to: S1, S2; invariant 9; B1, B3, B6, B8, B10, B13, C5.
 
 - Is every new or changed hook on `Model`, `NodeSubmodule` or a resource documented in
-  `docs/adding_models.rst`, with its return contract?
+  `docs/mintlify/adding_models.mdx`, with its return contract?
 - Comment blocks over about three lines that tell a debugging story or cite plan steps or PR
   numbers? Surprising code with no "why"?
 - Shared code using a name that mentions a model, protocol or parallelism mode, or an old name whose

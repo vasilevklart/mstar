@@ -1,4 +1,4 @@
 """M* eval framework: one runner, one results schema, task suites.
 
-See docs/evaluation.rst. Entry point: ``python -m benchmark.eval``.
+See docs/mintlify/evaluation.mdx. Entry point: ``python -m benchmark.eval``.
 """

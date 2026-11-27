@@ -169,7 +169,7 @@ class OmniVoiceModel(Model):
         # the same architecture is served from a local volume just as often.
         # _refresh_checkpoint_defaults is what catches a fine-tune whose
         # config actually diverged. Documented in
-        # docs/environment_variables.rst.
+        # docs/mintlify/environment_variables.mdx.
         self.model_path_hf = os.environ.get("MSTAR_OMNIVOICE_MODEL_PATH") or model_path_hf
         self.cache_dir = cache_dir
         self.config = OmniVoiceConfig()

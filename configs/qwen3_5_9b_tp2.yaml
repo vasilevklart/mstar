@@ -4,7 +4,8 @@ max_seq_len: 32768
 # collects almost every step and runs a full collection every few hundred.
 knobs:
   gc_gen0_threshold: 50000
-# Captured text-prefill and mixed-step ladders (see docs/serving.rst): the
+# Captured text-prefill and mixed-step ladders (see prefill_token_buckets in
+# docs/mintlify/reference/config.mdx): the
 # powers of two to 2048, and on text prefill 1152-1792 too, so a prompt a
 # little past 1024 tokens doesn't pad to 2048 (on a mixed step every (rows,
 # tokens) pair is one more compile against Dynamo's recompile limit). The LLM's

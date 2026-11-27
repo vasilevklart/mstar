@@ -124,7 +124,7 @@ class CanaryQwenModel(Model):
     # slack covers containers that decode longer than their header said, and
     # stays inside the largest encoder graph (4096 mel frames, 512 audio tokens)
     MAX_AUDIO_SECONDS = 40.96
-    # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
+    # a few tiny ops per upload; see "Preprocessing threads" in docs/mintlify/adding_models.mdx
     PREPROCESS_TORCH_THREADS = 1
     MAX_SEQ_LEN = 2048
     # the requests the default cache holds at full length; configs/canary_qwen.yaml

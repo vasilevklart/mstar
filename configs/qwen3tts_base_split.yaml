@@ -2,7 +2,8 @@
 # workers of their own, all on GPU 0 (rank_devices) as clients of one MPS daemon, so the
 # Talker's decode steps overlap codec windows and reference encodes. It serves more audio
 # a second than configs/qwen3tts_base.yaml (one worker) from c=8 up and is level
-# at c=1; see docs/models.rst. NVIDIA only: it needs nvidia-cuda-mps-control on PATH.
+# at c=1; see docs/mintlify/models/qwen3-tts.mdx. NVIDIA only: it needs nvidia-cuda-mps-control
+# on PATH.
 # Model settings and pool sizes are configs/qwen3tts_base.yaml's.
 model: "qwen3_tts_base"
 max_seq_len: 32768

@@ -7,11 +7,11 @@ max_seq_len: 512
 model_kwargs:
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
-  # transformer is still not bit-exact with the eager path (measured PSNR: compile_exact_ops in docs/models.rst)
+  # transformer is still not bit-exact with the eager path (compile_exact_ops in docs/mintlify/models/flux-z-image.mdx)
   compile_eager_rounding: true
   # compile_exact_ops keeps op classes on the eager kernels inside the compiled forward. On Z-Image the cost is the
-  # 180 norm graph breaks per step (see compile_exact_ops in docs/models.rst). Default: the fast plain compile; set
-  # [norms] for reference-faithful output.
+  # 180 norm graph breaks per step (see compile_exact_ops in docs/mintlify/models/flux-z-image.mdx). Default: the
+  # fast plain compile; set [norms] for reference-faithful output.
   compile_exact_ops: false
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
@@ -40,7 +40,7 @@ model_kwargs:
   # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
-  # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
+  # newly ready requests into it; `false` = lockstep, within a few percent (see docs/mintlify/models/flux-z-image.mdx)
 
 node_groups:
   - node_names: [text_encoder]

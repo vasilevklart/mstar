@@ -2349,7 +2349,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         and key it by latent shape; the per-prompt rotary tables, the latents
         and the timestep flow in as static-buffer inputs.
 
-        Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
+        Set ``COSMOS3_DISABLE_ACCELERATOR_GRAPH=1`` to skip capture and run the denoise
         loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
         Set ``COSMOS3_GEN_CAPTURE_RES`` (e.g. ``"192x320,480x832"``, height x
         width) to override which resolutions are captured, and

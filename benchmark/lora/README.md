@@ -134,7 +134,7 @@ What to read:
 Any `failed` request in a `load_c*.json` invalidates that run.
 
 A step none of whose rows names an adapter replays a capture with no LoRA kernel in it
-(a lean capture, see "Lean captures" in `docs/adding_models.rst`). Measured before
+(a lean capture, see "Lean captures" in `docs/mintlify/contributing/state-contract.mdx`). Measured before
 main had resident decode planning (#1127), on an H200 with
 `compare_engines` (3 rounds, per-arm `e_off`), Qwen3.5-9B base-model traffic (GPU-bound)
 kept 96.2/96.2/97.2% of its LoRA-off throughput at c=1/32/64 without that capture and
@@ -202,7 +202,7 @@ Results go to `prefix_cache.json` and `server.log` under `--out`.
 The CPU tests behind it are in `test/modular/test_lora_prefix_keys.py` (a real
 `KVManager` fed the preprocess worker's kwargs as the conductor hands them over) and
 the Orpheus test above. Above one rank the prefix cache is off unless
-`prefix_cache_tp: true` is set (`docs/serving.rst`), which this phase does not cover.
+`prefix_cache_tp: true` is set (`docs/mintlify/serving.mdx`), which this phase does not cover.
 
 ## 6. Loading and unloading adapters at runtime, under base traffic (about 15 minutes)
 

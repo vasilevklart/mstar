@@ -199,8 +199,8 @@ Paths are on `main`; grep the symbol if a file has moved.
   their consumer walk (AGENTS.md invariant 12).
 - Streaming readiness (`is_ready_for_streaming`, `mstar/graph/base.py`): a node missing only
   streaming inputs is ready when a chunk arrives. That is how "waiting for more input" is expressed.
-- Initial inputs: `process_prompt` and `get_initial_forward_pass_args` (`mstar/model/base.py`) turn
-  the API request into the first edges, once.
+- Initial inputs: `process_prompt` (`mstar/model/base.py`) turns the API request into the first
+  edges, once.
 - Examples: Qwen3-Omni (thinker → talker), `nemotron_duplex`, Orpheus, fish_s2_pro.
 
 **State** (`mstar/engine/resources/`)

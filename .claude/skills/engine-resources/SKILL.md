@@ -13,8 +13,6 @@ A model declares the state it keeps between steps in `declare_state` and any oth
 
 ## Which resource for which state
 
-Entries marked *open PR* are not on `main` yet. Check the checkout; if your port needs one, stack on that PR or say in the description which resource you used instead.
-
 | state | resource | expresses |
 |---|---|---|
 | a cache that grows with the request | paged KV (`KVSpec` + `PagedKVConfig`), optionally a `RetentionPolicy` | any length; retention keeps a protected prefix plus the newest pages |
@@ -76,4 +74,4 @@ KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-req
 
 ## Scope
 
-KV layout is engine-side Python only; a cache-layout change needs no `rust/` change (invariant 5 covers the graph runtime, wire format and edges). New resource kinds should still land as their own PR under the model that needs them; see "Splitting work across PRs" in [AGENTS.md](../../../AGENTS.md). Document the resource in `docs/adding_models.rst` (invariant 9).
+KV layout is engine-side Python only; a cache-layout change needs no `rust/` change (invariant 5 covers the graph runtime, wire format and edges). New resource kinds should still land as their own PR under the model that needs them; see "Splitting work across PRs" in [AGENTS.md](../../../AGENTS.md). Document the resource in `docs/mintlify/contributing/state-contract.mdx` (invariant 9).

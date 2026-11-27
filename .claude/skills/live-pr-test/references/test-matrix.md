@@ -64,9 +64,7 @@ Verify the exact config, client name and flags against the PR's checkout before 
 
 ## Server settings for every run
 
-- `MSTAR_SHM_ARENA=1` (set in `env.sh`; off by default otherwise).
-- `MSTAR_TP_ASYNC_SCHED=1` whenever the config has `tp_size` or `sp_size` > 1. It must match on every rank, which it does when set on the `mstar serve` process.
-- The Rust extension built and active: check for `control mesh transport: rust` and `graph runtime: rust` in each server log, and record them in the report.
+- The Rust extension built and active: check for `control mesh transport: rust` in each server log, and record it in the report.
 - Distinct `--port` and `--socket-path-prefix` per concurrently running server; start and stop everything through the benchmarking skill's `scripts/server.sh`.
 - Readiness timeout sized for the slowest cold compile in the plan (qwen3-omni's first Inductor compile has exceeded 15 minutes): `--timeout 2400`.
 

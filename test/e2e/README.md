@@ -120,7 +120,7 @@ server's startup.
   Chatterbox needs `pyloudnorm` and `resemble-perth` (multilingual adds
   `pykakasi` and `spacy-pkuseg`); Qwen3-TTS needs `qwen-tts`; Qwen3-Omni needs
   `qwen-omni-utils` and `flash-attn`; OmniVoice needs the git build described in
-  `docs/installation.rst`. Install them without changing the installed `torch`,
+  `docs/mintlify/models/omnivoice.mdx`. Install them without changing the installed `torch`,
   `torchcodec` or `transformers` versions. The exception is OmniVoice: its git
   build requires `transformers>=5.3`, so run it from a separate environment.
 - Gated checkpoints (Orpheus, FLUX.2-klein 9B) need a logged-in Hugging Face

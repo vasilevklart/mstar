@@ -16,9 +16,9 @@ resources:
   kv:
     max_num_pages: 1024
 model_kwargs:
-  # Denoise CUDA-graph capture knobs (serving). cuda_graph=false serves eager;
-  # graph_max_latent_area caps which resolutions are captured (latent H*W).
-  # The COSMOS3_DISABLE_CUDA_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars
+  # Denoise CUDA-graph capture knobs (serving). accelerator_graph: false serves
+  # eager; graph_max_latent_area caps which resolutions are captured (latent H*W).
+  # The COSMOS3_DISABLE_ACCELERATOR_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars
   # override.
   accelerator_graph: true
   graph_max_latent_area: 2000

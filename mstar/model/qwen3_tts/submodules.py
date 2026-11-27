@@ -1016,7 +1016,7 @@ class CodecSubmodule(ARNodeSubmodule):
     CAPTURE_BATCH_SIZES = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 28, 32]
     MAX_BATCH_SIZE = CAPTURE_BATCH_SIZES[-1]
     # The opt-in watermark's captures are per chunk length and cost far more
-    # memory each (see docs/models.rst), so they keep power-of-two buckets.
+    # memory each, so they keep power-of-two buckets.
     WATERMARK_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     def __init__(

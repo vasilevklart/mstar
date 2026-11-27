@@ -7,8 +7,6 @@ description: End-to-end workflow for adding a model to M* — reconnaissance on 
 
 A model is not done when it produces correct output once. It is done when it is decomposed sensibly, registered everywhere, batched, capturable, benchmarked against the competition, and its media output has been looked at by a human.
 
-Supersedes the `add-mstar-model` skill drafted in PRs [#214](https://github.com/mstar-project/mstar/pull/214) and [#253](https://github.com/mstar-project/mstar/pull/253). Much of the design guidance below is distilled from the `mstar-model-port` and `model-recon` skills on [`garv/new-model-support-agent-2`](https://github.com/mstar-project/mstar/tree/garv/new-model-support-agent-2/.claude/skills), themselves distilled from the Waypoint port — those remain worth reading as standalone deep treatments of reconnaissance and port planning.
-
 Read [AGENTS.md](../../../AGENTS.md) alongside this. Invariants 1, 2, 3, 4 and 8 are the ones model ports trip over, and the PR reviewer cites them by number.
 
 ## Two drift patterns seen in real agent-written ports
@@ -21,7 +19,7 @@ Check your own work against both before anything else, because both produce code
 
 ## Phase 0 — Verify the contract in the checkout, not in the docs
 
-Read `Model` in `mstar/model/base.py` and list its current abstract hooks and `declare_state`, whose types are in `mstar/engine/state/contract.py`; read `NodeSubmodule` and `ARNodeSubmodule` in `mstar/model/submodule_base.py`; read the declarations and implementations under `mstar/engine/resources/` with their focused tests. `docs/adding_models.rst` is the narrative guide and worth reading, but the checkout is authoritative — the docs were wrong about the registry's own type signature for a long time. If a direction you need requires an API that does not exist, record that and stop rather than reviving an older one.
+Read `Model` in `mstar/model/base.py` and list its current abstract hooks and `declare_state`, whose types are in `mstar/engine/state/contract.py`; read `NodeSubmodule` and `ARNodeSubmodule` in `mstar/model/submodule_base.py`; read the declarations and implementations under `mstar/engine/resources/` with their focused tests. `docs/mintlify/adding_models.mdx` is the narrative guide and worth reading, but the checkout is authoritative — the docs were wrong about the registry's own type signature for a long time. If a direction you need requires an API that does not exist, record that and stop rather than reviving an older one.
 
 Then check you can actually run the reference, before any design work:
 
@@ -51,7 +49,7 @@ Diff your `state_dict()` against the checkpoint's safetensors index by **name an
 
 - Anything you want independently schedulable or independently placeable is its own node — that is what buys disaggregation via `node_groups`.
 - Where to draw the line between two adjacent stages is a judgement call. Start from precedent in the repo, then reason about performance: what crosses the edge and how large it is, whether either side is worth placing, scaling, or scheduling independently, and how it affects capture. LTX-2.5 keeps its text encoder and text connectors in one node because Gemma's stacked hidden states are ~30× the connectors' output; splitting there would ship the large tensor between nodes to gain nothing.
-- Decide now which nodes need tensor or sequence parallelism. TP has to be designed into the linear layers from the start (`tp_enabled_nodes` in the sharding config), and retrofitting it is a rewrite of the layers. SP is declarations: a `SeqShardSpec`, its step in every `declare_step` branch, and a `scatter`/`gather` bracket around the layer stack, with attention reached through the resources (LTX-2.5 and cosmos3 with its `*_tp2_sp2.yaml` are the precedent; **Sequence and context parallelism** in `docs/adding_models.rst`).
+- Decide now which nodes need tensor or sequence parallelism. TP has to be designed into the linear layers from the start (`tp_enabled_nodes` in the sharding config), and retrofitting it is a rewrite of the layers. SP is declarations: a `SeqShardSpec`, its step in every `declare_step` branch, and a `scatter`/`gather` bracket around the layer stack, with attention reached through the resources (LTX-2.5 and cosmos3 with its `*_tp2_sp2.yaml` are the precedent; **Sequence and context parallelism** in `docs/mintlify/contributing/state-contract.mdx`).
 - A finished artifact and an ordered stream of partial results are **different modalities** even when the bytes look alike. Add a modality only when the lifecycle differs.
 - Streaming partitions are for parts of the graph that should run asynchronously, passing data as it is produced rather than at walk boundaries. Read invariant 12 first; the coordination and finish-condition hazards are real.
 
@@ -61,7 +59,7 @@ Diff your `state_dict()` against the checkpoint's safetensors index by **name an
 
 A **resource** is state the engine must admit, plan, commit and clean up per request, and that must survive graph capture: persistent cross-step state, and anything planned over it. Everything else is a submodule.
 
-State a node keeps between steps is declared in `declare_state`, as Step 2a of `docs/adding_models.rst` shows, and its layers reach it through handles. The engine builds the resource behind each declaration, so for that state the pass below decides the declaration and checks the resource the engine builds for it. A declaration the engine can't build yet fails at load with `no layout yet` and names what's missing. The gap is in `mstar/engine/state/adapters.py`, the layer that builds resources from declarations, and sometimes in the resource itself, which the paragraphs below cover. A new model package is listed in `PORTED` in `test/modular/test_state_lint.py`, which fails one that isn't. When the contract can't declare its state yet, the mask or op and its binding in `mstar/engine/state/adapters.py` land first, in their own PR.
+State a node keeps between steps is declared in `declare_state`, as Step 2a of `docs/mintlify/adding_models.mdx` shows, and its layers reach it through handles. The engine builds the resource behind each declaration, so for that state the pass below decides the declaration and checks the resource the engine builds for it. A declaration the engine can't build yet fails at load with `no layout yet` and names what's missing. The gap is in `mstar/engine/state/adapters.py`, the layer that builds resources from declarations, and sometimes in the resource itself, which the paragraphs below cover. A new model package is listed in `PORTED` in `test/modular/test_state_lint.py`, which fails one that isn't. When the contract can't declare its state yet, the mask or op and its binding in `mstar/engine/state/adapters.py` land first, in their own PR.
 
 **Do an explicit resource pass before writing submodules**, one row per piece of per-request or per-step state and per attention, sampling or position operation:
 
@@ -88,7 +86,7 @@ If the model gets OpenAI routes, its adapter lands in both frontends: the Python
 
 Grep for callers before overriding any base-model or submodule hook — the hook surface contains refactored-out methods that nothing calls, and overriding one is a silent no-op.
 
-The engine calls `submodule.to(device, dtype)` *after* `get_submodule` (`mstar/worker/engine_manager.py:82`), so per-parameter dtype fixes applied at construction do not survive. If a module has dtype-sensitive parameters — FlashInfer's GDN kernels assert fp32 on the decay terms — enforce it in the module's own `_apply`, so it holds against any caller rather than one loader.
+The engine calls `submodule.to(device, dtype)` *after* `get_submodule` (`mstar/worker/engine_manager.py:488`), so per-parameter dtype fixes applied at construction do not survive. If a module has dtype-sensitive parameters — FlashInfer's GDN kernels assert fp32 on the decay terms — enforce it in the module's own `_apply`, so it holds against any caller rather than one loader.
 
 Reuse from `mstar/model/components/`, and put anything reusable across models there rather than in your package. For MoE models, CUDA-graph compatibility comes from the vLLM kernels shipped in `mstar/model/components/moe.py`. For image and video flow models, build the `dit` node on the DiT scaffold in `mstar/model/components/diffusion/`; read the [diffusion-scaffold skill](../diffusion-scaffold/SKILL.md) first.
 
@@ -102,7 +100,7 @@ Validate in this order:
 2. A standalone eager pipeline from the reference as an independent oracle. Do not wrap the upstream pipeline as the served implementation — oracle only.
 3. Your node forwards against that oracle.
 4. Walks, state and resource declarations, request layouts and step declarations on CPU, before weights (`pytest test/modular/`, dummy mode, `get_submodule` returns `None`).
-5. Live serving against the oracle on deterministic input, through the API server and not only the engine: the streamed output equals the non-streamed one sample for sample, with the same length (compare decoded audio or frames, not response bytes: a streamed WAV carries an unknown-length header); two identical requests on one server return identical bytes; an edge budget (`max_tokens` of 1 or 2) returns exactly that much; and a malformed field is a 400 and the server serves normally afterwards. Where a route enforces the media rules of #411 (open PR), check that the model's media fields follow them too. Keep the script under `test/<model>/` and exit nonzero on any mismatch.
+5. Live serving against the oracle on deterministic input, through the API server and not only the engine: the streamed output equals the non-streamed one sample for sample, with the same length (compare decoded audio or frames, not response bytes: a streamed WAV carries an unknown-length header); two identical requests on one server return identical bytes; an edge budget (`max_tokens` of 1 or 2) returns exactly that much; and a malformed field is a 400 and the server serves normally afterwards. Where a route enforces the media rules of #411 (request media may not name a server file path), check that the model's media fields follow them too. Keep the script under `test/<model>/` and exit nonzero on any mismatch.
 
 When a parity check fails, diff per-layer hidden states against the oracle, then split the first bad layer into its parts — each norm, the mixer, the MLP. A mixer compared in isolation can pass while its enclosing layer is wrong, because the isolated comparison feeds both sides the same input; the norms and the residual are where convention mismatches live.
 

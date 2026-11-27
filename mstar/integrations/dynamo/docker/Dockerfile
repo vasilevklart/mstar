@@ -12,7 +12,7 @@
 # The default is CUDA 13, which needs an r580+ driver: flash-attn publishes
 # its torch 2.10 wheel only for CUDA 13. For an r570 host, override these
 # together and supply a flash-attn wheel built from source for cu12 and
-# torch 2.10 (docs/installation.rst):
+# torch 2.10 (docs/mintlify/installation.mdx):
 #   --build-arg CUDA_IMAGE=docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
 #   --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu128
 #   --build-arg FLASH_ATTN_WHEEL=<your cu12 torch2.10 wheel>
@@ -36,7 +36,7 @@ ARG TORCHAUDIO_VERSION=2.10.0
 # torchcodec against this torch fails at runtime with undefined symbols.
 ARG TORCHCODEC_VERSION=0.10.0
 # flash-attn ships no PyPI wheels; install the GitHub release wheel whose
-# cu1x / torchX.Y / cpXY tags match the torch above (docs/installation.rst).
+# cu1x / torchX.Y / cpXY tags match the torch above (docs/mintlify/installation.mdx).
 ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 # Mooncake publishes one wheel per CUDA major: -cuda13 here, plain
 # mooncake-transfer-engine (the extras' default) for CUDA 12.
@@ -92,7 +92,7 @@ RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all]" \
         "setuptools>=78.1.1"
 
 # Qwen3-TTS's speech tokenizer is not in [all]: --no-deps keeps its
-# transformers==4.57.3 pin out of the environment (docs/installation.rst).
+# transformers==4.57.3 pin out of the environment (docs/mintlify/models/qwen3-tts.mdx).
 RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps "qwen-tts==0.1.1"
 
 # The graph runtime is Rust, and an editable install does not compile it. The

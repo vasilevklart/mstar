@@ -266,7 +266,7 @@ def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
         raise ImportError(
             "Qwen3-TTS Codec requires the 'qwen-tts' package, installed "
             f"without its dependencies: {QWEN_TTS_INSTALL} (see "
-            "docs/installation.rst)"
+            "https://m-star-labs.mintlify.site/installation#manual-installs)"
         ) from exc
 
     source_root = Path(distribution.locate_file(

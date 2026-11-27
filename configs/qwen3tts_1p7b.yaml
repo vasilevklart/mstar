@@ -8,7 +8,7 @@ max_seq_len: 32768
 model_kwargs:
   # bf16 codec decoder (RMSNorm and RoPE stay fp32): 101 Seed-TTS req/s under
   # the streaming SLO where float32 holds 90 (H200), at 35 dB SNR from the
-  # float32 decode and the same WER (docs/models.rst)
+  # float32 decode and the same WER (codec_dtype in docs/mintlify/models/qwen3-tts.mdx)
   codec_dtype: bfloat16
   # A 4-frame first chunk (320 ms of audio): [1, 3, 8, 16] halves idle first
   # audio (15 vs 31 ms p50 at 1 req/s) but holds 90 Seed-TTS req/s, not 101

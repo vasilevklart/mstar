@@ -506,7 +506,7 @@ class Cosmos3Config:
     # ----- denoise CUDA-graph capture (serving knobs) -----
     # Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier
     # accelerator). Set False to serve the denoise loop eagerly. The env var
-    # COSMOS3_DISABLE_CUDA_GRAPH, when set, overrides this.
+    # COSMOS3_DISABLE_ACCELERATOR_GRAPH, when set, overrides this.
     accelerator_graph: bool = True
     # Only capture resolutions whose latent H*W is at or below this; larger tiers
     # (720p+, video) run eager+dense where the graph is net-slower. The env var

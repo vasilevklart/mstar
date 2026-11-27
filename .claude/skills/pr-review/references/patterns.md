@@ -182,7 +182,7 @@ Can a fixed limit be too small and let the bug return (#73)? Make a constant an 
 default (#165); derive a recompile limit instead of fixing it to today's configs (#178).
 
 ### B12. Document every new env var
-AGENTS.md invariant 9: a row in `docs/environment_variables.rst` (#164, #185).
+AGENTS.md invariant 9: a row in `docs/mintlify/environment_variables.mdx` (#164, #185).
 
 ### B13. Type-annotate parameters model authors implement against (#95). Minor.
 
@@ -203,7 +203,7 @@ AGENTS.md invariant 9: a row in `docs/environment_variables.rst` (#164, #185).
   missing.
 - **C4. Performance changes need A/B numbers per mechanism** (AGENTS.md invariants 9, 10; #185,
   #368).
-- **C5. Register and document new models:** `docs/models.rst`, `mstar/cli/main.py`, a model class in
+- **C5. Register and document new models:** `docs/mintlify/models.mdx`, `mstar/cli/main.py`, a model class in
   `benchmark/base.py`, the `all` extra (#184, #249).
 - **C6. Keep `forward` capturable** (AGENTS.md invariant 3): data-dependent control flow captures one
   branch (#31); keep `preprocess` a pure function of its inputs (#184).

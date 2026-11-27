@@ -4,7 +4,7 @@ codec is a :class:`Codec` (typed msgpack by default, so an edge can
 terminate in a Rust process); ``register_event_for_poll`` forwards the eventfd to
 the Rust poller; a readiness poll buffers any consumed message so nothing is
 dropped or reordered. Build: ``maturin develop --release`` in ``rust/``
-(see ``docs/installation.rst``)."""
+(see ``docs/mintlify/installation.mdx``)."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class RustZMQCommunicator(BaseCommunicator):
             raise RuntimeError(
                 "RustZMQCommunicator needs the mstar_rust extension; build it "
                 "with `maturin develop --release` in rust/ "
-                "(see docs/installation.rst)"
+                "(see https://m-star-labs.mintlify.site/installation#rust)"
             )
         transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)

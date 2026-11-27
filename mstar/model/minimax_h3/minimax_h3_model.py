@@ -11,7 +11,7 @@ Nodes:
 
 Walks: encode_text or encode_keyframes, then generate_{av,video,audio}[_keyframes]: the
 denoise loop and the decoders asked for. Video and audio always denoise together; the
-walk only picks the decoders. Request knobs: docs/models.rst.
+walk only picks the decoders. Request knobs: docs/mintlify/models/minimax-h3.mdx.
 """
 
 from __future__ import annotations

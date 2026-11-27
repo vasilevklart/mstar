@@ -1,5 +1,5 @@
 """GLM-5.2 lays out its one paged label, so the preprocess worker and the conductor hold
-each request to the context its prompt leaves (``docs/adding_models.rst``, Paged KV layouts)."""
+each request to the context its prompt leaves (``docs/mintlify/adding_models.mdx``, Layouts)."""
 
 from __future__ import annotations
 

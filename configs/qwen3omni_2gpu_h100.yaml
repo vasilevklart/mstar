@@ -8,8 +8,8 @@ max_seq_len: 32768
 # so the large buckets no longer replay, but they are still captured and still take
 # that memory; whether 1,024 pages fit with today's ladders and encoder placement is
 # unmeasured.
-# Host pages give a full pool a request to move; see the Qwen3-Omni notes in
-# docs/models.rst for when to set max_concurrent_requests.
+# Host pages give a full pool a request to move; see
+# docs/mintlify/models/qwen3-omni.mdx for when to set max_concurrent_requests.
 resources:
   thinker_kv:
     max_num_pages: 512

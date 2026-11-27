@@ -1,7 +1,7 @@
 //! `/v1/realtime` conversations (OpenAI's GA events) with a full-duplex model,
 //! one whose client stream declares `ClientAudio` and that decides when to
 //! speak: a port of `serving_realtime.RealtimeConversation` (see its
-//! docstring, and docs/clients.rst for the protocol).
+//! docstring, and docs/mintlify/clients.mdx for the protocol).
 //!
 //! The call is one engine request, opened by the first append with the
 //! session's instructions as its prompt; formats and instructions are fixed

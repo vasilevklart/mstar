@@ -153,7 +153,7 @@ class Flux2KleinModel(Model):
         self.loras = [LoraFile.parse(item) for item in (lora or [])]
         # The transformer's block linears in a low-precision format (mxfp8, nvfp4), with this deployment's extra
         # bf16 patterns on top of the model's declaration, and optionally some denoise steps in bf16 on a twin.
-        # Trades image fidelity for speed; see docs/models.rst.
+        # Trades image fidelity for speed; see docs/mintlify/models/flux-z-image.mdx.
         self.linear_dtype = check_linear_dtype(linear_dtype)
         self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
         self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)

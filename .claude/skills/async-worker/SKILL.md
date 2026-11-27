@@ -23,7 +23,7 @@ The worker does not run one batch at a time. While batch N's kernels are on the 
 
 Knobs: **`MSTAR_TP_ASYNC_SCHED` is `1`, so lockstep-parallel (TP/SP/CFG) nodes speculate too.** `0` runs them serially, which is still a supported path: a change that only works with speculation on needs testing with it off as well. It also takes a comma-separated node list. The worker `all_gather`s the value and raises if it disagrees across the ranks of an instance — an instance of invariant 11 made into a startup check.
 
-The others: `MSTAR_PRE_PLAN_SPEC`, `MSTAR_MAX_CONSECUTIVE_SPEC_STEPS`, `MSTAR_SPEC_PEEK_FOR_FAIRNESS`, `MSTAR_LAUNCH_WAIT_MS`, `MSTAR_ENGINE_STEP_SYNC`, `MSTAR_FORWARD_SIDE_STREAM`. Defaults for all of these are in [docs/environment_variables.rst](../../../docs/environment_variables.rst); check it rather than assuming. Per-node opt-out from async scheduling entirely: `enable_async_scheduling=False` on the `GraphNode`.
+The others: `MSTAR_PRE_PLAN_SPEC`, `MSTAR_MAX_CONSECUTIVE_SPEC_STEPS`, `MSTAR_SPEC_PEEK_FOR_FAIRNESS`, `MSTAR_LAUNCH_WAIT_MS`, `MSTAR_ENGINE_STEP_SYNC`. Defaults for all of these are in [docs/mintlify/environment_variables.mdx](../../../docs/mintlify/environment_variables.mdx); check it rather than assuming. Per-node opt-out from async scheduling entirely: `enable_async_scheduling=False` on the `GraphNode`.
 
 ## One iteration
 

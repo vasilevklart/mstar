@@ -43,8 +43,9 @@ path until the arena is measured there. It then sends every tensor as a per-uuid
 still reads its peers' arenas, so it mixes with entities that have one.
 
 Selection: ``create_tensor_communication_manager`` builds this manager for
-the SHM protocol; the file transport it extends is its spill path. See
-:doc:`environment_variables` for the knobs.
+the SHM protocol; the file transport it extends is its spill path. The
+knobs are in docs/mintlify/environment_variables.mdx (the Communication
+section).
 """
 
 from __future__ import annotations

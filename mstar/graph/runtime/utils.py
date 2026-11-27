@@ -19,7 +19,7 @@ def require_rust_extension(rust_dir: Path = CHECKOUT_RUST) -> None:
             "The graph runtime needs the mstar_rust extension, which this environment "
             "does not have. The Linux wheels of mstar-ai on PyPI carry it; from a "
             "checkout, build it with `maturin develop --release -m rust/Cargo.toml` "
-            "(see docs/installation.rst)."
+            "(see https://m-star-labs.mintlify.site/installation#rust)."
         ) from e
     if not is_mstar_rust_crate(rust_dir):
         return

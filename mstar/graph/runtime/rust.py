@@ -15,7 +15,7 @@ Rust never sees a tensor. It holds a share of the same ``TensorBookkeeping``
 Python gave ``TensorStore``, so descriptors and refcounts stay in one place.
 
 Build: ``maturin develop --release -m rust/Cargo.toml`` (see
-``docs/installation.rst``).
+``docs/mintlify/installation.mdx``).
 """
 from __future__ import annotations
 

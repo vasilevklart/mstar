@@ -1,6 +1,6 @@
 # Registering a model
 
-Five places, four of them easy to forget. A model can be entirely correct and still be unreachable because one of these is missing, and no unit test catches it. `test/modular/test_model_registration.py` covers the first, second and fourth.
+Five places, four of them easy to forget. A model can be entirely correct and still be unreachable because one of these is missing. `test/modular/test_model_registration.py` catches a missing first, second or fourth; no test catches the third or fifth.
 
 ## 1. `mstar/model/registry.py` — required
 
@@ -20,7 +20,7 @@ HF_MODELS: dict[str, dict] = {
 }
 ```
 
-Note that `docs/adding_models.rst` showed the wrong signature for a long time (`dict[str, type[Model]]` with a direct import). Trust the file.
+The model-authoring guide showed the wrong signature for a long time (`dict[str, type[Model]]` with a direct import). Trust the file.
 
 ## 2. `mstar/cli/main.py` — required
 
@@ -38,9 +38,9 @@ This namespace is a superset of `MODEL_REGISTRY`: a key here may be a deployment
 
 The same file builds the post-launch client example from a series of `if model in (...)` tuples — the plain `client.generate(...)` form, and an OpenAI-compatible block for models with OpenAI semantics. A model absent from all of them still serves, but prints no usage example. Add it to whichever tuples match its modalities.
 
-## 4. `docs/models.rst` — required for a released model
+## 4. `docs/mintlify/models.mdx` — required for a released model
 
-One row in the registry-key table, marked `*(Beta)*` if that applies. This is the list users actually read.
+One row in the supported-models matrix, with the registry key in backticks in the first cell, marked beta if that applies. This is the list users actually read. Add the model to its family page under `docs/mintlify/models/` too, or start one.
 
 ## 5. `mstar/api_server/openai/adapters.py` — only if the model needs OpenAI routes
 

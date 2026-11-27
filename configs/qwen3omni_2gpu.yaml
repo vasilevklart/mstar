@@ -7,7 +7,7 @@ max_seq_len: 32768
 # H100 is unmeasured; qwen3omni_2gpu_h100.yaml is the H100 placement. On H200-class
 # GPUs, when concurrent requests hold more than 128k tokens of Thinker KV, serve
 # qwen3omni_2gpu_large_kv.yaml, which keeps 2,048 pages (256k tokens) on the GPU; see
-# the Qwen3-Omni notes in docs/models.rst for its caveats.
+# docs/mintlify/models/qwen3-omni.mdx for its caveats.
 resources:
   thinker_kv:
     max_num_pages: 1024

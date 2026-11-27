@@ -5,7 +5,7 @@ max_seq_len: 65536
 # on an H200 (an H100 has 81,559 MiB; not run on one). A 20 min file holds about
 # 122 pages of 128 tokens for its prompt and up to 32 for its transcript, so the
 # two pools hold about 32 of them at full size.
-# More long files than that at once can stall (see docs/asr.rst).
+# More long files than that at once can stall (see docs/mintlify/models/whisper-qwen-asr.mdx).
 max_concurrent_requests: 64
 # See whisper_large_v3_turbo.yaml; level at a held clock, 60-75% at the default one.
 knobs:

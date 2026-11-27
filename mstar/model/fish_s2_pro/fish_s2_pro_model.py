@@ -131,7 +131,7 @@ class FishS2ProModel(Model):
         # Server-init knob: decode the codec with TF32 off (the reference's fp32).
         # Off by default: TF32 speeds up the codec's conv stack, most of the GPU
         # time once requests overlap, for a small SNR cost (measured on the
-        # earlier windowed codec; see the Fish S2-Pro notes in docs/models.rst).
+        # earlier windowed codec; see docs/mintlify/models/fish-s2-pro.mdx).
         self.codec_exact_fp32 = bool(kwargs.get("codec_exact_fp32", False))
         self.local_dir = _resolve_snapshot(model_path_hf, cache_dir, list(METADATA_FILES))
         logger.info(LICENSE_NOTICE)

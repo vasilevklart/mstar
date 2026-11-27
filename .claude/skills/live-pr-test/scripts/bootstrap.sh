@@ -80,7 +80,6 @@ export HF_PERSIST=$HF HF_HOME=$HF_SERVE
 export UV_CACHE_DIR=\$HOME/.cache/uv PIP_CACHE_DIR=\$HOME/.cache/pip
 export UV_LINK_MODE=hardlink
 export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH
-export MSTAR_SHM_ARENA=1
 # Inductor/Triton autotune results and FlashInfer JIT builds, restored from and saved to
 # CACHE_TAR so a new box doesn't recompile every kernel. Keyed by compute capability.
 export COMPILE_CACHE=$COMPILE

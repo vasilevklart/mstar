@@ -155,7 +155,7 @@ def make_communicator(
             "The control mesh runs on the mstar_rust extension, which this "
             "environment does not have. The Linux wheels of mstar-ai on PyPI "
             "carry it; from a checkout, build it with `maturin develop "
-            "--release -m rust/Cargo.toml` (see docs/installation.rst)."
+            "--release -m rust/Cargo.toml` (see https://m-star-labs.mintlify.site/installation#rust)."
         ) from e
     from mstar.communication.rust_communicator import RustZMQCommunicator
 

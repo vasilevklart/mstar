@@ -40,7 +40,7 @@ class build_py_with_configs(build_py):
 # cibuildwheel builds, or a build from the sdist): the mstar_rust extension and
 # the mstar-server binary (the HTTP frontend), which installs into the
 # environment's scripts directory. Every other build is the pure-Python
-# package, and a checkout builds both with cargo/maturin (docs/installation.rst).
+# package, and a checkout builds both with cargo/maturin (docs/mintlify/installation.mdx).
 # setuptools' editable finder cannot import a top-level extension built in
 # place, and compiling it would slow every `pip install -e .`.
 rust_extensions = []

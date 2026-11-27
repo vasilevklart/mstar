@@ -11,12 +11,12 @@ max_seq_len: 512
 model_kwargs:
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
-  # transformer is still not bit-exact with the eager path (measured PSNR: compile_exact_ops in docs/models.rst)
+  # transformer is still not bit-exact with the eager path (compile_exact_ops in docs/mintlify/models/flux-z-image.mdx)
   compile_eager_rounding: true
   # op classes kept on the eager result inside the compiled forward: with the norms kept the compiled
   # transformer was bit-exact with the eager one (measured while the q/k norms were graph breaks; the
   # activations add nothing but graph breaks), and with vae_compile: false so was every served image
-  # (see compile_exact_ops in docs/models.rst)
+  # (see compile_exact_ops in docs/mintlify/models/flux-z-image.mdx)
   compile_exact_ops: [norms]
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
@@ -30,10 +30,10 @@ model_kwargs:
   # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
-  # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
+  # newly ready requests into it; `false` = lockstep, within a few percent (see docs/mintlify/models/flux-z-image.mdx)
   # linear_dtype: bf16 (default), mxfp8 or nvfp4 runs the block linears through a block-scaled GEMM, faster and
   # further from the bf16 image of the same seed; linear_keep_bf16 and linear_dtype_steps keep some linears or steps
-  # in bf16. See docs/models.rst before turning it on
+  # in bf16. See docs/mintlify/models/flux-z-image.mdx before turning it on
   # LoRA adapters folded into the transformer at load (diffusers / PEFT or BFL-layout
   # safetensors; ``scale`` multiplies the adapter). Example:
   # lora:

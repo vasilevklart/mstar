@@ -967,7 +967,7 @@ class _AgentTurn:
 class RealtimeConversation:
     """Drives one ``/v1/realtime`` conversation (OpenAI's GA events) with a
     full-duplex model: one whose client stream declares ``ClientAudio`` and
-    that decides when to speak (see docs/clients.rst for the protocol).
+    that decides when to speak (see docs/mintlify/clients.mdx for the protocol).
 
     The call is one engine request, opened by the first append with the
     session's instructions as its prompt; formats and instructions are fixed

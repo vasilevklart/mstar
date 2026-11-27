@@ -24,7 +24,7 @@ ARG TORCHAUDIO_VERSION=2.10.0
 # torchcodec against this torch fails at runtime with undefined symbols.
 ARG TORCHCODEC_VERSION=0.10.0
 # flash-attn ships no PyPI wheels; the GitHub release wheel's tags must
-# match the torch above (docs/installation.rst).
+# match the torch above (docs/mintlify/installation.mdx).
 ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 # Mooncake publishes one wheel per CUDA major: -cuda13 here, plain
 # mooncake-transfer-engine (the extras' default) for CUDA 12.
@@ -80,7 +80,7 @@ RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all,dynamo]" \
         "setuptools>=78.1.1"
 
 # Qwen3-TTS's speech tokenizer is not in [all]: --no-deps keeps its
-# transformers==4.57.3 pin out of the environment (docs/installation.rst).
+# transformers==4.57.3 pin out of the environment (docs/mintlify/models/qwen3-tts.mdx).
 RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps "qwen-tts==0.1.1"
 
 # The graph runtime is Rust, and an editable install does not compile it. The

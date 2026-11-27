@@ -99,7 +99,7 @@ def compile_transformer_forward(
     modules on the eager result (``exclude_from_compile``) and compiles the rest — ``True`` for
     all of them, or a list of the op classes to keep (``["norms"]``, ``["activations"]``), since
     every kept module but a 1-D ``torch.nn.RMSNorm`` is a graph break that costs fusion
-    (measured PSNR, and Z-Image's cost: ``compile_exact_ops`` in docs/models.rst).
+    (Z-Image's cost: ``compile_exact_ops`` in docs/mintlify/models/flux-z-image.mdx).
 
     ``recompile_limit`` replaces the process-wide limit for this forward only, where ``torch.compile`` takes it
     (torch 2.12 and up); an older torch gets the process-wide limit raised to it instead, since the keyword would

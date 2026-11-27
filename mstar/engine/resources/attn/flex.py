@@ -53,7 +53,7 @@ def _flash_unavailable_reason() -> str | None:
 def _resolve_flex_backend() -> str:
     """Read once at import. Unset defaults to FLASH and falls back to TRITON,
     bit-for-bit the previous kernel, when FLASH cannot run; an explicit FLASH
-    fails instead. See docs/installation.rst for installing flash-attn-4."""
+    fails instead. See docs/mintlify/models/world-models.mdx for installing flash-attn-4."""
     requested = os.environ.get("MSTAR_FLEX_BACKEND")
     if requested is not None and requested not in _ALLOWED_FLEX_BACKENDS:
         raise ValueError(

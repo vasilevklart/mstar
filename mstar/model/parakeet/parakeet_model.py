@@ -57,7 +57,7 @@ class ParakeetModel(Model):
     MAX_AUDIO_SECONDS = 610.0
     # requests the default state pool holds; the YAMLs cap max_concurrent_requests here
     MAX_CONCURRENT_REQUESTS = 128
-    # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
+    # a few tiny ops per upload; see "Preprocessing threads" in docs/mintlify/adding_models.mdx
     PREPROCESS_TORCH_THREADS = 1
     # Requests prepare at once: the loaders and process_prompt keep no shared
     # state, and the decode releases the GIL. Inline at c=32, a request queued

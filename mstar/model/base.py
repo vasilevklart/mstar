@@ -1365,7 +1365,7 @@ class Model(ABC):
         return 24000
 
     # ``(start_id, end_id)``: the text tokens that open and close a full-duplex
-    # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
+    # model's turns (see "Streams from the client" in docs/mintlify/adding_models.mdx); None: none.
     turn_tokens: tuple[int, int] | None = None
     # A model whose replies may never get their end mark: a reply ends after this many
     # steps with no text, no mark and no audio above ``turn_silence_rms`` (the RMS of

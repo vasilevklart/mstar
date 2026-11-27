@@ -92,7 +92,7 @@ class CanaryModel(Model):
     # the requests the default caches hold at full length; configs/canary.yaml
     # caps max_concurrent_requests here, so the conductor queues the rest
     MAX_CONCURRENT_REQUESTS = 64
-    # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
+    # a few tiny ops per upload; see "Preprocessing threads" in docs/mintlify/adding_models.mdx
     PREPROCESS_TORCH_THREADS = 1
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs):

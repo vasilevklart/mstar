@@ -2,7 +2,7 @@
 each phase. ``benchmark/worker_phases`` reads what this writes out.
 
 Set ``MSTAR_PHASE_TIMING`` to a positive period (in passes) to turn it on; see
-``docs/environment_variables.rst``.
+``docs/mintlify/environment_variables.mdx``.
 """
 import gc
 import logging

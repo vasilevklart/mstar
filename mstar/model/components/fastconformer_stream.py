@@ -360,9 +360,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     def _blocks_stream(self, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
         """A stream step of the blocks, and the projection. The residual
         goes in fp32, which the fused add + LayerNorm keeps: under bf16 autocast
-        a bf16 residual put the frames measurably further from an fp32 run (see
-        docs/models.rst). The offline encoders keep theirs in bf16; for Canary
-        an fp32 one was no closer."""
+        a bf16 residual put the frames measurably further from an fp32 run. The
+        offline encoders keep theirs in bf16; for Canary an fp32 one was no closer."""
         return self.projection(self.encoder.blocks_stream(x.float(), n))
 
     # -- the front end --------------------------------------------------------

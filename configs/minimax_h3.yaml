@@ -11,8 +11,8 @@ max_seq_len: 8192
 # its share of the clips, so rank 0 schedules it between denoise steps on all four. Both
 # compiled. The Qwen3-VL-32B conditioner (~53 GB for the 50 layers it runs) and the audio
 # decoder on rank 0, the keyframe encoder on rank 1, so rank 0 needs a 141 GB GPU (117 GiB
-# in use once loaded); the SP2 and SP8 configs place them the same way. Measured settings and
-# times: docs/models.rst.
+# in use once loaded); the SP2 and SP8 configs place them the same way. Settings:
+# docs/mintlify/models/minimax-h3.mdx.
 model_kwargs:
   compile: true
   vae_tile_batch: 28

@@ -3,7 +3,8 @@
 # plus the RefEncoder node, which turns the request's
 # reference clip into the x-vector and codec frames the clone prefill needs.
 # Every node on one worker, on any GPU. On NVIDIA, configs/qwen3tts_base_split.yaml
-# (a worker per node under MPS) serves more audio a second from c=8 up; see docs/models.rst.
+# (a worker per node under MPS) serves more audio a second from c=8 up; see
+# docs/mintlify/models/qwen3-tts.mdx.
 # KV geometry is identical across sizes (28 layers, 8 KV heads, head_dim 128).
 # The codec dtype, codec slots and gc threshold are configs/qwen3tts_1p7b.yaml's (same codec).
 model: "qwen3_tts_base"
@@ -19,7 +20,7 @@ resources:
   talker_attn:
     flashinfer_backend: fa2
   # Every request reserves its whole KV footprint at admission: a streamed one
-  # can't pause (unpausable_outputs, see docs/serving.rst), and none can be
+  # can't pause (unpausable_outputs, see docs/mintlify/reference/config.mdx), and none can be
   # rebuilt after a drop (its prompt is rows, not ids) with no host pool. That is
   # its prompt plus its length cap: a few pages of 128 tokens for a clone capped
   # by its text budget, about 66 for one that asks for the checkpoint's 8192

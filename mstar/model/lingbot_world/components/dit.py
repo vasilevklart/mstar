@@ -60,8 +60,9 @@ def require_flash_attn() -> None:
     except ImportError as e:
         raise ImportError(
             "LingBot-World's reference attention is FlashAttention-2 (flash_attn_varlen_func), as the "
-            "reference runs; install flash-attn (docs/installation.rst, 'flash-attn (Qwen3-Omni, "
-            "LingBot-World)') or serve without reference_numerics."
+            "reference runs; install flash-attn "
+            "(https://m-star-labs.mintlify.site/models/world-models#lingbot-install) "
+            "or serve without reference_numerics."
         ) from e
 
 
