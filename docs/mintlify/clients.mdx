@@ -43,6 +43,7 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
 reply = client.chat.completions.create(
     model="qwen3_5_4b",                      # mstar serve qwen3_5_4b
     messages=[{"role": "user", "content": "Give me one fun fact."}],
+    extra_body={"enable_thinking": False},   # Qwen3.5 reasons first by default
 )
 print(reply.choices[0].message.content)
 ```

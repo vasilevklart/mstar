@@ -34,9 +34,13 @@ The Python SDK sends images with `images=` and videos with `video=`:
 from mstar import MStarClient
 
 client = MStarClient("http://localhost:8000")
-print(client.chat("What is in this image?", images="cat.jpg", max_output_tokens=256).text)
-print(client.generate(text="Describe this clip.", video="clip.mp4", max_output_tokens=512).text)
+print(client.chat("What is in this image?", images="cat.jpg", max_output_tokens=256,
+                  enable_thinking=False).text)
+print(client.generate(text="Describe this clip.", video="clip.mp4", max_output_tokens=512,
+                      enable_thinking=False).text)
 ```
+
+Qwen3.5 reasons before it answers unless `enable_thinking` is false ([Options](#options)). The reasoning comes back in the text, ending with `</think>`, and counts against `max_output_tokens`: with reasoning on, 256 tokens ran out before the image answer started.
 
 The OpenAI route takes `image_url` and `video_url` parts. The server reads remote URLs only when `MSTAR_ALLOW_REMOTE=1`, so send a data URI:
 
