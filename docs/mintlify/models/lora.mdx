@@ -1,0 +1,78 @@
+---
+title: "Per-request LoRA adapters"
+description: "Serve PEFT LoRA adapters per request, and load or unload them while the server runs."
+---
+
+A `resources: lora:` block in a serving config serves PEFT adapters per request. Requests on different adapters, and on none, share a batch.
+
+## Supported models {#models}
+
+| Model | Keys | Node | Targets | Validated |
+|---|---|---|---|---|
+| Qwen3.5 and Qwen3.8 | `qwen3_5_*`, `qwen3_8_27b` | `LLM`, `vision_encoder` | Every linear of the text stack, `lm_head`, `embed_tokens`; the vision tower's blocks, merger and patch embed | yes |
+| Orpheus | `orpheus` | `LLM` | `qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`, `lm_head`, `embed_tokens` | yes |
+| Higgs Audio | `higgs_audio` | `LLM` | `qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`, `lm_head` | yes |
+| Qwen3-Omni | `qwen3_omni` | `Thinker` | `qkv_proj`, `o_proj`, dense-layer `gate_up_proj` and `down_proj`, `lm_head`; the routed experts only when `targets:` names them | no |
+| Qwen3-TTS | `qwen3_tts*` | `Talker` | `qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`, `codec_head` | no |
+| Chatterbox | `chatterbox`, `chatterbox_multilingual` | `T3` | `qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`, `speech_head` | no |
+
+Every row runs CPU checks of the model's stack against merged weights; the GPU checks are in [benchmark/lora/README.md](https://github.com/mstar-project/mstar/blob/main/benchmark/lora/README.md). The rows marked no are not validated: serve them at your own risk.
+
+`configs/phi4mm.yaml` ships a `lora:` block for the checkpoint's own vision and speech adapters, which the model picks per request from its media. With more `max_slots`, the same pool serves your adapters on text-only requests.
+
+## Configure {#configure}
+
+Add the block to a copy of the model's config and start it with `mstar serve <model> --config <path>`:
+
+```yaml
+resources:
+  lora:
+    max_slots: 4
+    max_rank: 16
+    adapters:
+      sql: /adapters/qwen3_5-4b-sql/adapter_model.safetensors
+      chat: /adapters/qwen3_5-4b-chat   # a PEFT directory
+```
+
+Every adapter the block names is checked at startup (LoRA layers present, rank within `max_rank`, supported targets, shapes that fit), and one that fails stops the server with an error naming it.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_slots` | `4` | Adapters resident on the device at once, beside the zero adapter base rows use. |
+| `max_rank` | `16` | Largest adapter rank. Every slot is sized to it. |
+| `cpu_capacity` | `16` | Adapters kept in pinned host memory. |
+| `adapters` | `{}` | Name to safetensors file or PEFT directory. |
+| `targets` | with `runtime_updates` off, the targets the named adapters touch; with it on, every target but Qwen3-Omni's experts | The targets to serve. An adapter that touches a target left out is refused. List Qwen3-Omni's experts targets here to serve them. |
+| `runtime_updates` | `false` | Serve the load and unload routes. |
+| `runtime_update_timeout_s` | `120` | How long a load waits for every worker before it fails with a 504 and is undone. |
+
+## Send a request {#request}
+
+On any OpenAI route, the `model` field picks the adapter. The base model's name, its Hugging Face repo id or no `model` runs the base model; an unknown name is a 400. On `/generate`, pass `model_kwargs: {"lora_adapter": "<name>"}`. `GET /v1/models` lists the adapters beside the base model.
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "sql", "messages": [{"role": "user", "content": "List the tables in a library database."}]}'
+```
+
+## Load and unload at runtime {#runtime-updates}
+
+The routes take vLLM's bodies. They make the server read paths a client names, so they answer 404 unless the block sets `runtime_updates: true`. The block may name no adapters at all: `resources: {lora: {max_slots: 4, runtime_updates: true}}`.
+
+```bash
+curl -X POST localhost:8000/v1/load_lora_adapter -H 'Content-Type: application/json' \
+  -d '{"lora_name": "sql", "lora_path": "/adapters/qwen3_5-4b-sql"}'
+curl -X POST localhost:8000/v1/unload_lora_adapter -H 'Content-Type: application/json' \
+  -d '{"lora_name": "sql"}'
+```
+
+- `lora_path` must be readable at the same path by the API server and every worker.
+- A load is checked as at startup and becomes selectable once every worker has it. A load that fails anywhere is undone everywhere and answered with a 400, as is a name already loaded.
+- To change an adapter's weights, unload it and load it again; a worker refuses weights that changed on disk under a loaded name.
+- An unload stops new requests on the name at once; running requests finish on its weights. Unloading an unknown name is a 404.
+
+## Limits {#limits}
+
+- Refused at startup, or with a 400 on a runtime load, naming the reason: DoRA (`use_dora`), `modules_to_save`, trainable tokens, bias LoRA, other PEFT methods, a module outside the targets, and shapes that do not fit (an adapter for another model size).
+- Qwen3-Omni's experts targets are refused under expert parallelism, and only per-expert adapters (`experts.<N>.<proj>`) are read. Chatterbox Turbo takes no adapters.
+- Other families take no per-request adapters. FLUX.2 klein merges adapters at load instead ([options](/models/flux-z-image#options)).

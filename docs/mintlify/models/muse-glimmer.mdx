@@ -1,0 +1,80 @@
+---
+title: "Muse Glimmer"
+description: "Text and image in, text out on Meta's Muse Glimmer 30B VLM."
+---
+
+Muse Glimmer is Meta's 30B dense VLM: three sliding-window layers for each NoPE global layer, and a windowed ViT perception encoder. It takes text and images and returns text. Support is in beta.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `muse_glimmer` | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) | `configs/muse_glimmer.yaml` | 1 | `all` |
+
+The model has no extra of its own; `all` covers its imports. The bf16 weights are about 60 GB: the default config needs one 141 GB GPU, such as an H200. On two 80 GB GPUs, serve the TP2 config.
+
+```bash
+uv pip install --torch-backend=auto -e ".[all]"
+mstar serve muse_glimmer --gpus 0
+mstar serve muse_glimmer --config configs/muse_glimmer_tp2.yaml --gpus 0,1
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.chat("What is in this image?", images="cat.jpg", max_output_tokens=1024).text)
+```
+
+On the OpenAI route, images go in `image_url` parts as data URIs (remote URLs need `MSTAR_ALLOW_REMOTE=1`):
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+image = base64.b64encode(open("cat.jpg", "rb").read()).decode()
+reply = client.chat.completions.create(
+    model="muse_glimmer",
+    messages=[{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}},
+        {"type": "text", "text": "What is in this image?"},
+    ]}],
+    max_tokens=1024,
+    extra_body={"reasoning_effort": "low"},
+)
+print(reply.choices[0].message.content)
+```
+
+The reply is the model's channel stream as generated: its reasoning addressed `to=self`, then the answer addressed `to=user`.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/muse_glimmer.yaml` | 1 | none | One 141 GB GPU. |
+| `configs/muse_glimmer_tp2.yaml` | 2 | TP2 | Two 80 GB GPUs. The model has two KV heads, so TP past 2 replicates the KV cache and saves no memory. |
+
+Both keep 2048 KV pages and set `prefix_cache: false`. Each request holds every token of the global layers but only about the last 2048 tokens of the sliding ones.
+
+## Options {#options}
+
+Request knobs go in `model_kwargs` on `/generate` and in `extra_body` on the OpenAI route.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `reasoning_effort` | the template's | Reasoning strength: `low`, `medium`, `high` or `xhigh`. `reasoning_strength` is the same knob under the template's own name. |
+| `enable_thinking` | | `false` means `low`. The template has no off switch, so the model still reasons. |
+| `current_date` | | A date string passed to the chat template. |
+| `top_k`, `min_p`, `repetition_penalty` | the checkpoint's | Sampling defaults come from the checkpoint's `generation_config.json`. A `min_p` above 0 is refused unless that file sets one. |
+
+`chat_template_kwargs` may carry any of these too; a flat key wins.
+
+## Limits {#limits}
+
+- Video input is refused.
+- The chat route refuses tool calls, `n` above 1, stop sequences and OpenAI `logprobs`.
+- No prefix cache: a KV pool that keeps a sliding window does not prefix cache yet.
+- Images resize with torchvision's antialiased Lanczos, which needs torchvision 0.27 or newer. An older torchvision falls back to PIL's Lanczos with a warning, and its pixels differ slightly.

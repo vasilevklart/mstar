@@ -1,0 +1,55 @@
+---
+title: "Higgs Audio"
+description: "Speech in, transcript out with Boson AI's Higgs Audio v3 STT."
+---
+
+Higgs Audio v3 STT: a Whisper-style audio encoder and projector feeding a dense Qwen3-1.7B decoder, which writes the transcript. Beta: functionally supported, not yet performance-optimized.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `higgs_audio` | [bosonai/higgs-audio-v3-stt](https://huggingface.co/bosonai/higgs-audio-v3-stt) | `configs/higgs_audio.yaml` | 1 | `asr` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[asr]"
+mstar serve higgs_audio
+```
+
+The model computes mel features with the `openai/whisper-large-v3` feature extractor, so a machine without network access needs that repository in its Hugging Face cache as well.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.transcribe("speech.wav"))
+```
+
+The OpenAI route takes uploads longer than 30 s and cuts them into windows:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/transcriptions \
+  -F model=higgs_audio -F file=@speech.wav
+```
+
+## Configs {#configs}
+
+| File | GPUs | Use |
+|---|---|---|
+| `higgs_audio.yaml` | 1 | The audio encoder and the LLM on one worker |
+
+## Options {#options}
+
+| Knob | Where | Default | Effect |
+|---|---|---|---|
+| `prompt` | request (`text` on `/generate`) | the model's instruction | Replaces the transcription instruction. |
+| `max_output_tokens` | request | 1024 | Transcript token cap. |
+| `encoder_graphs` | deployment `model_kwargs` | `true` | `false` runs the audio tower eagerly instead of replaying a captured graph per chunk count. |
+
+## Limits {#limits}
+
+- The model drops or repeats text on long audio, so `/v1/audio/transcriptions` cuts an upload longer than 30 s into windows of at most 30 s and runs them in parallel. `/generate` does not window; keep its clips to 30 s.
+- One audio clip per request.
+- `language` and timestamp requests are not read. A timed `response_format` gets one segment per window.

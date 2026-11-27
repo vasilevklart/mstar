@@ -1,0 +1,76 @@
+---
+title: "Phi-4-multimodal"
+description: "Text, image and audio in, text out on Microsoft's Phi-4-multimodal-instruct."
+---
+
+Phi-4-multimodal is Phi-4-mini with a SigLIP vision tower and a conformer audio tower. It takes text, images and audio and returns text. Support is in beta.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `phi4mm` | [microsoft/Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) | `configs/phi4mm.yaml` | 1 | `all` |
+
+The model has no extra of its own; `all` covers its imports.
+
+```bash
+uv pip install --torch-backend=auto -e ".[all]"
+mstar serve phi4mm
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.chat("Transcribe this clip, then summarize it.", audio="speech.wav", max_output_tokens=512).text)
+print(client.chat("What is in this image?", images="cat.jpg", max_output_tokens=256).text)
+```
+
+The OpenAI route takes `image_url`, `audio_url` and `input_audio` parts:
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+audio = base64.b64encode(open("speech.wav", "rb").read()).decode()
+reply = client.chat.completions.create(
+    model="phi4mm",
+    messages=[{"role": "user", "content": [
+        {"type": "input_audio", "input_audio": {"data": audio, "format": "wav"}},
+        {"type": "text", "text": "Transcribe this clip."},
+    ]}],
+    max_tokens=512,
+)
+print(reply.choices[0].message.content)
+```
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/phi4mm.yaml` | 1 | none | The only shipped config: the LLM and both encoders on one GPU, 131072-token context. |
+
+## Options {#options}
+
+The checkpoint ships a vision LoRA and a speech LoRA, and the model picks one per request from its media: vision for any prompt with an image, speech for audio alone, the base model for text. The config serves them from the engine's LoRA pool:
+
+```yaml
+resources:
+  lora:
+    max_slots: 2
+    max_rank: 320
+```
+
+The vision adapter has rank 256 and the speech adapter rank 320, so `max_rank` stays at 320 or more. A text-only prompt may run an adapter of the deployment's own; raise `max_slots` to hold it, and see [LoRA](/models/lora).
+
+Request knobs are the sampler's: `temperature`, `top_p`, `top_k`, `repetition_penalty`, `penalize_prompt` and `max_output_tokens`. A `min_p` above 0 is refused unless the checkpoint's `generation_config.json` sets one.
+
+## Limits {#limits}
+
+- Video input is refused.
+- Audio below 8 kHz is refused. Audio between 8 and 16 kHz runs through the 8 kHz front end, and higher rates are resampled to 16 kHz.
+- LongRoPE picks its table from the prompt's length: a prompt past 4096 tokens runs on the long table throughout. Unlike the reference, a request whose output crosses 4096 tokens stays on the table it started on.
+- The chat route refuses tool calls, `n` above 1, stop sequences and OpenAI `logprobs`.

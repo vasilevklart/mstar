@@ -1,0 +1,88 @@
+---
+title: "Whisper and Qwen3-ASR"
+description: "Speech in, transcript out with OpenAI Whisper large-v3 and Qwen3-ASR."
+---
+
+Whisper large-v3 and large-v3-turbo (four decoder layers) transcribe and translate speech, with word timestamps. Qwen3-ASR is an audio encoder over a Qwen3 decoder that hears up to 20 minutes per request and also serves [realtime transcription](/asr#realtime).
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `whisper_large_v3_turbo` | [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | `configs/whisper_large_v3_turbo.yaml` | 1 | `asr` |
+| `whisper_large` | [openai/whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) | `configs/whisper_large.yaml` | 1 | `asr` |
+| `qwen3_asr` | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | `configs/qwen3_asr.yaml` | 1 | `asr` |
+| `qwen3_asr_realtime` | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | `configs/qwen3_asr_realtime.yaml` | 1 | `asr` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[asr]"
+mstar serve whisper_large_v3_turbo
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.transcribe("speech.wav", language="en"))
+```
+
+The SDK sends one `/generate` request. For files longer than the model's clip limit (30 s for Whisper), use the OpenAI route, which cuts them into windows (`pip install openai`):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+with open("speech.wav", "rb") as f:
+    result = client.audio.transcriptions.create(
+        model="whisper_large_v3_turbo", file=f,
+        response_format="verbose_json", timestamp_granularities=["word"],
+    )
+for word in result.words:
+    print(word.start, word.end, word.word)
+```
+
+For Qwen3-ASR, drop `timestamp_granularities`; its segments are the upload's windows.
+
+## Configs {#configs}
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `whisper_large_v3_turbo.yaml` | 1 | One worker, `step_threads: serial` | Default |
+| `whisper_large_v3_turbo_split.yaml` | 1 | Encoder and decoder in two workers, MPS | A decode step never waits behind an encoder batch |
+| `whisper_large.yaml` | 1 | One worker | Default |
+| `whisper_large_split.yaml` | 1 | Two workers, MPS | As above |
+| `whisper_large_tp2.yaml` | 2 | Decoder at TP2 | No word timestamps |
+| `qwen3_asr.yaml` | 1 | One worker, 3500 KV pages and 1536 offload pages, sized for an 80 GB GPU | Default |
+| `qwen3_asr_split.yaml` | 1 | Two workers, MPS, 2048 pages, cap 12 | Bursts of whole long files |
+| `qwen3_asr_realtime.yaml` | 1 | One worker, 1024 pages | Realtime sessions |
+| `qwen3_asr_realtime_split.yaml` | 1 | Two workers, MPS | As above |
+
+`mps: true` starts a CUDA MPS daemon for the deployment and needs `nvidia-cuda-mps-control` on `PATH`; it ships with the NVIDIA driver.
+
+## Options {#options}
+
+Request fields on `/v1/audio/transcriptions`. Fields that are not OpenAI's go in `extra_body` or as extra form fields.
+
+| Field | Default | Effect |
+|---|---|---|
+| `language` | detected | Forces the language: an ISO code, or for Qwen3-ASR also a name. |
+| `prompt` | none | Whisper: prior text as decoder context. Qwen3-ASR: system-turn context. `/generate` calls it `initial_prompt`. |
+| `task` | `transcribe` | Whisper only. `translate` translates into English. |
+| `response_format`, `timestamp_granularities` | `json` | Whisper: a timed format asks for segment timestamps, `word` for word timestamps. |
+| `long_form` | `parallel` | Whisper: `sequential` decodes windows in order, each conditioned on the transcript so far and decoded again at rising temperatures when its text loops. Slower, and the only mode with that repetition guard. |
+| `window_seconds` | 30 s (Qwen3-ASR) | 5 s up to the clip limit. `1200` sends a whole Qwen3-ASR file as one request. |
+| `assistant_prefix` | none | Qwen3-ASR: text the transcript continues from. |
+| `max_output_tokens` | 4096 (Qwen3-ASR) | Transcript token cap. |
+
+Deployment keys: `max_concurrent_requests` (64; 12 in `qwen3_asr_split.yaml`), `resources.kv_cache.max_num_pages` and `cpu_offload_pages`, and `knobs: step_threads` ([Tuning](/asr#tuning)).
+
+## Limits {#limits}
+
+- Whisper hears 30 s per request. `/generate` drops audio past 30 s; only the transcription route windows longer uploads.
+- Word timestamps need the decoder on one GPU. `whisper_large_tp2.yaml` answers a word-timestamp request with a 400.
+- Whisper's decoder caches hold 64 requests. Startup refuses a `max_concurrent_requests` they cannot hold.
+- Qwen3-ASR writes no timestamps and decodes greedily. `min_p` and `repetition_penalty` are refused.
+- Admission reserves only a request's prompt. Many concurrent whole 20-minute files (`window_seconds=1200`) can fill the KV pools and wait on each other until they time out; `qwen3_asr.yaml` holds about 32 at full size. For that traffic, lower `max_concurrent_requests` or raise the pools with it.
+- Realtime transcription is served by the two Qwen3-ASR keys only.

@@ -1,0 +1,110 @@
+---
+title: "Qwen3.5 and Qwen3.8"
+description: "Text, image and video in, text out, on the Qwen3.5 dense models and Qwen3.8-27B."
+---
+
+The Qwen3.5 dense models interleave gated DeltaNet linear attention with full attention and add a ViT tower. Qwen3.8-27B is the same architecture on the same code. Every key takes text, images and video in any order in the prompt and returns text.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `qwen3_5_0.8b` | [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) | `configs/qwen3_5_0.8b.yaml` | 1 | `all` |
+| `qwen3_5_2b` | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) | `configs/qwen3_5_2b.yaml` | 1 | `all` |
+| `qwen3_5_4b` | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | `configs/qwen3_5_4b.yaml` | 1 | `all` |
+| `qwen3_5_9b` | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) | `configs/qwen3_5_9b.yaml` | 1 | `all` |
+| `qwen3_5_27b` | [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) | `configs/qwen3_5_27b_tp4.yaml` | 4 | `all` |
+| `qwen3_8_27b` | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | `configs/qwen3_8_27b_tp4.yaml` | 4 | `all` |
+
+These keys have no extra of their own; `all` covers their imports. Video input also needs FFmpeg's shared libraries on the host, which torchcodec loads.
+
+```bash
+uv pip install --torch-backend=auto -e ".[all]"
+mstar serve qwen3_5_4b
+mstar serve qwen3_8_27b --gpus 0,1,2,3
+```
+
+The shipped configs compile the vision path with two warmup requests before the server binds, so wait for `/health` before the first request.
+
+## Send a request {#request}
+
+The Python SDK sends images with `images=` and videos with `video=`:
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.chat("What is in this image?", images="cat.jpg", max_output_tokens=256).text)
+print(client.generate(text="Describe this clip.", video="clip.mp4", max_output_tokens=512).text)
+```
+
+The OpenAI route takes `image_url` and `video_url` parts. The server reads remote URLs only when `MSTAR_ALLOW_REMOTE=1`, so send a data URI:
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+image = base64.b64encode(open("cat.jpg", "rb").read()).decode()
+reply = client.chat.completions.create(
+    model="qwen3_5_4b",
+    messages=[{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}},
+        {"type": "text", "text": "What is in this image?"},
+    ]}],
+    max_tokens=256,
+    extra_body={"enable_thinking": False},
+)
+print(reply.choices[0].message.content)
+```
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/qwen3_5_0.8b.yaml`, `_2b`, `_4b`, `_9b` | 1 | none | The default for each size. |
+| `configs/qwen3_5_9b_dp2.yaml` | 2 | a replica per GPU | Video traffic on two GPUs. Each replica runs its own vision encoder. |
+| `configs/qwen3_5_9b_tp2.yaml` | 2 | TP2 | One replica across two GPUs. The vision encoder runs on one rank while the other waits for it. |
+| `configs/qwen3_5_27b_tp4.yaml` | 4 | TP4 | The default for `qwen3_5_27b`, which has no one-GPU config. |
+| `configs/qwen3_8_27b_tp4.yaml` | 4 | TP4 | The default for `qwen3_8_27b`. |
+
+All of them set `max_seq_len: 32768`. Under DP2 the conductor sends each request to the cheaper replica, judged by live requests and the prompt's predicted prefix hit.
+
+## Options {#options}
+
+Request knobs go in `model_kwargs` on `/generate` and in `extra_body` on the OpenAI route. `temperature`, `top_p`, `max_tokens` and `seed` are the standard OpenAI fields.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `enable_thinking` | `true` | `false` writes an empty, closed `<think>` block, which turns reasoning off. `chat_template_kwargs.enable_thinking` works too. |
+| `top_k`, `min_p` | the checkpoint's | A `min_p` above 0 is refused unless the checkpoint's `generation_config.json` sets one. |
+| `repetition_penalty`, `penalize_prompt` | the checkpoint's, `true` | With `penalize_prompt: false` the penalty counts generated tokens only. |
+| `max_output_tokens` | 2048 | At most the checkpoint's `max_position_embeddings`. |
+| `return_token_ids` | `false` | Adds each text chunk's sampled ids to its `metadata` on `/generate`, stop tokens included. |
+| `return_logprobs` | `false` | Adds each token's log-prob to its chunk's `metadata`. Needs `resources: sampler: enable_logprobs: true` in the config. |
+| `logprobs_mode` | `raw` | `processed` scores the token under the distribution it was drawn from. Needs `enable_processed_logprobs: true` as well. |
+
+Sampling defaults come from the checkpoint's `generation_config.json`, under whatever the request sets.
+
+Deployment keys in the YAML:
+
+| Key | Default | Effect |
+|---|---|---|
+| `resources.kv_cache.max_num_pages` | 2048 | KV pool size in 128-token pages. Raise it for many concurrent long videos: a 1 to 3 minute video is a prefill of about 11k to 12k tokens. |
+| `resources.gdn_state.max_slots` | 256; 129 in the shipped configs | DeltaNet state slots: the concurrency you serve plus one for the sink. |
+| `resources.gdn_state.state_dtype` | the checkpoint's `mamba_ssm_dtype` | `bfloat16` halves state traffic at some precision and needs FlashInfer's bf16 decode kernel. |
+| `resources.gdn_state.prefix_slots` | 0; 128 in the one-GPU and DP2 configs | DeltaNet state snapshots kept for the prefix cache, at one rank only. |
+| `prefill_token_buckets` | | The captured prefill ladder per walk ([Config reference](/reference/config#prefill-token-buckets)). Each bucket adds captures and startup time. |
+| `resources.lora` | | Per-request LoRA adapters; see [LoRA](/models/lora). |
+
+`MSTAR_MAX_VIDEO_PIXELS` caps the pixels a request's videos decode to. Decoding runs in the API server before the request is queued, and a video over the cap is a 400.
+
+## Limits {#limits}
+
+- Qwen3.5 MoE checkpoints are not supported.
+- A video request without torchcodec and FFmpeg's shared libraries is a 400; there is no fallback decoder.
+- The MTP head is not loaded.
+- Qwen3.8-27B's chat template options `reasoning_effort` and `preserve_thinking` are not forwarded. Every request gets the template's defaults, and one that sends either is logged as ignoring it.
+- Prefix caching is off when the LLM spans more than one rank, as in the TP2 and TP4 configs.
+- The chat route returns one choice of plain text. It refuses tool calls, `n` above 1, stop sequences, OpenAI `logprobs`, `logit_bias`, presence and frequency penalties, and a `response_format` other than text.
+- An encoder step past the vision encoder's largest captured bucket (16384 patches, such as a long video at ordinary resolution) runs without the graph. The request still succeeds, with more launch overhead.

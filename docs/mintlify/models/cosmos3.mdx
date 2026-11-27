@@ -1,0 +1,140 @@
+---
+title: "Cosmos3"
+description: "NVIDIA Cosmos3 world models: text, image and video to image or video, robot action policies, and image and video chat on Edge."
+---
+
+Cosmos3 is NVIDIA's world-model family. One model class serves seven checkpoints: text-to-image, text-to-video, image-to-video and video-to-video generation with opt-in sound, robot action prediction, and on Cosmos3-Edge a reasoner that answers image and video chat.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `cosmos3` | [nvidia/Cosmos3-Nano](https://huggingface.co/nvidia/Cosmos3-Nano) | `configs/cosmos3_nano.yaml` | 1 | `cosmos3` |
+| `cosmos3_droid` | [nvidia/Cosmos3-Nano-Policy-DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | `configs/cosmos3_droid.yaml` | 1 | `cosmos3` |
+| `cosmos3_edge` | [nvidia/Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) | `configs/cosmos3_edge.yaml` | 1 | `cosmos3` |
+| `cosmos3_edge_droid` | [nvidia/Cosmos3-Edge-Policy-DROID](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) | `configs/cosmos3_edge_droid.yaml` | 1 | `cosmos3` |
+| `cosmos3_super` | [nvidia/Cosmos3-Super](https://huggingface.co/nvidia/Cosmos3-Super) | `configs/cosmos3_super_tp2.yaml` | 2 | `cosmos3` |
+| `cosmos3_super_t2i_4step` | [nvidia/Cosmos3-Super-Text2Image-4Step](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) | `configs/cosmos3_super_t2i_4step_tp2.yaml` | 2 | `cosmos3` |
+| `cosmos3_super_i2v_4step` | [nvidia/Cosmos3-Super-Image2Video-4Step](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) | `configs/cosmos3_super_i2v_4step_tp2.yaml` | 2 | `cosmos3` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[cosmos3]"
+mstar serve cosmos3
+```
+
+Runtime requirements:
+
+- The extra installs `fa3-fwd`, which runs the eager denoise attention of the default `attention_backend: dense_gen`. Its wheel is tied to the torch and CUDA build and has kernels for sm_80 and sm_90a only. Where it cannot load or has no kernel for the GPU, as on Blackwell, the same pass runs on FlashInfer's ragged prefill; `resources: attn_gen: flashinfer_backend:` picks that kernel (`cudnn`, `cutlass`, `fa2`), and a backend the GPU cannot run stops the server at startup.
+- Video-input requests decode the clip with `torchcodec`.
+- Responses with sound mux the AAC track with the `ffmpeg` and `ffprobe` binaries, which must be on `PATH`.
+- The VAE decodes in bf16 with cuDNN 9.16 or newer and in fp32 otherwise.
+
+## Send a request {#request}
+
+`POST /v1/videos/generations` returns the mp4 in `data[0].b64_json`; `size` is `WxH`.
+
+```bash
+curl -sS http://localhost:8000/v1/videos/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a robot arm stacks two red cubes on a wooden table", "size": "832x480", "num_frames": 33, "seed": 0}' \
+  | python -c "import sys,json,base64; open('out.mp4','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+```
+
+- Images: `POST /v1/images/generations`, or `client.generate_image(prompt, size="1024x1024")` in the SDK.
+- Image-to-video: add `image` (a URL or data URI). The image is scaled to cover the output size and center-cropped, and the request must ask for more than 4 frames.
+- Video-to-video: add `video` instead.
+- Other knobs go in the body or `extra_body`: `num_inference_steps`, `guidance_scale`, `negative_prompt`, `fps`, and `generate_sound: true` for a video with sound.
+
+### Image and video chat {#chat}
+
+`cosmos3_edge` serves `POST /v1/chat/completions` with image and video content parts, streamed. The Edge DROID checkpoint has no reasoner. `extra_body` takes `enable_thinking` (a `<think>` block opens by default), `top_k`, `repetition_penalty`, `penalize_prompt`, `video_fps` and `video_num_frames`. `max_tokens` defaults to 2048, and `min_p` is refused unless the checkpoint's `generation_config.json` sets one.
+
+### Streaming rollout {#windowed-video}
+
+Long clips can be generated window by window, each window streamed as soon as it is decoded. The deployment must set `enable_windowed_video: true`, which `configs/cosmos3_edge.yaml` and `configs/cosmos3_nano_ar.yaml` do:
+
+```bash
+mstar serve cosmos3 --config configs/cosmos3_nano_ar.yaml
+python examples/cosmos3_stream_video_ws_client.py --port 8000 \
+  --prompt "a drone flies over a coastal town at dawn" --frames 241 --mode chained --out /tmp/rollout
+```
+
+Request knobs, in `model_kwargs` or the video request body:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `window_mode` | none; `chained` when `stream_video` is set | `chained`: each window is a full denoise conditioned on the previous window's last frames. `kv`: experimental, later windows attend to committed K/V. |
+| `window_frames` | 61 on Edge, 29 elsewhere; 29 for `kv` | Frames per window. |
+| `overlap_frames` | 32 on Edge, 8 elsewhere | `chained` only: frames carried over from the previous window. |
+| `context_frames` | 61 | `kv` only: committed frames kept; `0` keeps all. |
+| `stream_video` | `false` | Emit each window as its own chunk. `/v1/videos/generations` then returns NDJSON. |
+| `session_id`, `resume_session`, `end_session`, `session_timeout_s` | | Keep a rollout's state and continue it in a later request. Idle sessions expire after 600 s by default. |
+
+Windowed requests take no sound and no video conditioning.
+
+### Robot actions {#actions}
+
+The DROID policies predict a chunk of robot actions from one observation image (the client composes it from the wrist and exterior cameras), the task text and the robot's current state. For a control loop use `/generate/ws`:
+
+```bash
+mstar serve cosmos3_droid
+python examples/cosmos3_action_ws_client.py --host localhost --port 8000 \
+  --wrist wrist.png --exterior-1 ext1.png --exterior-2 ext2.png \
+  --joints=-0.07,0.26,0.02,-2.21,0.02,2.48,0.79 --gripper 0.0 \
+  --prompt "put the marker in the pot" --iters 20
+```
+
+Add `--json-prompt` for `cosmos3_edge_droid`. A request with `output_modalities: ["action"]` and a `robot_state` is a policy request; the chunk (32 rows), the observation rate (15 fps) and the domain (`droid_lerobot`) come from the checkpoint or the config. The reply is float32 `[chunk, padded width]`, and the first `raw_action_dim` columns are the robot's actions.
+
+The code fixes no DROID action width. `raw_action_dim` sets it, from 1 to the checkpoint's padded width (64 by default); when it is left out, the length of `robot_state` (or of a forward-dynamics `action` row) sets it. The shipped DROID configs and the example client send 8 values: the 7 joint positions and the gripper. The configs map the gripper to the checkpoint's `1 - gripper` on the way in and back on the way out (`inverted_action_dims: [7]`).
+
+`action_mode` also takes `forward_dynamics` and `inverse_dynamics`. Those requests, and any action request to a checkpoint that is not a DROID policy, must name `domain_name` or `domain_id`.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `cosmos3_nano.yaml` | 1 | none | Nano default. |
+| `cosmos3_nano_ar.yaml` | 1 | none | Nano with windowed video. |
+| `cosmos3_nano_dp2.yaml` | 2 | replica per GPU | Throughput under concurrency. |
+| `cosmos3_nano_sp2.yaml` | 2 | `sp_size: 2` | One request's latency. |
+| `cosmos3_nano_sp4.yaml` | 4 | `sp_size: 4` | One request's latency. |
+| `cosmos3_nano_tp2.yaml` | 2 | `tp_size: 2` | Weights split across GPUs. |
+| `cosmos3_nano_tp4.yaml` | 4 | `tp_size: 4` | Weights split across GPUs. |
+| `cosmos3_nano_tp2_sp2.yaml` | 4 | `tp_size: 2`, `sp_size: 2` | Both. |
+| `cosmos3_droid.yaml`, `cosmos3_edge_droid.yaml` | 1 | none | DROID policies, with the observation encode warmed at startup. |
+| `cosmos3_edge.yaml` | 1 | none | Edge generator, reasoner and windowed video. |
+| `cosmos3_edge_dp2.yaml` | 2 | replica per GPU | Edge throughput, chat kept. |
+| `cosmos3_edge_sp2.yaml` | 2 | `sp_size: 2` | Edge generation latency; the reasoner is off. |
+| `cosmos3_super_tp2.yaml` | 2 | `tp_size: 2` | Super default; Super does not fit one GPU. |
+| `cosmos3_super_tp4.yaml` | 4 | `tp_size: 4` | Super on four GPUs. |
+| `cosmos3_super_tp2_sp2.yaml` | 4 | `tp_size: 2`, `sp_size: 2` | Super on four GPUs. |
+| `cosmos3_super_t2i_4step_tp2.yaml`, `cosmos3_super_i2v_4step_tp2.yaml` | 2 | `tp_size: 2` | The distilled Super checkpoints. |
+
+All files are under `configs/`.
+
+## Options {#options}
+
+Set these under `model_kwargs` in the config.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `accelerator_graph` | `true` | Capture the denoise, prefill and reasoner steps. `false` serves eagerly. The `COSMOS3_DISABLE_ACCELERATOR_GRAPH` variable also turns capture off. |
+| `graph_max_latent_area` | `2000` | Capture only resolutions whose latent height x width is at most this. |
+| `gen_capture_image` | 192x320, 480x832, 720x1280 | `[height, width]` image tiers to capture. |
+| `gen_capture_video` | none | `[height, width, frames]` video tiers to capture. |
+| `max_batched_vision_tokens` | none | A step whose requests total more vision tokens runs them one at a time. There is no cap by default, since the right value depends on the GPU; on an H100, set 16384. |
+| `enable_sound` | `true` | Serve sound when the checkpoint ships a sound tokenizer. |
+| `enable_windowed_video` | `false` | Serve windowed requests. |
+| `enable_reasoner` | `true` | Serve Edge's chat. |
+| `conditioning_resize` | `aspect_crop` | `stretch` resizes the image-to-video frame to the output size without keeping its aspect ratio. |
+| `compile_denoise` | `true` | Compile the denoise step. |
+| `denoise_compile_mode` | `deterministic` | `deterministic` gives the same video for a seed in every server process. `default` uses torch.compile's defaults and `level` the `mstar serve -O` level's options. |
+| `vae_decode_fast` | `true` | Channels-last, compiled VAE decode for video. |
+
+## Limits {#limits}
+
+- The 4-step distilled checkpoints fix the step count and guidance (leave `num_inference_steps` and `guidance_scale` unset) and refuse action, sound, windowed and video-conditioned requests.
+- Sound is for video requests only, on a checkpoint that ships a `sound_tokenizer/`. The Nano DROID checkpoint has none.
+- Requests that share a step can differ from their solo results at bf16 rounding. Serve one request at a time when outputs must be bitwise repeatable.
+- `window_mode: kv` is experimental: with an image prompt the rollout can leave the scene at the first window boundary.
+- Per-request LoRA is not served.

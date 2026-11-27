@@ -1,0 +1,84 @@
+---
+title: "OmniVoice"
+description: "Text in, speech out in 600+ languages with OmniVoice, a masked-diffusion zero-shot TTS model."
+---
+
+OmniVoice is zero-shot text-to-speech in 600+ languages: a masked-diffusion canvas over a Qwen3-0.6B backbone and the Higgs Audio v2 codec. It is not autoregressive; it fills eight codebook rows over a few unmasking steps. It clones a voice from a reference clip, designs one from a description, or picks one. Output is 24 kHz.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `omnivoice` | [k2-fsa/OmniVoice](https://huggingface.co/k2-fsa/OmniVoice) | `configs/omnivoice.yaml` | 1 | `omnivoice` (empty) and a manual install |
+
+The runtime is the `omnivoice` package. Neither the `omnivoice` extra nor `all` installs it; install it from git:
+
+```bash
+uv pip install "git+https://github.com/k2-fsa/OmniVoice.git"
+python -c "from omnivoice.models import omnivoice_flashinfer; print('ok')"
+mstar serve omnivoice
+```
+
+It has to come from git: the PyPI release has no `omnivoice.models.omnivoice_flashinfer`, the packed-attention forward M\* calls, so a PyPI install fails at model load with `ImportError: cannot import name 'omnivoice_flashinfer'`. PyPI also rejects a direct git URL in a package's dependencies, which is why this is an install step and not part of the extra.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+client.tts("Xin chào", language="Vietnamese").to_wav("out.wav")
+client.tts("Xin chào", language="Vietnamese", reference_audio="ref.wav",
+           ref_text="Transcript of the reference clip.").to_wav("clone.wav")
+```
+
+The OpenAI route, with the model picking the voice:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "omnivoice", "input": "Xin chào", "language": "Vietnamese"}' \
+  -o out.wav
+```
+
+To design a voice, add `instructions` (`voice` is accepted as an alias). The `omnivoice` package validates it against the reference's vocabulary of gender, age, pitch, style and accent terms and refuses others. To clone, send the clip as `ref_audio` (a data URL or bare base64) with `ref_text`.
+
+## Configs {#configs}
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `omnivoice.yaml` | 1 | Reference encoder, backbone and codec decode on one worker | Default |
+| `omnivoice_split.yaml` | 1 | Codec decode on a second worker on GPU 0, `mps: true` | The unmask loop no longer stops for each finished request's decode |
+
+`mps: true` needs `nvidia-cuda-mps-control` on `PATH`.
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech`, all but `instructions`, `speed` and `seed` go in `extra_body`):
+
+| Field | Default | Effect |
+|---|---|---|
+| `language` | none | A name (`Vietnamese`) or an id (`vi`). An unrecognized value warns and falls back to language-agnostic mode. |
+| `instructions` | none | Voice description (`instruct` on `/generate`). |
+| `ref_audio`, `ref_text` | none | Clone a voice. `ref_text` is required with the clip. |
+| `speed` | 1.0 | Scales the estimated duration. |
+| `duration` | estimated | Target length of the speech in seconds. |
+| `num_step` | 32 | Unmasking steps. |
+| `guidance_scale` | 2.0 | Classifier-free guidance; 0 turns it off. |
+| `t_shift` | 0.1 | Must be above 0. |
+| `position_temperature`, `class_temperature` | 5.0, 0.0 | Which cell is revealed next, and which token. 0 is argmax. |
+
+Deployment settings:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `model_kwargs.backbone_graphs` | `true` | `false` runs the backbone's layer loop eagerly instead of replaying captured graphs. |
+| `prefill_token_buckets: {backbone: {backbone_layers: [...]}}` | up to 8192 tokens | The packed-token buckets captured for the backbone; larger steps run eagerly. See [Config files](/serving#config-files). |
+
+## Limits {#limits}
+
+- No built-in speakers.
+- A request whose estimated speech is over 30 s is a 400. Split the text or pass a shorter `duration`.
+- `num_step` may be at most 64.
+- `temperature` and `top_p` are not mapped: OmniVoice ranks the whole canvas by confidence instead of sampling one token per position.
+- Logits match the reference to half-precision rounding, not bit for bit.

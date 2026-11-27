@@ -1,0 +1,79 @@
+---
+title: "VoxCPM2"
+description: "Text in, 48 kHz speech out with VoxCPM2: zero-shot, voice design and voice cloning."
+---
+
+VoxCPM2 is tokenizer-free text-to-speech: MiniCPM-4 base and residual language models emit continuous latent patches through a local flow-matching DiT, decoded by AudioVAE V2 in streamed chunks. It speaks zero-shot, designs a voice from a description, or clones one from a clip. Output is 48 kHz.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `voxcpm2` | [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) | `configs/voxcpm2.yaml` | 1 | `voxcpm2` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[voxcpm2]"
+mstar serve voxcpm2
+```
+
+The Talker's decode step is compiled with `torch.compile` and captured at startup, so the first start with a cold compile cache is slow; see [Cold start](/cold-start#compile-cache). `model_kwargs: {compile_talker: false}` starts in seconds at lower throughput.
+
+## Send a request {#request}
+
+The mode follows from what the request sends: text alone (zero-shot), a description in `instructions` (voice design), a `ref_audio` clip (cloning), or `ref_audio` with its transcript in `ref_text` (continuation).
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+client.tts("Hello from M star!", instruct="A calm, warm adult female voice.").to_wav("design.wav")
+client.tts("Hello from M star!", reference_audio="ref.wav").to_wav("clone.wav")
+```
+
+The OpenAI route:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "voxcpm2", "input": "Hello from M star!",
+       "instructions": "A calm, warm adult female voice."}' \
+  -o out.wav
+```
+
+For cloning on the OpenAI route, send the clip as `ref_audio` (a data URL or bare base64; an http(s) URL only when the server sets `MSTAR_ALLOW_REMOTE=1`).
+
+## Configs {#configs}
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `voxcpm2.yaml` | 1 | RefEncoder and Talker on one worker; the VAE decoder's windows on the worker's side lane (`side_stream: true`); cap 32 | Default |
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech`, all but `instructions` and `seed` go in `extra_body`):
+
+| Field | Default | Effect |
+|---|---|---|
+| `instructions` | none | Voice description (`instruct` on `/generate`). |
+| `ref_audio`, `ref_text` | none | Clone, or continue, a clip of 0.5 to 60 s. |
+| `cfg_value` | 2.0 | Guidance, a number from 0 to 10. |
+| `min_len`, `max_new_tokens` | 2, 4096 | Length in 160 ms patches. A budget past `max_len` (4096) is refused. |
+| `seed` | unset | Fixes the diffusion noise. |
+
+Deployment `model_kwargs`:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `compile_talker` | `true` | `false` captures the eager decode step: fast startup, lower throughput. |
+| `compile_vae` | `true` | `false` decodes the streaming VAE eagerly. |
+| `max_text_tokens` | 1365 | Longest text per request; longer text is a 400. |
+| `inference_timesteps` | 10 | Diffusion steps, at least 2. A request may only repeat this value. |
+
+Each language model's KV cache defaults to 2,049 pages, enough for 32 requests at the full 8,192 positions and the sink page. Startup refuses a `max_concurrent_requests` the caches cannot hold, so raise `resources.base_kv.max_num_pages` and `resources.res_kv.max_num_pages` with it.
+
+## Limits {#limits}
+
+- Nothing preempts a request once a KV cache is full, which is why the shipped cap is 32; the conductor queues the rest.
+- One request with long text can stop early, as the official `voxcpm` package does. Split long text into several requests.
+- `min_len`, `max_len` and `inference_timesteps` must be integers (a whole float such as `16.0` is accepted); `cfg_value` outside 0 to 10 is a 400.
+- VoxCPM2 has no named voices: `voice` is dropped, and `speed` is logged as ignored.

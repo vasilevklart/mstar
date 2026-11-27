@@ -1,0 +1,78 @@
+---
+title: "MiniMax-H3"
+description: "Text, first-frame and last-frame to video with sound using MiniMax-H3 (beta)."
+---
+
+MiniMax-H3 (the FL2VA checkpoint) generates a 24 fps video with 32 kHz stereo audio from a prompt and up to two keyframes. It is a 33B packed-sequence audio-video DiT, guidance-distilled to one forward per step, with a Qwen3-VL-32B conditioner. The model is in beta.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `minimax_h3` | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) | `configs/minimax_h3.yaml` | 4 | `all` |
+
+The weights are under the MiniMax H3 Community License Agreement; check it before deploying. The server also needs the `ffmpeg` binary on `PATH` to mux the audio track, and `ffprobe` when the request sets `fps`.
+
+```bash
+uv pip install --torch-backend=auto -e ".[all]"
+mstar serve minimax_h3 --gpus 0,1,2,3
+```
+
+The SP configs put the conditioner next to the DiT on rank 0, which then holds about 117 GiB once loaded, so they need 141 GB GPUs such as the H200. No config has been run on 80 GB cards.
+
+## Send a request {#request}
+
+`POST /v1/videos/generations` returns one mp4 with the audio as an AAC track (`"audio": false` for video alone). `image` is the first keyframe and `last_image` the last, each a data URL.
+
+```bash
+curl -sS http://localhost:8000/v1/videos/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a dog barking on a beach at sunset", "size": "1344x768", "seed": 0}' \
+  | python -c "import sys,json,base64; open('out.mp4','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+```
+
+Request knobs, in `model_kwargs` or the video request body:
+
+| Knob | Default | Rule |
+|---|---|---|
+| `height`, `width` | 768, 1344, or the keyframe's aspect (the first keyframe's when there are two) | Multiples of 32, aspect 1:4 to 4:1. Give both or neither. |
+| `num_frames` | 124 | Snapped up to `17n+5`; the clip must be 5 to 15 s at 24 fps. |
+| `num_inference_steps` | 50 | Sigma points; the DiT runs one fewer forward. |
+| `flow_shift`, `audio_flow_shift` | 12, 3 | Video and audio schedule shifts. |
+| `keyframe_anchors` | `first`, then `last` | Which end of the video each image anchors, in image order. |
+| `seed` | none | Fixes the noise. |
+
+`fps` other than 24 and `n` other than 1 are a 400.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/minimax_h3.yaml` | 4 | `sp_size: 4` | Default. |
+| `configs/minimax_h3_sp8.yaml` | 8 | `sp_size: 8` | Lowest latency per clip. |
+| `configs/minimax_h3_sp2.yaml` | 2 | `sp_size: 2` | Two 141 GB GPUs. |
+| `configs/minimax_h3_2gpu.yaml` | 2 | none | Parity runs and short clips at reduced resolution; one GPU runs every step. |
+
+In the SP configs the video decoder runs in the DiT's SP group, and each rank decodes a share of the clips between denoise steps.
+
+## Options {#options}
+
+Set these under `model_kwargs` in the config. The SP configs set `compile: true`, `vae_tile_batch: 28` and `vae_compile: true`.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `compile` | `false` | Compile the DiT blocks, one graph per row bucket. A new bucket compiles mid-request. Buckets count against `MSTAR_RECOMPILE_LIMIT` (default 84): past half of it a new bucket runs partly eager, past all of it fully eager. |
+| `row_bucket` | 256 with `compile`, else 1 | Packed rows pad up to a multiple of this and of the SP size. |
+| `vae_tile_batch` | `1` | 256-pixel tiles per decoder call; 28 is one 768p clip. |
+| `vae_compile` | `false` | Compile the decoder blocks, one graph per tile batch. |
+| `max_packed_rows` | `131072` | Ceiling on prompt, keyframe, audio and video rows. Larger requests are a 400. |
+| `max_prompt_tokens` | text encoder positions (262,144) | Lower prompt cap, keyframe tokens included. |
+
+`backend: sdpa` on the `dit_attn` and `refiner_attn` resources runs the reference's attention kernel; without it FlashInfer runs.
+
+## Limits {#limits}
+
+- One request per denoise step: `max_batch_size` other than 1 is refused at load.
+- A prompt that contains Qwen's vision tokens is a 400, and so is a keyframe outside 1:4 to 4:1. The exception is a request that sets `height` and `width`: its first (or only) keyframe is resized to them.
+- `backend: sdpa` on `dit_attn` is refused on SP ranks, which is every shipped config but `minimax_h3_2gpu.yaml`.
+- Not ported: `Ref2VA`, the H3-Context-IR prompt rewriter and the 2K regenerator. No accelerator-graph capture and no tensor parallelism.
+- Per-request LoRA is not served.

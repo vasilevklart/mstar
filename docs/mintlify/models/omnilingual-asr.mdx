@@ -1,0 +1,68 @@
+---
+title: "Omnilingual ASR"
+description: "Speech in, transcript out in 1,600+ languages with Meta's Omnilingual ASR CTC models."
+---
+
+Meta's Omnilingual ASR CTC checkpoints: a wav2vec 2.0 encoder with a CTC head that transcribes speech in 1,600+ languages without a language code. It is not autoregressive, and requests are batched together. Code and weights are Apache-2.0.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `omnilingual_asr_ctc_300m` | v2 from Meta's CDN (default); v1 [facebook/omniASR-CTC-300M](https://huggingface.co/facebook/omniASR-CTC-300M) | `configs/omnilingual_asr_ctc_300m.yaml` | 1 | none |
+| `omnilingual_asr_ctc_1b` | v2 from Meta's CDN; v1 [facebook/omniASR-CTC-1B](https://huggingface.co/facebook/omniASR-CTC-1B) | `configs/omnilingual_asr_ctc_1b.yaml` | 1 | none |
+| `omnilingual_asr_ctc_3b` | v2 from Meta's CDN; v1 [facebook/omniASR-CTC-3B](https://huggingface.co/facebook/omniASR-CTC-3B) | `configs/omnilingual_asr_ctc_3b.yaml` | 1 | none |
+| `omnilingual_asr_ctc_7b` | v2 from Meta's CDN; v1 [facebook/omniASR-CTC-7B](https://huggingface.co/facebook/omniASR-CTC-7B) | `configs/omnilingual_asr_ctc_7b.yaml` | 1 | none |
+
+The base install reads WAV uploads. The `audio` extra adds FLAC, OGG and MP3; other containers need `torchcodec` and FFmpeg.
+
+```bash
+uv pip install --torch-backend=auto -e ".[audio]"
+mstar serve omnilingual_asr_ctc_300m
+```
+
+The model loads Meta's own `.pt` files, without fairseq2. Meta's CDN (`dl.fbaipublicfiles.com/mms/`) publishes no checksums, so M\* checks the v2 downloads against sha256 values pinned in `mstar/model/omnilingual_asr/config.py`. The v1 files come from the Hub repos at pinned revisions.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.transcribe("speech.wav"))
+```
+
+`/generate` takes one clip of up to 40 s. The OpenAI route takes longer uploads and cuts them into windows:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/transcriptions \
+  -F model=omnilingual_asr_ctc_300m -F file=@speech.wav
+```
+
+## Configs {#configs}
+
+| File | GPUs | Use |
+|---|---|---|
+| `omnilingual_asr_ctc_300m.yaml`, `_1b`, `_3b`, `_7b` | 1 | One config per size, one encoder node |
+
+## Options {#options}
+
+Deployment `model_kwargs`:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `weights_version` | `v2` | `v1` loads the `facebook/omniASR-CTC-*` Hub checkpoints. |
+| `checkpoint_path`, `tokenizer_path` | download | Local files instead. |
+| `dtype` | `bfloat16` | The reference's inference dtype. `float32` also turns off TF32 for the node's matmuls. |
+| `max_batch_size` | 16 | Requests in one step. |
+| `max_batch_seconds` | 320 | Padded audio per forward (rows times the longest clip). A step past it is split. |
+
+Request field: `window_seconds` (5 to 40). It sets both the whole-clip length and the window length for that request.
+
+## Limits {#limits}
+
+- `/v1/audio/transcriptions` transcribes a clip of up to 20 s whole and cuts a longer one into the fewest windows of at most 16 s, each ending at a quiet moment. The model hears at most 40 s, and `/generate` refuses a longer clip with a 400.
+- `language`, `prompt` and `temperature` have no effect; decoding is a per-frame argmax.
+- No timestamps and no language detection. `srt` and `vtt` get one cue per window, `verbose_json` one segment per window, and its `language` is the request's `language` as given, or null.
+- `/v1/realtime` is not supported.
+- In bf16, a request batched with others can differ from the same request run alone where two characters nearly tie. `max_batch_size: 1` or `dtype: float32` give batch-invariant transcripts.

@@ -1,0 +1,83 @@
+---
+title: "Supported hardware"
+description: "Which GPUs M* runs on, what was tested, and what changes by GPU generation."
+---
+
+M* serves on NVIDIA GPUs through CUDA. AMD Instinct support is partial, with no install path yet, and Intel GPUs serve BAGEL only.
+
+## Platforms {#platforms}
+
+| Platform | GPUs | Arch | Status | Install |
+|---|---|---|---|---|
+| NVIDIA Hopper | H100, H200 | `sm_90` | Tested | [From source](/installation#install-from-source) |
+| NVIDIA Blackwell | B200, GB200 | `sm_100` | Tested | [From source](/installation#install-from-source) |
+| NVIDIA Blackwell Ultra | B300 | `sm_103` | Tested | [From source](/installation#install-from-source) |
+| NVIDIA Blackwell workstation | GeForce RTX 50 series, RTX PRO Blackwell | `sm_120` | Untested | [From source](/installation#install-from-source) |
+| NVIDIA Ampere and Ada | A100, L40S | `sm_80`, `sm_89` | Untested | [From source](/installation#install-from-source) |
+| AMD Instinct | MI300X | `gfx942` | Partial | Not documented yet |
+| Intel GPUs (XPU) | | | BAGEL only | [Docker](/installation#docker) |
+| CPU only | | | Not supported | |
+
+Tested means the repo holds a record of runs on that GPU: noise-floor rows in `benchmark/eval/e2e/calibration.yaml` (H200, B200), a tuned kernel table under `mstar/kernels/tables/` (H100, H200, GB200, B300), or a config whose comments size it for that GPU. It does not mean every model ran on it. Untested GPUs may work; for `sm_120` the repo records only Wan2.2's VAE decode memory fit, measured on an RTX 5090. A CPU-only machine runs the CPU test suite, not models.
+
+## NVIDIA {#nvidia}
+
+A CUDA 13 build of torch needs an r580 or newer driver; see [CUDA toolkit](/installation#cuda-toolkit) to match torch to your toolkit.
+
+These fast paths run on Hopper (compute capability 9.0) only:
+
+- The fused Qwen3-TTS depth kernel. It also needs Triton 3.7 or newer and is off under MPS.
+- FlashInfer's SM90 block-scale GEMM for the larger batches of fp8 block-scale linears, such as GLM-5.2's. Other GPUs run cuBLAS's block-scaled GEMM if a startup probe passes (`mstar/utils/dense_fp8.py` notes that it raises off SM90), else a w8a16 kernel.
+
+On Ampere and Ada these are off, and so is programmatic dependent launch, which the causal conv1d, MLA prep, fused-MoE decode and GLM-5.3-Flash mHC kernels use from compute capability 9.0.
+
+Blackwell notes:
+
+- `fa3-fwd`, the FlashAttention-3 build behind the `dense` attention backend, ships `sm_80` and `sm_90a` kernels only. On Blackwell the dense pass runs on FlashInfer's ragged prefill instead.
+- Triton's bundled ptxas before 13.1.115 miscompiles integer floor division on `sm_100` and `sm_103`. When it is older, M* points `TRITON_PTXAS_BLACKWELL_PATH` at torch's ptxas, if that one is new enough, and tags the Inductor cache to match. If neither is, the server logs a warning: set `TRITON_PTXAS_BLACKWELL_PATH` to ptxas 13.1.115 or later. This applies to compute capability 10.x only, not `sm_120`.
+- flash-attn 2.8.3's Blackwell kernels do not compile under nvcc 13.x, and its default target list includes them. For a source build on another GPU, set `FLASH_ATTN_CUDA_ARCHS` to that GPU's capability alone, such as `"90"` ([Manual installs](/installation#manual-installs)).
+- MXFP8 and NVFP4 linears (`linear_dtype` on FLUX.2 klein and Z-Image) need compute capability 10.0 or newer. Below it they stay bf16 with a warning.
+
+Kernel tables in `mstar/kernels/tables/` pick tuned kernels per GPU model, or per architecture (`sm_103.json`). A GPU without a table runs the built-in defaults, and the server logs `kernel table: no ... entry`, with the `python -m benchmark.kernels.sweep` command that would tune the shape. In a source checkout, `python -m benchmark.kernels.sweep --list` lists the ops and the GPUs that have tables.
+
+## AMD {#amd}
+
+AMD Instinct GPUs run through PyTorch's ROCm build. Support is partial:
+
+- M* detects ROCm and reports the GPU's `gfx` architecture (see [Check your machine](#check-your-machine)).
+- The `dense` attention backend runs AITER's varlen kernel when the `aiter` package is installed.
+- The default attention backend (`auto`) resolves to FlashInfer on every platform, and FlashInfer is not built for ROCm, so a config that keeps the default has no paged attention kernel there.
+- Configs with `mps: true`, which most `_split` configs and `minicpm_o.yaml` set to share one GPU between workers, are refused off NVIDIA.
+- Workers send tensors through files instead of the shared-memory arena.
+
+No ROCm install path is documented yet.
+
+## Intel XPU {#intel-xpu}
+
+BAGEL is the one model with XPU configs. The XPU image, built from `docker/Dockerfile.xpu`, installs M\* with the `bagel_xpu` extra ([Docker](/installation#docker)). The configs set the XPU attention backend, since the default resolves to FlashInfer:
+
+```yaml
+resources:
+  attn:
+    backend: "xpu_paged"
+```
+
+| Config | GPUs | Layout |
+|---|---|---|
+| `configs/bagel_xpu_tp2.yaml` | 3 | Encoders and VAE on one GPU, the LLM at TP2 on two |
+| `configs/bagel_xpu_cfg_tp2.yaml` | 7 | CFG parallel: the main LLM and each guidance branch at TP2 |
+
+Both set `model_kwargs.accelerator_graph: false` and `max_concurrent_requests: 1`. The `bagel_xpu` extra installs BAGEL's dependencies with `vllm-xpu-kernels` for an XPU build of torch.
+
+```bash
+mstar serve bagel --config configs/bagel_xpu_tp2.yaml
+```
+
+## Check your machine {#check-your-machine}
+
+```bash
+nvidia-smi --query-gpu=name,compute_cap --format=csv
+python -c "from mstar.platforms import current_platform; print(current_platform, current_platform.arch())"
+```
+
+The second command prints the platform M* resolved and its architecture: `CudaPlatform() sm_90` on an H100 or H200, `sm_100` on a B200, `sm_103` on a B300, `RocmPlatform() gfx942` on an MI300X, and `XpuPlatform() None` or `CpuPlatform() None` elsewhere.

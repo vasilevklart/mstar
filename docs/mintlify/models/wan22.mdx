@@ -1,0 +1,84 @@
+---
+title: "Wan2.2"
+description: "Text to video and image to video with Wan2.2-TI2V-5B."
+---
+
+Wan2.2-TI2V-5B generates video from text, or from text and a first frame, with a dense 5B DiT, a UMT5-XXL prompt encoder and the Wan2.2 VAE. Only the TI2V-5B variant is implemented; the A14B variants are refused at load.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `wan22` | [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | `configs/wan22.yaml` | 1 | `wan22` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[wan22]"
+mstar serve wan22
+```
+
+## Send a request {#request}
+
+`POST /v1/videos/generations` takes a JSON body and returns the mp4 in `data[0].b64_json`. `size` is `WxH`, width first. Add `image` (a URL or data URI) for image-to-video.
+
+```bash
+curl -sS http://localhost:8000/v1/videos/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a fluffy cat walking across a sunlit floor", "size": "832x480", "num_frames": 33, "seed": 42}' \
+  | python -c "import sys,json,base64; open('out.mp4','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+```
+
+The same request on `/generate` sets `height` and `width` separately and returns the mp4 base64-encoded in `outputs.video[0].data`:
+
+```bash
+curl -s http://localhost:8000/generate \
+  -F 'text=a fluffy cat walking across a sunlit floor' \
+  -F 'output_modalities=video' -F 'streaming=false' \
+  -F 'model_kwargs={"height":480,"width":832,"num_frames":33,"seed":42}'
+```
+
+Request knobs, in `model_kwargs` or the video request body:
+
+| Knob | Default | Rule |
+|---|---|---|
+| `height`, `width` | 704, 1280 | Multiples of 32, so 720x1280 is refused; use 704x1280. |
+| `num_frames` | 81 | `4k+1` (33, 81, 121). |
+| `num_inference_steps` | 50 | 1 to 100. |
+| `guidance_scale` | 5.0 | Classifier-free guidance. |
+| `negative_prompt` | `""` | |
+| `fps` | 24 | Container playback rate only; it does not change what is generated. |
+
+A value outside these rules is a 400; for a size or frame count it names the nearest valid values.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/wan22.yaml` | 1 | none | Default. |
+| `configs/wan22_cfg_parallel_2gpu.yaml` | 2 | `cfg_size: 2` on the DiT | Lower latency for guided requests: each rank runs one guidance branch. Without guidance both ranks compute the same step. |
+| `configs/wan22_dp2.yaml` | 2 | a replica per GPU | Throughput under concurrency; one request takes the one-GPU time. |
+| `configs/wan22_cfg2_sp2_4gpu.yaml` | 4 | `cfg_size: 2`, `sp_size: 2` | Lowest latency for one request. Split the guidance branches first, then add `sp_size`. |
+
+`sp_size` must divide the DiT's 24 attention heads.
+
+## Options {#options}
+
+Set these under `model_kwargs` in the config.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `compile_dit` | `true` | Compile the DiT. Only the shapes in `compile_dit_sizes` run compiled. |
+| `compile_dit_sizes` | `["1280x704x81"]` | `WxHxF` shapes that use the compiled DiT, each compiled on first use with and without guidance. Other shapes run eager. |
+| `dit_max_batch_size` | `1` | Requests at one latent grid and guidance scale that share a DiT forward. |
+| `vae_decode_fast` | `true` | Compiled, channels-last VAE decode for the sizes in `vae_decode_fast_sizes`. |
+| `vae_decode_fast_sizes` | `["1280x704"]` | `WxH` sizes the fast decode compiles for. The shipped configs add `832x480`. |
+| `vae_decode_tiling` | `auto` | `auto` tiles the VAE decode only when free memory is short; `tiled` or `untiled` forces a path. The `WAN22_VAE_DECODE_TILING` variable overrides it. |
+| `max_video_pixels` | `268435456` | Ceiling on `height x width x num_frames`. Larger requests are a 400. |
+
+`backend: sdpa` on the `dit_self_attn` resource runs torch's SDPA instead of the engine's ragged attention.
+
+## Limits {#limits}
+
+- No video conditioning; `video` in the request body is a 400.
+- Each axis must fit the DiT's 1,024 rotary positions (`num_frames` up to 4,093), and height and width are at most 16,384.
+- No accelerator-graph capture and no component offload.
+- `backend: sdpa` on `dit_self_attn` is refused on SP ranks.
+- Per-request LoRA is not served.

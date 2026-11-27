@@ -1,0 +1,69 @@
+---
+title: "Ripple-65B"
+description: "Text in, text out on Ricursive's Ripple-65B dense LLM."
+---
+
+Ripple-65B is Ricursive's 65B dense text LLM: four sliding-window layers for each NoPE global layer, with a value residual from the token embeddings. It serves text in, text out in BF16. Support is experimental.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `ripple_65b` | [ricursiveAI/Ripple-65B-Preview](https://huggingface.co/ricursiveAI/Ripple-65B-Preview) | `configs/ripple_65b_tp4.yaml` | 4 | `all` |
+
+The model has no extra of its own; `all` covers its imports. The bf16 weights are about 130 GB.
+
+```bash
+uv pip install --torch-backend=auto -e ".[all]"
+mstar serve ripple_65b --gpus 0,1,2,3
+mstar serve ripple_65b --config configs/ripple_65b_tp2.yaml --gpus 0,1
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.chat("Prove that the square root of 2 is irrational.", max_output_tokens=4096).text)
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+reply = client.chat.completions.create(
+    model="ripple_65b",
+    messages=[{"role": "user", "content": "Prove that the square root of 2 is irrational."}],
+    max_tokens=4096,
+)
+print(reply.choices[0].message.content)
+```
+
+The reply keeps its reasoning inline as `<think>...</think>`.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/ripple_65b_tp4.yaml` | 4 | TP4 | The default: four 80 GB GPUs. |
+| `configs/ripple_65b_tp2.yaml` | 2 | TP2 | Two 141 GB GPUs. |
+
+Both serve 131072 tokens a request. TP cannot go past the model's 8 KV heads.
+
+## Options {#options}
+
+| Knob | Default | Effect |
+|---|---|---|
+| `temperature` | 1.0 | The checkpoint ships no `generation_config.json`; 1.0 is what Ricursive's server samples at. |
+| `max_tokens` (OpenAI), `max_output_tokens` (`/generate`) | 2048 | A long reasoning reply can reach 2048 inside `<think>`, so set it for hard problems. |
+| `top_p`, `top_k`, `repetition_penalty`, `penalize_prompt` | | Sampler knobs. A `min_p` above 0 is refused, since the checkpoint sets none. |
+| `resources.kv_cache.max_seq_len`, `resources.kv_cache.max_num_pages` | 131072 and 2048 in the shipped configs | Deployment keys. Raise them together to serve longer requests. |
+
+A prompt holds all 80 layers' K/V until its prefill commits, so the shipped pool runs out near 260K tokens of prompts in flight, and two 128K prompts cannot prefill at once.
+
+## Limits {#limits}
+
+- `enable_thinking` is ignored: the chat template always reasons.
+- A chat that asks for tool calls is refused.
+- Not supported: the NVFP4 checkpoint, prefix caching (a pool that keeps a sliding window does not prefix cache) and DP replicas (a window pool cannot span instances).

@@ -1,68 +1,179 @@
 ---
-title: "Speech recognition: Whisper and Qwen3-ASR"
-description: "Transcribe speech with Whisper and Qwen3-ASR through the OpenAI-compatible API."
+title: "Speech recognition"
+description: "Transcribe audio files and live audio with the 13 speech recognition keys."
 ---
 
-M\* serves two ASR families on one encoder-decoder scaffold: OpenAI Whisper (`whisper_large_v3_turbo`, `whisper_large`) and Qwen3-ASR (`qwen3_asr` for the 1.7B checkpoint, `qwen3_asr_realtime` for the 0.6B one trained for streaming). Both are reached through the OpenAI endpoints described in [Using a Server](/clients): `POST /v1/audio/transcriptions` and, for Qwen3-ASR, the `/v1/realtime` transcription WebSocket.
+Every speech recognition key serves `POST /v1/audio/transcriptions`. `qwen3_asr` and `qwen3_asr_realtime` also stream live transcripts over `/v1/realtime?intent=transcription`.
+
+## Models {#models}
+
+| Key | Languages | Timestamps | Realtime | Clip per request | Guide |
+|---|---|---|---|---|---|
+| `whisper_large_v3_turbo` | Detected, or set with `language` | word, segment | no | 30 s | [Whisper and Qwen3-ASR](/models/whisper-qwen-asr) |
+| `whisper_large` | Detected, or set with `language` | word, segment | no | 30 s | [Whisper and Qwen3-ASR](/models/whisper-qwen-asr) |
+| `qwen3_asr` | 30, detected or set with `language` | no | yes | 20 min | [Whisper and Qwen3-ASR](/models/whisper-qwen-asr) |
+| `qwen3_asr_realtime` | 30, detected or set with `language` | no | yes | 20 min | [Whisper and Qwen3-ASR](/models/whisper-qwen-asr) |
+| `canary` | 25 European; translation to or from English | no | no | 40 s | [FastConformer ASR](/models/fastconformer-asr) |
+| `canary_qwen` | English | no | no | 40 s | [FastConformer ASR](/models/fastconformer-asr) |
+| `parakeet` | 25 European, detected | no | no | 600 s | [FastConformer ASR](/models/fastconformer-asr) |
+| `nemotron_asr` | A locale prompt such as `en-US`, or `auto` | no | no | 600 s | [FastConformer ASR](/models/fastconformer-asr) |
+| `omnilingual_asr_ctc_300m` | 1,600+, no language code | no | no | 40 s | [Omnilingual ASR](/models/omnilingual-asr) |
+| `omnilingual_asr_ctc_1b` | 1,600+, no language code | no | no | 40 s | [Omnilingual ASR](/models/omnilingual-asr) |
+| `omnilingual_asr_ctc_3b` | 1,600+, no language code | no | no | 40 s | [Omnilingual ASR](/models/omnilingual-asr) |
+| `omnilingual_asr_ctc_7b` | 1,600+, no language code | no | no | 40 s | [Omnilingual ASR](/models/omnilingual-asr) |
+| `higgs_audio` | `language` is not read | no | no | 30 s | [Higgs Audio](/models/higgs-audio) |
+
+The transcription route accepts uploads of up to 30 minutes and 512 MiB. It cuts an upload longer than one window into windows, each ending at a quiet moment, and transcribes them in parallel. A window is the model's clip limit, with two exceptions: Qwen3-ASR cuts 30 s windows although one request can hold 20 minutes, and Omnilingual ASR transcribes clips of up to 20 s whole and cuts longer ones into windows of at most 16 s. `window_seconds` in the request, from 5 s up to the clip limit, sets the window for that request.
+
+Only Whisper writes timestamps. For the other models, a timed `response_format` (`verbose_json`, `srt`, `vtt`) gets one segment per window, and the FastConformer models answer `timestamp_granularities` with a 400.
+
+## Transcribe a file {#transcribe-a-file}
+
+Install M\* from source with the Rust build ([Installation](/installation#install-from-source)) and the `asr` extra. Omnilingual ASR needs no extra.
 
 ```bash
-mstar-serve --config configs/whisper_large_v3_turbo.yaml --port 8000
-curl http://localhost:8000/v1/audio/transcriptions \
-     -F model=whisper_large_v3_turbo -F file=@speech.wav \
-     -F response_format=verbose_json -F 'timestamp_granularities[]=word'
+uv pip install --torch-backend=auto -e ".[asr]"
 ```
 
-## Whisper {#whisper}
+Start Whisper large-v3-turbo:
 
-**Graph.** Two nodes. `audio_encoder` takes one window of samples (at most 30 s) per request, pads it, turns the batch into log-mel features with one STFT on the GPU and runs the convolutional-transformer encoder; the forward is captured once per batch size (1 to 32) and replayed. `decoder` is the autoregressive text decoder on paged KV: the encoder output is projected once per request into a separate paged cross-attention cache (written at prefill, read by every later step), so decode steps of many requests batch together and are captured per batch size (1 to 64).
+```bash
+mstar serve whisper_large_v3_turbo
+```
 
-**Walks.**
+The server compiles and captures its graphs before it answers. In another terminal, wait until `/health` returns 200:
 
-`prefill` <br />
-encoder, then the forced prompt `[<|startofprev|> context] <|startoftranscript|><|lang|><|task|>[<|notimestamps|>]` through the decoder, and samples the first transcript token.
+```bash
+until curl --fail --silent http://localhost:8000/health; do sleep 5; done
+```
 
-`detect_language` <br />
-the same with a prompt that stops at `<|startoftranscript|>` and sampling restricted to the language tokens; `prefill_prompt` then appends `<|task|>[<|notimestamps|>]` after the detected token.
+Upload a file and ask for word timestamps:
 
-`decode` <br />
-a dynamic loop, one token per step, until `<|endoftext|>`, the request's `max_tokens` or the end of the 448-position table. `max_tokens` counts the prompt walk's token, so a budget of one, or an `<|endoftext|>` sampled there, runs no decode step. The Whisper timestamp rules (first token a timestamp, timestamps in monotonic pairs, timestamp-vs-text log-probability test) are applied inside the captured forward from a four-integer state that travels with the token, so the worker's speculative next-step launch never sees a stale history.
+```bash
+curl --fail http://localhost:8000/v1/audio/transcriptions \
+  -F model=whisper_large_v3_turbo \
+  -F file=@speech.wav \
+  -F response_format=verbose_json \
+  -F 'timestamp_granularities[]=word'
+```
 
-`align` <br />
-only when word timestamps were asked for: one teacher-forced pass over `<|startoftranscript|><|lang|><|task|><|notimestamps|> transcript <|endoftext|>` on the served decoder weights, outside the caches. On the GPU, the alignment heads' cross-attention is standardized per head, median-filtered and averaged, and the walk emits that matrix with the token ids as one float32 tensor. The API server's `postprocess` runs the dynamic time warping (compiled by numba, part of the `asr` extra, when the API server loads the model) and groups tokens into words, rendered in Whisper's own timestamp vocabulary after `<|startoflm|>`, which the serving layer lifts into `words`.
+The response's `text` is the transcript, and `words` holds each word's `start` and `end` in seconds. WAV, FLAC, OGG and MP3 uploads decode with `soundfile`; other containers such as M4A and WebM go through `torchcodec`, which needs FFmpeg's shared libraries.
 
-**Request options** (`model_kwargs` / the OpenAI fields): `language` (ISO code; omit to detect), `task` (`transcribe` or `translate`), `initial_prompt` (the OpenAI `prompt`: prior text carried over as `<|startofprev|>` context), `timestamps` (`segment` or `word`, set from `response_format` / `timestamp_granularities`), `temperature`.
+The same request from the Python SDK:
 
-**Long-form audio.** Whisper hears 30 s; the transcription route cuts a longer upload into fixed windows, each at the quietest point before its boundary, and submits them at once. `long_form="sequential"` asks for openai-whisper's loop instead: each window is conditioned on the transcript so far, decoded with timestamps so the next window starts where the last closed segment ended, and re-decoded (first without the prompt, then at rising temperatures) when its text is a repetition loop. It is several times slower, and only it has that repetition guard. See [Using a Server](/clients).
+```python
+from mstar import MStarClient
 
-## Qwen3-ASR {#qwen3-asr}
+client = MStarClient("http://localhost:8000")
+print(client.transcribe("speech.wav", language="en"))
+```
 
-**Graph.** `audio_encoder` is the AuT encoder: three strided convolutions (13 tokens per 100 mel frames), transformer layers whose attention is confined to 8 s windows, run as one packed forward per batch of up to 4096 tokens (a larger step runs its clips one by one) with ragged attention (one segment per window of every request), and a projection into the LLM's hidden size. `LLM` is a dense Qwen3 decoder: the ChatML prompt with `<|audio_pad|>` placeholders is embedded, the encoder output is scattered over the placeholders, and prefill (captured on packed token buckets) and decode (captured per batch size) run on paged KV. The model writes `language {Name}<asr_text>{text}`; the adapter reports the language as an ISO code and the text alone.
+`client.transcribe()` sends one `/generate` request, which the server does not cut into windows. Whisper hears only the first 30 s, and Qwen3-ASR, the FastConformer models and Omnilingual ASR refuse a clip longer than their limit. Send long files to `/v1/audio/transcriptions`.
 
-A request hears up to 20 minutes, but the route cuts an upload into 30 s windows and submits them at once, which is several times faster and holds far fewer KV pages. `window_seconds=1200` in `extra_body` asks for the whole file as one request (on 10 minute English files, about 1.07 % WER against 1.2 % on the windows one request at a time; at concurrency 16 the difference is within batching noise). The `context` (the OpenAI `prompt`) is the system-turn hint the reference SDK also takes; `language` forces the language; `assistant_prefix` prefills the assistant turn, which is what streaming builds on.
+To serve another model, stop the server and run `mstar serve` with that key. The request fields each model reads are on its guide page.
 
-**Realtime.** `/v1/realtime?intent=transcription` (see [Using a Server](/clients)) re-transcribes the audio heard so far every `chunk_seconds` as one engine request whose assistant turn starts with the previous hypothesis minus its last `unfixed_tokens` tokens, the SDK's streaming algorithm: only the tail is ever revised, partial results are pushed as `conversation.item.input_audio_transcription.delta` events plus `mstar.transcription.partial` (the stable hypothesis with the seconds of audio it covers), and `input_audio_buffer.commit` yields the final transcript.
+## Realtime transcription {#realtime}
 
-## Serving notes {#serving-notes}
+`/v1/realtime?intent=transcription` is served by `qwen3_asr` and `qwen3_asr_realtime`. Other keys close the socket with code 1008. Start the 0.6B checkpoint, which is sized for short realtime steps:
 
-The ASR models cap the API server's torch intra-op pool at 4 threads (`PREPROCESS_TORCH_THREADS`; `preprocess_torch_threads:` in the config overrides it). That process only decodes uploads and stages tensors, and a pool of one thread per core spins after each of those small ops and starves the event loop and transport threads. On a 192-core H200 host the cap matched `OMP_WAIT_POLICY=PASSIVE` on RTFx and latency at concurrency 1 to 64 for both models, where the default pool lost 4-9 % (up to 29 % with the server pinned to 16 cores), so no launch setting is needed.
+```bash
+mstar serve qwen3_asr_realtime
+```
 
-A transcription moves its audio, encoder states and output tokens as many small tensors. The SHM transport places them in the shared-memory arena's preallocated segments; the file per tensor it used before cost throughput. Qwen3-ASR 1.7B in one run: RTFx 81, 218, 350 and 412 at concurrency 1, 8, 32 and 64 with a file per tensor, 87, 252, 494 and 558 on the arena, with the same 1.41 % WER.
+This client streams a 16 kHz mono PCM16 WAV file and prints the partial and final transcripts. `websockets` is installed with M\*.
 
-Every ASR config sets `max_concurrent_requests`. Whisper's decoder caches hold 64 requests (12 cross-attention pages and 4 self-attention pages each), and the model refuses at startup a cap they cannot hold. Requests past the cap wait in the conductor, with their audio already staged in shared memory, so the uploads the transcription route is cutting at once split the cap between them, at least one window each; their other windows wait in the API server. A lone upload keeps up to 32 windows on the engine. Qwen3-ASR's requests vary far more in size: a 20 minute file holds about 122 pages of 128 tokens for its prompt and up to 32 more for its transcript, while a 30 s window holds about 4. `qwen3_asr.yaml` sizes its pools for an 80 GB H100 (`kv_cache.max_num_pages: 3500` and `cpu_offload_pages: 1536`) and caps Qwen3-ASR at 64 concurrent requests, which any mix of windows fits and which is what the default long-form throughput needs. Under 16 and 32 concurrent whole 20 minute files, GPU memory peaked at 74,285 and 78,651 MiB in two sessions on an H200, against an H100's 81,559 MiB. It hasn't been run on an H100; the H200's larger memory may let the allocator cache more, so an H100 may peak lower.
+```python
+import asyncio
+import base64
+import json
+import wave
 
-The cap does not bound long whole files. Admission reserves only a request's prompt, so more concurrent 20 minute files than the pools hold offload to the host pool and, once that is full too, wait on each other until they time out. Only requests that ask for whole files with `window_seconds` can do this; one that takes bursts of them should lower the cap or raise the pools with it. `qwen3_asr_split.yaml` keeps its cap of 12 and 2048 pages, which hold any mix of files up to 20 minutes; it hasn't been measured at a higher cap.
+import websockets
 
-Both decode loops stream their transcript token by token. A decode step keeps its rows' tokens on the device for the next step (the sampler's device loop-back, `device_loopback_signals`), and the worker sends the batch's tokens to the client in one frame per step from the stop check's host copy (`inline_signals`), rather than one tensor message per request. A streaming request therefore receives one delta per token, and tokens reach the API server while the window decodes: a 20 minute Qwen3-ASR window is about 3,450 tokens, which, sent as one tensor apiece when the loop ended, could miss the API server's 15 s delivery deadline under load. Each chunk is one byte-level BPE token, which can end inside a UTF-8 character; the server decodes the joined bytes.
+URL = "ws://localhost:8000/v1/realtime?intent=transcription"
 
-The `*_split` configs (`whisper_large_split.yaml`, `whisper_large_v3_turbo_split.yaml`, `qwen3_asr_split.yaml`, `qwen3_asr_realtime_split.yaml`) put the encoder and the decoder in two worker processes on one GPU (`rank_devices`), so a decode step never queues behind an encoder batch on the same stream. They set `mps: true`, so both workers run as clients of one CUDA MPS daemon and their kernels overlap rather than time-slice (see [Serving](/serving)).
+
+async def send_audio(ws, pcm: bytes) -> None:
+    for i in range(0, len(pcm), 3200):  # 100 ms of 16 kHz PCM16 per append
+        audio = base64.b64encode(pcm[i:i + 3200]).decode()
+        await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio}))
+    await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+
+async def main(path: str = "speech.wav") -> None:
+    with wave.open(path, "rb") as f:
+        pcm = f.readframes(f.getnframes())
+    async with websockets.connect(URL) as ws:
+        await ws.recv()  # transcription_session.created
+        sender = asyncio.create_task(send_audio(ws, pcm))
+        async for message in ws:
+            event = json.loads(message)
+            if event["type"] == "mstar.transcription.partial":
+                print("partial:", event["text"])
+            elif event["type"] == "conversation.item.input_audio_transcription.completed":
+                print("final:", event["transcript"])
+                break
+            elif event["type"] == "error":
+                raise RuntimeError(event)
+        await sender
+
+
+asyncio.run(main())
+```
+
+Every `chunk_seconds` of new audio, the server transcribes everything heard so far as one engine request, with the previous hypothesis minus its last `unfixed_tokens` tokens as the start of the answer. Only that tail can change.
+
+| Server event | Carries |
+|---|---|
+| `conversation.item.input_audio_transcription.delta` | New text before the unstable tail. Deltas are append-only: a later revision of text already sent is not resent. |
+| `mstar.transcription.partial` | The whole current hypothesis, unstable tail included, with `audio_seconds`, the audio it covers. |
+| `conversation.item.input_audio_transcription.completed` | The final transcript after `input_audio_buffer.commit`. Use it rather than the joined deltas. |
+
+To change the session, send `transcription_session.update` with these fields under `session`:
+
+| Field | Default | Effect |
+|---|---|---|
+| `input_audio_format` | `"pcm16"` (16 kHz) | Also `"g711_ulaw"`, `"g711_alaw"`, or `{"type": "audio/pcm", "rate": N}` for N in 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000. Audio is resampled to 16 kHz. |
+| `turn_detection` | `null` | The client ends each utterance with `input_audio_buffer.commit`. `{"type": "server_vad"}` lets the server end it and needs the `vad` extra. |
+| `input_audio_transcription.language` | unset | Forces the language. |
+| `mstar.chunk_seconds` | 2.0 | Audio between steps. Values below 0.5 are raised to 0.5. |
+| `mstar.unfixed_chunks` | 2 | Chunks heard before the hypothesis is fed back. |
+| `mstar.unfixed_tokens` | 5 | Tokens at the end of the hypothesis that the next step may rewrite. |
+
+An utterance holds at most 300 s of audio. Without turn detection, an append past that is an `error` event, and the client commits or clears the buffer; with `server_vad` the server commits there.
+
+## Tuning {#tuning}
+
+`configs/whisper_large_v3_turbo.yaml` and `configs/qwen3_asr.yaml` set `knobs: step_threads: serial`. The worker then runs a step's host work on its main thread instead of its GPU and plan threads. ASR steps have little CPU work to overlap, and on a host with the `schedutil` CPU governor one busy thread holds a higher clock than work split across threads. Add the same block to another ASR config to try it, or set `MSTAR_STEP_THREADS=serial` for one run; the variable wins over the config.
+
+```yaml
+knobs:
+  step_threads: serial
+```
+
+Whisper, Qwen3-ASR and Higgs Audio cap the API server's torch threads at 4, and the FastConformer models at 1: that process only decodes uploads and stages tensors. `preprocess_torch_threads:` in the config sets the count, and `null` keeps torch's default.
 
 ## Benchmarks and parity {#benchmarks-and-parity}
 
-`benchmark/asr_bench.py` drives `/v1/audio/transcriptions` on the LibriSpeech test-clean set the protocol names (200 utterances at concurrency 1, 8 and 32, RTFx and p50/p95 latency, WER with the Whisper normalizer, and the 10-minute long-form file); `benchmark/asr_realtime_bench.py` plays utterances into `/v1/realtime` in real time and measures partial-result latency; `benchmark/asr_reference.py` produces the HF / reference-SDK transcripts the WER parity is held to. The GPU parity tests under `test/asr` pin the encoders to the HF modules on real audio, the Whisper greedy tokens to HF `generate`, and the word timestamps to HF's token timestamps.
+The benchmarks need a checkout and the `asr` and `eval` extras. `benchmark.asr_data` downloads LibriSpeech test-clean from openslr.org and writes the first 200 utterances and one 10-minute long-form file under `--out`:
+
+```bash
+uv pip install --torch-backend=auto -e ".[asr,eval]"
+python -m benchmark.asr_data --out data/asr
+```
+
+`benchmark.asr_bench` sends that set to `/v1/audio/transcriptions` at each concurrency and reports RTFx, p50 and p95 latency and WER:
 
 ```bash
 python -m benchmark.asr_bench --url http://localhost:8000 --model whisper_large_v3_turbo \
     --system "M*" --concurrency 1 8 32 --long-form --output-json results.json
-python -m benchmark.asr_realtime_bench --url ws://localhost:8003 --model qwen3_asr_realtime \
+```
+
+`benchmark.asr_realtime_bench` plays the utterances into `/v1/realtime` at real time and measures partial-result latency. Run it against `mstar serve qwen3_asr_realtime`:
+
+```bash
+python -m benchmark.asr_realtime_bench --url ws://localhost:8000 --model qwen3_asr_realtime \
     --system "M*" --sessions 1 8 --output-json realtime.json
 ```
+
+`benchmark/asr_reference.py` writes the Hugging Face or Qwen3-ASR SDK transcripts that WER parity is checked against. The GPU tests under `test/asr` compare both encoders with their Hugging Face modules, Whisper's greedy transcripts and word timestamps with Hugging Face, and Qwen3-ASR's greedy transcripts with the reference SDK.

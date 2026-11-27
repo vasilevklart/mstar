@@ -1,0 +1,92 @@
+---
+title: "CosyVoice3"
+description: "Text and a reference voice in, speech out with Fun-CosyVoice3 0.5B."
+---
+
+Fun-CosyVoice3 is voice-cloning TTS: a Qwen2-0.5B speech-token language model with repetition-aware sampling, a DiT flow-matching decoder and a causal HiFT vocoder, streamed in chunks. Every request clones a voice, from an uploaded clip or a preset. Output is 24 kHz.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `cosyvoice3` | [FunAudioLLM/Fun-CosyVoice3-0.5B-2512](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) | `configs/cosyvoice3.yaml` | 1 | `cosyvoice3` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[cosyvoice3]"
+mstar serve cosyvoice3
+```
+
+The checkpoint ships no voices. To serve presets, set `voices_dir` in the deployment's `model_kwargs`: `voice: "<name>"` loads `<name>.wav` and, when it exists, its transcript `<name>.txt`. With `voices_dir` set, `GET /v1/audio/voices` lists the presets.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+client.tts(
+    "Hello from M star!",
+    reference_audio="ref.wav",
+    ref_text="Transcript of the reference clip.",
+).to_wav("out.wav")
+```
+
+The OpenAI route takes the clip as base64 in `ref_audio` (in `extra_body` with the OpenAI client):
+
+```python
+import base64
+
+import requests
+
+ref = base64.b64encode(open("ref.wav", "rb").read()).decode()
+r = requests.post("http://localhost:8000/v1/audio/speech", json={
+    "model": "cosyvoice3", "input": "Hello from M star!",
+    "ref_audio": ref, "ref_text": "Transcript of the reference clip.",
+})
+r.raise_for_status()
+open("out.wav", "wb").write(r.content)
+```
+
+With `ref_text`, the language model is prompted with the clip's speech (zero-shot cloning). Without it, only the flow is conditioned on the clip (cross-lingual mode). `instructions` replaces the transcript with a style instruction. Keep the clip short, a few seconds: long clips drop words.
+
+## Configs {#configs}
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `cosyvoice3.yaml` | 1 | LM, flow and vocoder on one worker, cap 32 | Default |
+| `cosyvoice3_split.yaml` | 1 | Flow and vocoder on a second worker on the same GPU, batches of 16, `mps: true` | Throughput; about 67 GB of GPU memory |
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech`, all but `voice`, `instructions`, `temperature`, `top_p` and `seed` go in `extra_body`):
+
+| Field | Effect |
+|---|---|
+| `voice` | A preset in `voices_dir`. |
+| `ref_audio`, `ref_text` | A clip to clone (data URL or bare base64; an http(s) URL only with `MSTAR_ALLOW_REMOTE=1`) and its transcript. |
+| `instructions` | A style instruction (`instruct` on `/generate`). |
+| `temperature`, `top_p`, `top_k`, `ras_window`, `ras_tau` | Speech-token sampling. `top_k` is 1 to 128. |
+| `n_cfm_timesteps` | Flow Euler steps. |
+| `max_new_tokens` | Speech tokens at 25 Hz. A value above the deployment's limit is refused. |
+| `seed` | Fixes the LM's sampling; the flow and vocoder noise is fixed. |
+| `sentence_chunking` | Long text is synthesized as ordered sentence pieces of about 80 tokens, or 60 to 80 characters for text with Chinese, as the reference frontend does. `false` sends it whole. |
+
+Deployment `model_kwargs` (listed in `configs/cosyvoice3.yaml`):
+
+| Knob | Default | Effect |
+|---|---|---|
+| `voices_dir` | none | Preset clips. |
+| `flow_cache_frames` | 768 | Frames whose flow K/V a streamed row keeps in `resources.flow_kv` (about 41 GiB for 32 requests). `0` re-solves every frame each hop and frees it. |
+| `flow_estimator_dtype` | `bfloat16` | `float32` runs the flow estimator at the reference's precision, with lower throughput. |
+| `flow_capture_frame_buckets`, `hift_capture_frame_buckets` | captured | `[]` captures no flow or vocoder graphs: faster startup, less memory, eager steps. |
+| `stream_hop_tokens` | 25 | Speech tokens in the first flow hop; later hops double up to 100. `0` decodes once at the end with full attention. |
+| `llm_weights` | `llm.pt` | `llm.rl.pt` loads the checkpoint's RL-tuned LM. |
+
+## Limits {#limits}
+
+- A request with neither `ref_audio` nor a preset `voice` is a 400, and so is a reference clip over 30 s.
+- One request's prompt (transcript or instruction) and text may hold at most 512 tokens. `/v1/audio/speech` cuts long text into pieces under it; on `/generate`, split it yourself.
+- Request fields are strictly typed: `ras_window` and `n_cfm_timesteps` take a number, not a string or boolean, and an out-of-range value is a 400. `voice`, `instruct` and `ref_text` must be strings.
+- `speed` has no effect and is logged as ignored.
+- `lm_dtype: float32` cannot be served; the paged attention runs in bfloat16 or float16.
+- Japanese written in kana only, with spaces between words, is read poorly, as it is by the official model.

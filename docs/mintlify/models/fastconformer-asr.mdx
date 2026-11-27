@@ -1,0 +1,87 @@
+---
+title: "FastConformer ASR"
+description: "Speech in, transcript out with NVIDIA Canary, Canary-Qwen, Parakeet and Nemotron ASR."
+---
+
+Four NVIDIA speech recognition models on one FastConformer encoder: Canary (a Transformer decoder, with translation), Canary-Qwen (the encoder projected into Qwen3-1.7B, English only), Parakeet and Nemotron ASR (transducers). Audio in, text out, no timestamps.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `canary` | [nvidia/canary-1b-v2](https://huggingface.co/nvidia/canary-1b-v2) | `configs/canary.yaml` | 1 | `asr` |
+| `canary_qwen` | [nvidia/canary-qwen-2.5b](https://huggingface.co/nvidia/canary-qwen-2.5b) | `configs/canary_qwen.yaml` | 1 | `asr` |
+| `parakeet` | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | `configs/parakeet.yaml` | 1 | `asr` |
+| `nemotron_asr` | [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) | `configs/nemotron_asr.yaml` | 1 | `asr` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[asr]"
+mstar serve parakeet
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.transcribe("speech.wav", language="en"))
+```
+
+The OpenAI route cuts uploads longer than the model's clip limit into windows at quiet moments and joins their text:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/transcriptions \
+  -F model=parakeet -F file=@speech.wav
+```
+
+Canary translates when the target language differs from the speech's:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/transcriptions \
+  -F model=canary -F file=@speech.wav -F language=de -F target_language=en
+```
+
+## Configs {#configs}
+
+Each key ships one config with both nodes on one worker.
+
+| File | GPUs | Concurrency cap | Sized by |
+|---|---|---|---|
+| `canary.yaml` | 1 | 64 | The decoder's KV caches |
+| `canary_qwen.yaml` | 1 | 64 | The KV cache, which takes about 15 GB |
+| `parakeet.yaml` | 1 | 128 | `resources.transducer_state.max_slots: 129` |
+| `nemotron_asr.yaml` | 1 | 128 | `resources.transducer_state.max_slots: 129` |
+
+Requests past the cap wait in the conductor. Startup refuses a cap the caches or state pool cannot hold. On a smaller GPU, lower `max_concurrent_requests` and `resources.kv_cache.max_num_pages` together for Canary-Qwen. For Parakeet and Nemotron ASR, `max_slots` is the cap plus one.
+
+## Options {#options}
+
+Request fields, the same on `/v1/audio/transcriptions` and in `/generate`'s `model_kwargs`:
+
+| Key | Field | Effect |
+|---|---|---|
+| `canary` | `language` | The speech's language, default `en`, one of the 25 Parakeet knows. |
+| `canary` | `target_language` | Translation to or from English. The OpenAI route also takes `task=translate`, which means into English. |
+| `canary` | `punctuation` | Default `true`. |
+| `canary_qwen` | `instruction` | Replaces the trained instruction, "Transcribe the following:". |
+| `parakeet` | `language` | Optional. Must be one of bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk; the model detects the language either way. |
+| `nemotron_asr` | `language` | The prompt: a locale from the checkpoint such as `en-US`, a bare code, or `auto` (default). |
+| `canary`, `canary_qwen` | `temperature` | Greedy unless above 0; `top_p` and `top_k` then apply. |
+| `canary`, `canary_qwen` | `max_output_tokens` | At most 1014 on Canary and 1024 on Canary-Qwen; a larger value is refused. |
+
+Deployment `model_kwargs`:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `compile_step` | `true` | Parakeet and Nemotron ASR. `false` decodes with eager kernels: faster startup, slower decoding. |
+| `lookahead` | 13 | Nemotron ASR: right attention context in 80 ms frames, one of 0, 3, 6, 13. Wider is more accurate. |
+
+## Limits {#limits}
+
+- One request holds up to 40.96 s on Canary and Canary-Qwen and 610 s on Parakeet and Nemotron ASR. `/generate` refuses a longer clip; the transcription route windows it.
+- No timestamps: `timestamp_granularities` is a 400, and a timed format gets one segment per window. The OpenAI `prompt` is dropped.
+- Canary-Qwen refuses any `language` other than English.
+- Request fields must have their documented types, or the request is a 400. `min_p` and `repetition_penalty` are refused on Canary and Canary-Qwen. Parakeet and Nemotron ASR decode greedily and log a sent `temperature` as ignored.
+- One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- Uploads that `soundfile` cannot read, such as M4A and WebM, are decoded by `torchcodec`, which needs FFmpeg.

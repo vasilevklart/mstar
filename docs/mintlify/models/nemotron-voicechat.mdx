@@ -1,0 +1,79 @@
+---
+title: "Nemotron VoiceChat"
+description: "Full-duplex speech-to-speech with NVIDIA NemotronLabs VoiceChat-11B: user speech in, agent text and speech out."
+---
+
+NemotronLabs VoiceChat-11B is a full-duplex speech-to-speech model: a FastConformer encoder, a Nemotron-H hybrid Mamba-2 and attention backbone, an EarTTS talker and an RVQ codec. User speech goes in; agent text and 22.05 kHz agent speech come out, one 80 ms frame per 80 ms of input, and the model decides when to speak. Beta: functionally supported, not yet performance-optimized.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `nemotron_duplex` | [nvidia/NVIDIA-NemotronLabs-VoiceChat-11B](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B) | `configs/nemotron_duplex.yaml` | 1 | `all` |
+
+No extra is named after the model; the `all` extra covers its imports.
+
+```bash
+uv pip install --torch-backend=auto -e ".[all]"
+mstar serve nemotron_duplex
+```
+
+The text tokenizer is read from the `nano/` folder of [pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark](https://huggingface.co/pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark), since the base checkpoint ships only the RNN-T tokenizer. On a machine without network access, prefetch both repositories into the Hugging Face cache.
+
+## Send a request {#request}
+
+The model has no OpenAI adapter, so `/v1/*` other than `/v1/realtime` returns 404. It serves three routes:
+
+| Route | Input | Use |
+|---|---|---|
+| `POST /generate` | One uploaded clip | Offline replies and tests |
+| `WS /generate/ws` | An opening with `end_input: false`, then `append` messages of 16 kHz audio until `end_input` | Live calls on M\*'s own protocol |
+| `WS /v1/realtime` | OpenAI Realtime GA events, PCM16 at 8 to 48 kHz or G.711 | Live calls from OpenAI Realtime clients |
+
+A one-shot reply over `/generate` with the SDK:
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+res = client.generate(
+    audio="user.wav",
+    input_modalities=("audio",),
+    output_modalities=("text", "audio"),
+)
+print(res.text)
+res.audio.to_wav("agent.wav")
+```
+
+Send user-only 16 kHz mono speech. The model answers in the frames after the user stops, so end a clip with a few seconds of silence. The checkpoint's demo recordings are two-channel conversations (user left, agent right); feed the left channel only. `test/nemotron_duplex/duplex_request.py` prepares such a clip from the bundled demo and sends it.
+
+The request's text, if any, is the system prompt, primed before the first frame as the reference does. Over `/v1/realtime` it is the session's `instructions`.
+
+Output is clocked by input: a `/generate/ws` client keeps streaming, silence included, for as long as it wants the agent to talk. `/v1/realtime` pads a pause in the client's audio with silence, up to 30 s. Each agent reply arrives as one response (`response.output_audio.delta` and `response.output_audio_transcript.delta`); over `/generate`, text chunks carry `metadata.turn` where a reply starts or ends. The voice is `Aria`. `test/nemotron_duplex/live_ws_request.py` streams a clip over `/generate/ws` in 80 ms appends. The full protocols are in [Using a server](/clients) and the [WebSocket section](/clients#websocket-generatews).
+
+## Configs {#configs}
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `nemotron_duplex.yaml` | 1 | Encoder, LLM and talker on one GPU | Default |
+| `nemotron_duplex_disagg.yaml` | 2 | Encoder and LLM on rank 0, talker with its codec on rank 1 | Pipeline parallelism; same output |
+
+Both set `max_concurrent_requests: 16`. Every per-session resource is sized for 32 sessions, so raising the cap to 32 needs no other change. To serve more, raise the cap together with the `max_slots` of `mamba_state`, `encoder_state`, `encoder_front`, `codec_state` and `talker_prev` (the cap plus one, for the sink), `encoder_kv` (the cap), and the `max_num_pages` of `nano_kv` and `talker_kv`. The server refuses to start with a cap one of them cannot hold. A live call that opens while the server is at the cap ends at once with a 503; one-shot requests queue.
+
+## Options {#options}
+
+| Knob | Where | Default | Effect |
+|---|---|---|---|
+| `temperature`, `top_p` | request | 0.7, 0.9 | Agent-text sampling. `temperature: 0` is greedy. The talker's sampling is stochastic by design, and every session draws the same seeded noise. |
+| `max_session_s` | deployment `model_kwargs` | 160 | Longest call, in seconds of audio. The talker KV pool grows with it. |
+| `max_prompt_tokens` | deployment `model_kwargs` | 512 | Longest system prompt; a longer one is a 400. |
+| `max_call_input_mb` | deployment config | 32 in both configs | A live call's input files over its whole life; past it the call ends with a 400. |
+
+## Limits {#limits}
+
+- A call is capped at `max_session_s`. An upload past it gets a 400, as does a file with more than two channels, and so does a live call whose appends pass it. The server refuses to start with a `max_session_s` past 596 s, where a session's talker positions would pass the talker's 7500-position sliding window.
+- `/generate/ws` appends must be 16 kHz audio; they are not resampled one by one. `/v1/realtime` resamples for the client.
+- Live audio reaches the model in whole 80 ms frames (1280 samples at 16 kHz). The part of a frame that waits for the next append adds latency, so send 80 ms appends.
+- A call that ends with no more than 16 ms of audio fails with a 500.
+- `response.create`, `response.cancel` and the item-editing events get an `unsupported` error over `/v1/realtime`; the model decides when to speak. Input transcription and tools are not supported.
+- The checkpoint often answers speech not addressed to it, such as a side conversation or background speech. Its model card says it is not suited to noisy environments. Nothing in the serving path tells speakers apart.

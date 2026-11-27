@@ -1,0 +1,63 @@
+---
+title: "MiniCPM-o 4.5"
+description: "Text, image and audio in, text or text and speech out on MiniCPM-o 4.5, half duplex."
+---
+
+MiniCPM-o 4.5 is Qwen3-8B over a SigLIP image encoder and a Whisper-medium audio encoder, with a TTS and a streaming flow-matching vocoder for spoken replies. It takes text, images and audio and returns text, or text and 24 kHz speech, as upstream's half-duplex `chat()` does. Support is in beta, and it has no OpenAI adapter.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `minicpm_o` | [openbmb/MiniCPM-o-4_5](https://huggingface.co/openbmb/MiniCPM-o-4_5) | `configs/minicpm_o.yaml` | 1 | `minicpm_o` |
+
+The config runs three workers on one GPU under NVIDIA MPS, so it needs an NVIDIA GPU.
+
+```bash
+uv pip install --torch-backend=auto -e ".[minicpm_o]"
+mstar serve minicpm_o --gpus 0
+```
+
+## Send a request {#request}
+
+Use `/generate` or the Python SDK; the `/v1/*` generation routes answer 404 for this model. Ask for speech with `output_modalities`:
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+result = client.chat("Describe this image in one sentence.", images="cat.jpg",
+                     output_modalities=("text", "audio"))
+print(result.text)
+result.save_audio("reply.wav")
+```
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/minicpm_o.yaml` | 1 | three workers with `mps: true` | The only shipped config: the LLM and encoders, the TTS, and the vocoder each have a worker, so the vocoder's steps don't hold up the TTS's decode. |
+
+It caps `max_concurrent_requests` at 32 and gives the LLM's KV pool 512 host pages (`cpu_offload_pages`), so a full pool moves a request to the host instead of stalling.
+
+## Options {#options}
+
+Request knobs in `model_kwargs`:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `voice` | `default` | The bundled voice, the only one. |
+| `voice_prompt` | `true` | A spoken reply's system message is upstream's voice-clip prompt. `false` leaves the clip out and uses `system_prompt` instead; the reply is still spoken in the voice. |
+| `system_prompt` | | Your own system message. With speech output it needs `voice_prompt: false`. |
+| `enable_thinking` | `false` | Passed to the checkpoint's chat template as `enable_thinking`. |
+| `max_slice_nums` | 9 | Most slices an image is cut into, 1 to 9. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | 0.7, 0.8, 100, 1.02 | Upstream `chat()`'s recipe, kept over the checkpoint's file. |
+
+Deployment keys: each spoken reply holds a slot of each `t2w_*` resource while it speaks, so their `max_slots` cap the replies voiced at once. `t2w_state` has one more slot than each `t2w_*_kv` (its sink), and startup refuses counts that disagree. Startup also refuses a `tts_kv` pool that cannot hold `max_concurrent_requests` full replies.
+
+## Limits {#limits}
+
+- No OpenAI routes; see [No OpenAI adapter](/models#no-openai-adapter).
+- A spoken request with a system prompt of its own is a 400 unless it sets `voice_prompt: false`.
+- Video input, upstream's `streaming_generate` and full duplex are not supported.
+- `mps: true` is refused off NVIDIA.

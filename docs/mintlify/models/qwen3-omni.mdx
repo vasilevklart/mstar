@@ -1,0 +1,110 @@
+---
+title: "Qwen3-Omni"
+description: "Text, image, audio and video in, text and streamed speech out on Qwen3-Omni-30B-A3B."
+---
+
+Qwen3-Omni runs as five nodes: audio and vision encoders, the Thinker (the MoE LLM that writes the text), the Talker (which turns the Thinker's states into codec frames) and Code2Wav (the codec vocoder). It takes text, images, audio and video, and returns text, or text and streamed speech.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `qwen3_omni` | [Qwen/Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | `configs/qwen3omni_2gpu.yaml` | 2 | `qwen3_omni` |
+
+The encoders attend through FlashInfer, so no `flash-attn` install is needed. The MoE alignment kernel JIT-builds on first use.
+
+```bash
+uv pip install --torch-backend=auto -e ".[qwen3_omni]"
+mstar serve qwen3_omni --gpus 0,1
+```
+
+Whether every capture of the default config fits on an 80 GB GPU is unmeasured. On GPUs such as the H100, serve the H100 layout:
+
+```bash
+mstar serve qwen3_omni --config configs/qwen3omni_2gpu_h100.yaml --gpus 0,1
+```
+
+## Send a request {#request}
+
+The Python SDK asks for speech with `output_modalities`:
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+result = client.chat("Tell me a short joke.", output_modalities=("text", "audio"), voice="Ethan")
+print(result.text)
+result.save_audio("reply.wav")
+
+print(client.chat("What is said in this clip?", audio="speech.wav").text)
+```
+
+On `/v1/chat/completions`, `modalities` asks for speech and `message.audio.data` carries it, base64-encoded in `audio.format`:
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+reply = client.chat.completions.create(
+    model="qwen3_omni",
+    modalities=["text", "audio"],
+    audio={"voice": "Ethan", "format": "wav"},
+    messages=[{"role": "user", "content": "Tell me a short joke."}],
+)
+print(reply.choices[0].message.content)
+open("reply.wav", "wb").write(base64.b64decode(reply.choices[0].message.audio.data))
+```
+
+Messages may carry `image_url`, `video_url`, `audio_url` and `input_audio` parts. Remote URLs are read only with `MSTAR_ALLOW_REMOTE=1`; send data URIs otherwise.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/qwen3omni_colocated.yaml` | 1 | every node on one GPU | One 80 GB GPU. Its 176-page Thinker pool holds about 22K tokens of prompt and output, shared by all requests. |
+| `configs/qwen3omni_2gpu.yaml` | 2 | Thinker and encoders on GPU 1, Talker and Code2Wav on GPU 0 | The default. 1,024 Thinker KV pages (128k tokens) plus 1,024 host pages. |
+| `configs/qwen3omni_2gpu_h100.yaml` | 2 | the encoders move to the Talker's GPU | 80 GB GPUs such as the H100. 512 Thinker pages (64k tokens) plus 1,024 host pages. |
+| `configs/qwen3omni_2gpu_large_kv.yaml` | 2 | as the default | H200-class GPUs whose concurrent requests hold more than 128k tokens of Thinker KV. 2,048 pages (256k tokens), no host pages. |
+| `configs/qwen3omni_pd_2gpu.yaml` | 2 | Thinker prefill on GPU 0 with the other nodes, decode on GPU 1 | Prefill and decode apart, on two GPUs. |
+| `configs/qwen3omni.yaml` | 3 | encoders and Code2Wav, Thinker and Talker each on a GPU | One stage per GPU. |
+| `configs/qwen3omni_pd_disaggregated.yaml` | 3 | Thinker prefill on GPU 0, decode on GPU 1, Talker on GPU 2 | Prefill and decode apart, with the Talker alone. |
+| `configs/qwen3omni_thinker_tp2.yaml` | 3 | Thinker at TP2 | The Thinker over two GPUs. |
+| `configs/qwen3omni_thinker_ep2.yaml` | 3 | Thinker at TP2 with expert-parallel MoE | Each rank holds 64 of the 128 experts at full width; attention stays TP. |
+| `configs/qwen3omni_full_tp2.yaml` | 4 | Thinker at TP2, Talker at TP2 | Both LLMs over two GPUs each. |
+| `configs/qwen3omni_thinker_tp4_sp2.yaml` | 8 | Thinker at TP4 x SP2 | Long prompts, up to the model's 65536 positions. A prefill of at least 16384 tokens splits over each SP pair. |
+
+The others serve 32768 tokens a request.
+
+## Options {#options}
+
+Request knobs go in `model_kwargs` on `/generate` and in `extra_body` on the OpenAI routes.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `voice` | `Ethan` | The Talker's speaker, from the checkpoint. An unknown name is refused with the supported list. |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `penalize_prompt` | the checkpoint's | Plain keys set the Thinker, except on `/v1/audio/speech`, where `temperature` and `top_p` set the Talker. |
+| `thinker_*`, `talker_*`, `code_predictor_*` | the checkpoint's, else built-in | The same knobs for one stage on every route, such as `talker_top_k`. A stage key wins over a plain one. |
+| `max_output_tokens` | the checkpoint's | The Thinker's output budget. |
+| `talker_max_output_tokens` | the checkpoint's | The Talker's output budget, 4096 on the released checkpoint. |
+| `ignore_eos` | `false` | Decode past the Thinker's stop token. |
+| `seed` | | Seeds the request's sampling. |
+
+Deployment keys in the YAML:
+
+| Key | Default | Effect |
+|---|---|---|
+| `model_kwargs.codec_chunk_schedule` | `[12, 13]` | Streamed audio starts after 12 codec frames (0.96 s), then 13, then `codec_chunk_frames` (25) behind `codec_left_context_frames` (25). `[]` starts with a 25-frame chunk: first audio comes later, and the Talker needs less headroom over real time. |
+| `resources.thinker_kv.max_num_pages`, `cpu_offload_pages` | per config | Thinker KV pool in 128-token pages, and host pages a full pool moves a request to. |
+| `max_concurrent_requests` | unset | A full GPU pool moves a running request to the host pages. Where that can free nothing (no host pages, as in `large_kv`, or full ones), requests wait until they time out, so set the cap to the GPU pages over the pages of the longest request. At the full 32k context: 8 for `large_kv`, 4 for the default, 2 for the H100 config. |
+| `prefill_token_buckets` | `{Thinker: {prefill_text: [128 ... 2048]}}` | The Thinker's captured text and audio prefill ladder; a longer step runs eagerly. See [Config reference](/reference/config). |
+| `resources.vision_attn.flashinfer_backend`, `resources.audio_attn.flashinfer_backend` | unset | The encoders' FlashInfer kernel, such as `cutlass`. Unset, the GPU's kernel table or FlashInfer's own `auto` picks. |
+
+## Limits {#limits}
+
+- `/v1/audio/speech` returns the audio of the model's spoken reply to `input`, not `input` read aloud. Use a TTS model to read text.
+- The Talker batches at most 32 requests. Past that, requests queue, and a request's playback can pause when the Talker falls below real time.
+- An encoder step past its largest captured bucket (8192 vision patches, about one 1920x1080 image, or 4096 audio tokens) runs eagerly.
+- A clip under 1 s is zero-padded to a full chunk before the encoder's convolutions, so its embeddings differ from Hugging Face's for a clip encoded alone.
+- The Thinker's fused q/k norm and RoPE run in fp32 and round once, so outputs are close to Hugging Face's but not bit-exact.
+- The chat route refuses tool calls, `n` above 1, stop sequences and OpenAI `logprobs`.

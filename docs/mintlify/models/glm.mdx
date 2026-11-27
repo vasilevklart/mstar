@@ -1,0 +1,76 @@
+---
+title: "GLM-5.2 and GLM-5.3-Flash"
+description: "Text in, text out on the GLM-5.2 and GLM-5.3-Flash MoE checkpoints at TP8."
+---
+
+GLM-5.2 is a 753B MoE causal LM (40B active) with MLA and DSA attention. GLM-5.3-Flash is a 320B MoE (18B active) that interleaves KDA linear-attention layers with MLA layers. Both load fp8 checkpoints and serve text in, text out on eight GPUs.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `glm52` | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | `configs/glm52_tp8.yaml` | 8 | `glm` |
+| `glm5_next` | [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `configs/glm5_next_tp8.yaml` | 8 | `glm` |
+
+`glm52_tp8.yaml` is sized for eight 141 GB GPUs (the checkpoint is about 750 GB) and `glm5_next_tp8.yaml` for eight 80 GB GPUs (306 GB). The weights resolve through the Hugging Face cache (`HF_HOME`), or set `model_kwargs.checkpoint_path` to a local copy.
+
+```bash
+uv pip install --torch-backend=auto -e ".[glm]"
+mstar serve glm52 --gpus 0,1,2,3,4,5,6,7
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.chat("Explain KV caching in two sentences.", max_output_tokens=512).text)
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+reply = client.chat.completions.create(
+    model="glm52",
+    messages=[{"role": "user", "content": "Explain KV caching in two sentences."}],
+    max_tokens=512,
+)
+print(reply.choices[0].message.content)
+```
+
+The chat route takes text parts only; an image or audio part is a 400.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/glm52_tp8.yaml` | 8 | TP8 | The default: contexts up to 2048 tokens, captured decode. |
+| `configs/glm52_tp8_mtp.yaml` | 8 | TP8 | MTP drafting with 3 draft tokens per step. Greedy only. |
+| `configs/glm52_tp8_longctx.yaml` | 8 | TP8 | Contexts up to 8192 tokens through the DSA sparse path. Eager only. |
+| `configs/glm5_next_tp8.yaml` | 8 | TP8 | The default: contexts up to 2048 tokens. |
+| `configs/glm5_next_tp8_mtp.yaml` | 8 | TP8 | MTP drafting with 3 draft tokens per step. Greedy only. |
+
+## Options {#options}
+
+Deployment keys under `model_kwargs`:
+
+| Knob | Model | Default | Effect |
+|---|---|---|---|
+| `kernels` | `glm52` | `auto` | `auto` runs the tuned kernels, among them the fused fp8 MoE that lets decode capture. `reference` runs the numerics anchor, eager. |
+| `moe_quant_kernel` | `glm5_next` | `reference`; `auto` in the shipped configs | The same choice for GLM-5.3-Flash's MoE. |
+| `mtp_num_draft_tokens` | both | 0 | Draft tokens per decode step from the checkpoint's MTP layer. |
+| `dsa_long_context` | `glm52` | `false` | Serve past `index_topk` (2048) up to `model_kwargs.max_seq_len`. `glm5_next` refuses it. |
+| `prefill_graphs` | `glm5_next` | `false`; `true` in the shipped configs | Capture prefill per batch size and token bucket. `false` keeps it eager. |
+| `checkpoint_path` | both | | A local checkpoint directory. |
+
+Request knobs: `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `penalize_prompt` and `ignore_eos`. Sampling defaults to the checkpoints' temperature 1.0 and top_p 0.95, read from `generation_config.json` when it is cached.
+
+## Limits {#limits}
+
+- Contexts are held to `index_topk` (2048 tokens), where dense MLA computes exactly what the sparse attention does. A request with no `max_tokens` runs to the room its prompt leaves. On `glm5_next`, a `max_tokens` above 2048 is a 400, and under MTP so is one past the room the prompt leaves.
+- With `dsa_long_context`, a prompt must still fit in 2048 tokens; decode runs past it. The path is eager, and it cannot be combined with MTP.
+- With MTP drafting, a request with a `temperature` above 0 or a repetition penalty is refused.
+- A `min_p` above 0 is refused, since neither checkpoint sets one.
+- Neither model reports logprobs; a request that sets `return_logprobs` is refused.

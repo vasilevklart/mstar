@@ -1,0 +1,72 @@
+---
+title: "Orpheus"
+description: "Text in, speech out with Orpheus TTS, a Llama 3.2 3B model that emits SNAC audio codes."
+---
+
+Orpheus TTS: a Llama 3.2 3B language model that writes audio tokens, decoded to 24 kHz speech by a SNAC decoder that streams alongside it. It has eight built-in voices.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `orpheus` | [canopylabs/orpheus-3b-0.1-ft](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | `configs/orpheus_colocated.yaml` | 1 | `orpheus` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[orpheus]"
+mstar serve orpheus
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+client.tts("Hello from M star!", voice="tara").to_wav("out.wav")
+```
+
+The OpenAI route:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "orpheus", "input": "Hello from M star!", "voice": "tara"}' \
+  -o out.wav
+```
+
+The voices are `tara` (default), `zoe`, `zac`, `jess`, `leo`, `mia`, `julia` and `leah`. `GET /v1/audio/voices` lists them.
+
+## Configs {#configs}
+
+`mstar serve orpheus` loads `orpheus_colocated.yaml`, not `orpheus.yaml`.
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `orpheus_colocated.yaml` | 1 | LLM and SNAC on one GPU | Default |
+| `orpheus.yaml` | 2 | LLM on GPU 0, SNAC on GPU 1 | The decoder off the LLM's GPU |
+| `orpheus_pd_disaggregated.yaml` | 2 | Prefill on GPU 0, decode on GPU 1 | Prefill and decode apart |
+| `orpheus_tp2.yaml` | 2 | LLM at TP2 | Tensor parallelism |
+
+Start a two-GPU config with `mstar serve orpheus --config configs/orpheus_tp2.yaml --gpus 0,1`.
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech`, `top_k`, `repetition_penalty` and `penalize_prompt` go in `extra_body`):
+
+| Field | Default | Effect |
+|---|---|---|
+| `voice` | `tara` | One of the eight voices. |
+| `temperature`, `top_p` | 0.6, 0.8 | Sampling. The checkpoint's `generation_config.json` is Llama's chat preset, so only its `do_sample` is read. |
+| `repetition_penalty` | 1.3 | |
+| `max_output_tokens` | 2048 | Audio tokens; 2048 are about 25 s of speech. |
+| `sentence_chunking` | on from 250 characters | `/v1/audio/speech` synthesizes longer input as sentence chunks of about 200 characters. `false` sends it whole. |
+
+Deployment `model_kwargs`: `snac_chunk_schedule` (default `[4, 2, 2, 2]`) and `snac_chunk_frames` (4) set how many 7-token frames each streamed SNAC chunk takes.
+
+## Limits {#limits}
+
+- Text input only.
+- An unknown `voice` is a 400 that lists the voices.
+- `/v1/audio/speech` input that splits into more than 32 sentence chunks, about 6,400 characters, is a 400.
+- `speed` is not an Orpheus control and is logged as ignored.
+- The LM head computes only the audio-token rows, so sampling renormalizes over them; sampled output is not identical to the reference's.

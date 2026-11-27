@@ -1,0 +1,71 @@
+---
+title: "Command A+"
+description: "Text and image in, text out on Cohere's Command A+ MoE, served on /generate."
+---
+
+Command A+ is a 218B MoE (25B active) with three sliding-window layers for every global one. It takes text and images and returns text. Support is experimental, and it has no OpenAI adapter.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `command_a_plus` | [CohereLabs/command-a-plus-05-2026-bf16](https://huggingface.co/CohereLabs/command-a-plus-05-2026-bf16) | `configs/command_a_plus_tp4.yaml` | 4 | `command_a_plus` |
+
+The server never downloads the BF16 weights (about 437 GB); it fetches only the tokenizer and config files. Download the checkpoint yourself, then serve a copy of the default config with `model_kwargs.checkpoint_dir` set to it:
+
+```yaml
+model_kwargs:
+  max_seq_len: 65536
+  checkpoint_dir: /models/command-a-plus
+```
+
+Point `CUDA_HOME` at a CUDA toolkit that matches PyTorch's CUDA version, so the fused-MoE alignment kernel can JIT-build.
+
+```bash
+uv pip install --torch-backend=auto -e ".[command_a_plus]"
+# the revision the server pins its tokenizer and config to (mstar/model/command_a_plus/assets.py)
+hf download CohereLabs/command-a-plus-05-2026-bf16 \
+  --revision 5fb6fde5fd12ff89356aae552e11883bc49f069b --local-dir /models/command-a-plus
+cp configs/command_a_plus_tp4.yaml command_a_plus_local.yaml   # then set checkpoint_dir in it
+mstar serve command_a_plus --config command_a_plus_local.yaml --gpus 0,1,2,3
+```
+
+## Send a request {#request}
+
+Use `/generate` or the Python SDK; the `/v1/*` generation routes answer 404 for this model.
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.chat("What is in this image?", images="cat.jpg", max_output_tokens=1024).text)
+```
+
+A plain prompt is one user turn. For a conversation, pass `messages` in `model_kwargs`: a list of `system`, `user` and `assistant` turns that goes through the checkpoint's chat template. In it, an image is a `{"type": "image"}` item, and the uploaded files fill those items in order.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/command_a_plus_tp4.yaml` | 4 | TP4 | The default: 65536-token `max_seq_len`, FlashInfer's one-kernel all-reduce. Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as the H200, set `resources.kv_cache.max_num_pages` to 2048. |
+| `configs/command_a_plus_tp8.yaml` | 8 | TP8 | Eight 80 GB GPUs, 8192-token `max_seq_len`, NCCL all-reduce. |
+
+The image encoder runs once per image prompt beside the first LLM rank.
+
+## Options {#options}
+
+| Knob | Default | Effect |
+|---|---|---|
+| `messages` | | Chat turns through the checkpoint's template. |
+| `max_output_tokens` | 2048 | Output budget. The model reasons before it answers, so give it room. |
+| `temperature`, `top_p`, `repetition_penalty` | 0.9, 0.95, 1.04 | Used where the checkpoint's `generation_config.json` sets none. `top_k`, `min_p`, `penalize_prompt` and `ignore_eos` are also read. |
+| `model_kwargs.checkpoint_dir` | | Deployment key: the local checkpoint directory. |
+| `model_kwargs.max_seq_len` | 8192 | Deployment key: the longest prompt plus output. |
+
+Images are tiled as transformers' `Cohere2VisionProcessor` tiles them: up to 12 tiles of 512x512 plus a thumbnail, 256 tokens each.
+
+## Limits {#limits}
+
+- No OpenAI routes; see [No OpenAI adapter](/models#no-openai-adapter).
+- A prompt plus `max_output_tokens` longer than `max_seq_len` is refused.
+- No FP8 weights, no prefill graph capture and no prefix cache.

@@ -1,0 +1,119 @@
+---
+title: "Qwen3-TTS"
+description: "Text in, streamed speech out with the Qwen3-TTS 12 Hz CustomVoice, VoiceDesign and Base checkpoints."
+---
+
+Qwen3-TTS is streaming text-to-speech: a Talker language model with a residual code predictor and a causal 12 Hz speech codec. One model class serves every 12 Hz checkpoint; the variant (built-in speakers, instructions, reference audio) is read from the checkpoint's `config.json`.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `qwen3_tts` | [Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) | `configs/qwen3tts.yaml` | 1 | `qwen3_tts` |
+| `qwen3_tts_1p7b` | [Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | `configs/qwen3tts_1p7b.yaml` | 1 | `qwen3_tts` |
+| `qwen3_tts_voicedesign` | [Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) | `configs/qwen3tts_voicedesign.yaml` | 1 | `qwen3_tts` |
+| `qwen3_tts_base` | [Qwen/Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | `configs/qwen3tts_base.yaml` | 1 | `qwen3_tts` |
+
+The speech tokenizer comes from the `qwen-tts` package, which neither `qwen3_tts` nor `all` installs. Add it without its dependencies:
+
+```bash
+uv pip install --torch-backend=auto -e ".[qwen3_tts]"
+uv pip install --no-deps "qwen-tts==0.1.1"
+mstar serve qwen3_tts_1p7b
+```
+
+`qwen-tts` pins `transformers==4.57.3` and `accelerate==1.12.0`. Installed with them, it cannot share an environment with `diffusers>=0.40` (Wan2.2, Cosmos3, FLUX.2 klein), OmniVoice (`transformers>=5.3`) or Qwen3-Omni (`transformers>=5.18`), and installing it after them downgrades their dependencies. M\* reads only its speech-tokenizer source files, which run under transformers 4.57.3 or 5.x. `pip check` still lists the package's own requirements as unmet; that is expected.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+
+# CustomVoice: a built-in speaker; instruct is 1.7B only
+client.tts("Hello from M star!", voice="vivian", language="English",
+           instruct="Speak with great enthusiasm.").to_wav("out.wav")
+
+# VoiceDesign: the voice is described by instruct
+client.tts("Hello from M star!", language="English",
+           instruct="A calm, warm adult female voice.").to_wav("design.wav")
+
+# Base: clone a voice from one reference clip
+client.tts("Hello from M star!", language="English", reference_audio="ref.wav",
+           ref_text="Transcript of the reference clip.").to_wav("clone.wav")
+```
+
+`examples/sdk_tts_qwen3.py` runs one of the three, picked by its argument (`custom_voice`, `voice_design` or `voice_clone`). The OpenAI route, streamed:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3_tts_1p7b", "input": "Hello from M star!", "voice": "vivian",
+       "instructions": "Speak with great enthusiasm.", "stream": true}' \
+  -o out.wav
+```
+
+On Base, send the clip as `ref_audio` (a data URL or bare base64; an http(s) URL only when the server sets `MSTAR_ALLOW_REMOTE=1`) with `ref_text`, or `x_vector_only_mode: true` to clone from the speaker embedding alone.
+
+Audio streams in a ramp of codec chunks: the first frame alone, then wider chunks up to a steady width. For live text, open `/generate/ws` with `end_input: false` and `non_streaming_mode: false`, then send the rest of the text as `append` messages; see [WebSocket](/clients#websocket-generatews). A Base clone takes live text only with `x_vector_only_mode`.
+
+## Configs {#configs}
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `qwen3tts.yaml` | 1 | Talker and codec on one worker | 0.6B default |
+| `qwen3tts_split.yaml` | 1 | Codec on a second worker on GPU 0, `mps: true` | 0.6B throughput at high concurrency; slower at concurrency 1 |
+| `qwen3tts_1p7b.yaml` | 1 | One worker, bf16 codec, first chunk of 4 frames, 511 codec streams | 1.7B default |
+| `qwen3tts_1p7b_split.yaml` | 1 | Codec on a second worker on GPU 0, no MPS | Lower first-audio latency at high concurrency |
+| `qwen3tts_voicedesign.yaml` | 1 | One worker | VoiceDesign default |
+| `qwen3tts_base.yaml` | 1 | RefEncoder, Talker and codec on one worker, 2304 KV pages for an 80 GB GPU | Base default, any GPU |
+| `qwen3tts_base_split.yaml` | 1 | Talker, codec and RefEncoder on three workers on GPU 0, `mps: true` | Base throughput from concurrency 8 up |
+
+Every shipped config pins `resources.talker_attn.flashinfer_backend: fa2`. `mps: true` is NVIDIA only and needs `nvidia-cuda-mps-control` on `PATH`.
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech`, all but `voice`, `instructions`, `temperature`, `top_p` and `seed` go in `extra_body`):
+
+| Field | Default | Effect |
+|---|---|---|
+| `voice` | `vivian` | A CustomVoice speaker, case-insensitive; an unknown one is a 400 that lists them. Refused on VoiceDesign and Base. |
+| `language` | automatic | For example `English`. |
+| `instructions` | none | Style on the 1.7B CustomVoice, the voice description on VoiceDesign (required there). `instruct` on `/generate`. |
+| `ref_audio`, `ref_text`, `x_vector_only_mode` | none | Base cloning. The clip is 1 to 30 s. |
+| `non_streaming_mode` | per variant | CustomVoice and VoiceDesign put the whole text in the prefill; Base feeds it one token per frame. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | checkpoint | Talker sampling. `talker_<knob>` wins over a plain `<knob>`; `code_predictor_<knob>` sets the residual code predictor. |
+| `max_output_tokens` | the checkpoint's default; clones also stop within a text-based budget | Codec frames. |
+| `sentence_chunking` | on from 600 characters | Ordered sentence chunks of about 400 characters. |
+
+Deployment settings:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `model_kwargs.codec_dtype` | `float32` | `bfloat16` runs the codec decoder in bf16 (RMSNorm and RoPE stay float32). `qwen3tts_1p7b.yaml` and the Base configs set it. Measure on B300 before switching. |
+| `model_kwargs.codec_chunk_schedule`, `codec_chunk_frames` | `[1, 3, 8, 16]`, 25 | The ramp of first chunks and the steady chunk, in frames. |
+| `model_kwargs.depth_kernel` | `false` | Runs the code predictor's loop as one persistent kernel on a Hopper GPU with 128 or more SMs and Triton 3.7 or later, outside MPS; otherwise startup logs the reason and runs the loop. Codes can differ from the loop's at near-ties. |
+| `model_kwargs.audio_watermark` | off | `{enabled: true, message: 0xBEEF, alpha: 1.0}` marks the output with AudioSeal. Needs the `audioseal` extra; check files with `python -m mstar.model.audio_watermark detect --message 0xBEEF out.wav` (needs the `audio` extra). |
+| `resources.talker_attn.decode_tensor_cores` | `false` | Decode rows use FlashInfer's CUDA-core kernel, since every checkpoint has two query heads per KV head. `true` selects the tensor-core kernel. |
+| `resources.codec_state.max_slots` | 257 | Codec streams plus one sink slot. A new stream past it waits for a slot. |
+| `resources.talker_kv.max_num_pages` | model default | Talker KV pool in pages of 128 tokens. |
+
+Benchmark the OpenAI route with the shared streaming client, which needs a checkout and the `eval` extra:
+
+```bash
+python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
+    --model qwen3_tts_1p7b --sentences benchmark/assets/t2s.txt --voice vivian \
+    --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json \
+    --save-audio-dir results/mstar_c8_wav
+```
+
+## Limits {#limits}
+
+- `instructions` on the 0.6B CustomVoice are refused, since it was not trained with them. VoiceDesign without `instructions` is a 400.
+- Base needs exactly one reference clip and `ref_text`, unless `x_vector_only_mode` is set.
+- A live `/generate/ws` opening is a 400 in `non_streaming_mode` and for an in-context clone; send those one-shot.
+- Every request reserves its prompt plus its length cap at admission. A request for the checkpoint's 8192 frames takes about 66 pages, so `qwen3tts_base.yaml` admits 34 of those at once; the rest wait.
+- A clone without `max_output_tokens` stops within a budget set by its text length, so a runaway clone does not decode to the 8192-frame cap. Live text has no budget.
+- `speed` is not a Qwen3-TTS control and is logged as ignored.
+- The codec does not run on a side stream (`side_stream`); no Qwen3-TTS config sets it.

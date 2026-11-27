@@ -1,0 +1,81 @@
+---
+title: "BAGEL"
+description: "Text and image in, text or image out on BAGEL-7B-MoT: chat, text-to-image and image editing."
+---
+
+BAGEL is a unified multimodal model: one mixture-of-transformers LLM with a ViT encoder and a VAE understands images, writes text, generates images and edits them.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `bagel` | [ByteDance-Seed/BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | `configs/bagel_single_gpu.yaml` | 1 | `bagel` |
+| `bagel_cfg_parallel` | [ByteDance-Seed/BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | `configs/bagel_cfg_parallel.yaml` | 3 | `bagel` |
+
+`bagel_cfg_parallel` is the same model with its guidance branches on their own GPUs.
+
+```bash
+uv pip install --torch-backend=auto -e ".[bagel]"
+mstar serve bagel
+mstar serve bagel_cfg_parallel --gpus 0,1,2
+```
+
+The ViT encoder uses `flash-attn` when it is installed and falls back to torch SDPA with a warning; see [manual installs](/installation#manual-installs).
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+print(client.chat("What is the capital of France?").text)
+open("cat.png", "wb").write(client.generate_image("a cat wearing a hat", seed=42))
+open("watercolor.png", "wb").write(client.edit_image("make it a watercolor painting", "cat.png"))
+```
+
+BAGEL also serves `/v1/chat/completions`, `/v1/images/generations` and `/v1/images/edits`. The image routes return the image base64-encoded in `data[0].b64_json`:
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+image = client.images.generate(model="bagel", prompt="a cat wearing a hat", size="1024x1024")
+open("cat.png", "wb").write(base64.b64decode(image.data[0].b64_json))
+```
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/bagel_single_gpu.yaml` | 1 | none | The default. |
+| `configs/bagel.yaml` | 2 | encoders and VAE on GPU 0, LLM on GPU 1 | The LLM on a GPU of its own. |
+| `configs/bagel_pd_disaggregated.yaml` | 2 | prefill on GPU 0, decode and image generation on GPU 1 | Prefill apart from decode. |
+| `configs/bagel_cfg_parallel_2gpu.yaml` | 2 | main branch on GPU 0, both guidance branches on GPU 1 | Text-to-image with guidance on two GPUs. |
+| `configs/bagel_cfg_parallel.yaml` | 3 | main branch, text guidance and image guidance each on a GPU | Guided generation and edits, one branch per GPU. |
+| `configs/bagel_img_disaggregated.yaml` | 3 | prefill, decode and image generation each on a GPU | Text and image traffic apart. |
+| `configs/bagel_xpu_tp2.yaml`, `configs/bagel_xpu_cfg_tp2.yaml` | 3, 7 | LLM at TP2; CFG parallel at TP2 | Intel GPUs, one request at a time; see [Intel XPU](/hardware#intel-xpu). |
+
+A custom config that places the LLM per walk lists `image_gen_head`, `image_gen`, `image_gen_guided2` and `image_gen_guided3` on the GPU that generates images, as `configs/bagel_pd_disaggregated.yaml` does.
+
+## Options {#options}
+
+Request knobs go in `model_kwargs` on `/generate` and in `extra_body` on the OpenAI routes.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `cfg_text_scale` | 4.0 | Text guidance; 1 or less turns it off. |
+| `cfg_img_scale` | 1.0; 2.0 on an edit | Image guidance; 1 or less turns it off. |
+| `cfg_interval` | `[0.4, 1.0]`; `[0.0, 1.0]` on an edit | The part of the schedule guidance runs in, `[lo, hi]` within 0 to 1. |
+| `cfg_renorm_type` | `global`; `text_channel` on an edit | `global`, `channel` or `text_channel`. |
+| `think_mode` | `false` | The model writes its reasoning before it generates. |
+| `width`, `height` | 1024 | Multiples of 16, up to 1024. On an edit they bound the output, which keeps the input's aspect. |
+| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0.6, 0 (off), 1.0 (off), 1.05 | Text sampling. The checkpoint's `generation_config.json` is the backbone's chat preset, so only its `do_sample: false` is read. |
+
+Deployment: `model_kwargs.accelerator_graph: false` serves without graph capture (default `true`). With capture on, `MSTAR_VIT_ACCELERATOR_GRAPH=1` also captures the ViT encoder.
+
+## Limits {#limits}
+
+- Generated images are at most 1024 pixels a side.
+- A `min_p` above 0 is refused.
+- The chat route refuses tool calls, `n` above 1, stop sequences and OpenAI `logprobs`.

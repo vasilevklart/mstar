@@ -1,0 +1,85 @@
+---
+title: "Chatterbox"
+description: "Text in, speech out with Resemble AI's Chatterbox, Chatterbox Multilingual and Chatterbox-Turbo, with voice cloning."
+---
+
+Chatterbox is zero-shot voice-cloning TTS: a T3 speech-token language model (Llama-520M, or GPT-2-medium for Turbo) with classifier-free guidance and an exaggeration control, an S3Gen flow-matching decoder and a HiFT vocoder. Output is 24 kHz and carries Resemble's PerTh watermark. The multilingual checkpoint covers 23 languages.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `chatterbox` | [ResembleAI/chatterbox](https://huggingface.co/ResembleAI/chatterbox) | `configs/chatterbox.yaml` | 1 | `chatterbox` |
+| `chatterbox_multilingual` | [ResembleAI/chatterbox](https://huggingface.co/ResembleAI/chatterbox) (multilingual T3 weights) | `configs/chatterbox_multilingual.yaml` | 1 | `chatterbox`, `chatterbox_multilingual` |
+| `chatterbox_turbo` | [ResembleAI/chatterbox-turbo](https://huggingface.co/ResembleAI/chatterbox-turbo) | `configs/chatterbox_turbo.yaml` | 1 | `chatterbox` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[chatterbox]"
+mstar serve chatterbox
+```
+
+For `chatterbox_multilingual`, install `".[chatterbox,chatterbox_multilingual]"`; the second extra adds Japanese kana reading and Chinese word segmentation. Hebrew diacritics and Russian stress marks use `dicta_onnx` and `russian_text_stresser`, installed separately; without a package the step is skipped with a warning.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+client.tts("Hello there.", voice="default", cfg_weight=0.5).to_wav("out.wav")
+client.tts("Hello there.", reference_audio="ref.wav").to_wav("clone.wav")
+```
+
+The OpenAI route, cloning from a clip sent as base64 (`ref_audio` and the other model fields go in `extra_body` with the OpenAI client):
+
+```python
+import base64
+
+import requests
+
+ref = base64.b64encode(open("ref.wav", "rb").read()).decode()
+r = requests.post("http://localhost:8000/v1/audio/speech", json={
+    "model": "chatterbox", "input": "Hello there.", "ref_audio": ref, "exaggeration": 0.7,
+})
+r.raise_for_status()
+open("out.wav", "wb").write(r.content)
+```
+
+On `chatterbox_multilingual`, add `"language_id": "fr"` (one of ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru sv sw tr zh).
+
+## Configs {#configs}
+
+| File | GPUs | Concurrency cap | Layout |
+|---|---|---|---|
+| `chatterbox.yaml`, `chatterbox_multilingual.yaml` | 1 | 30 | T3 and S3Gen on one worker |
+| `chatterbox_turbo.yaml` | 1 | 50 | T3 and S3Gen on one worker |
+| `chatterbox_split.yaml`, `chatterbox_multilingual_split.yaml`, `chatterbox_turbo_split.yaml` | 1 | as above | S3Gen on a second worker on the same GPU, with `mps: true` |
+
+The split configs pay only under CUDA MPS, which lets the two workers' kernels overlap: more throughput at high concurrency, a later first chunk. `mps: true` needs `nvidia-cuda-mps-control` on `PATH`.
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech`, all but `voice`, `temperature`, `top_p` and `seed` go in `extra_body`):
+
+| Field | Default | Effect |
+|---|---|---|
+| `voice` | `default` | The checkpoint's voice, or a preset clip in the deployment's `voices_dir`, named with or without its extension. |
+| `ref_audio` | none | A clip to clone: a data URL or bare base64. An http(s) URL only when the server sets `MSTAR_ALLOW_REMOTE=1`. 5 to 30 s works best. |
+| `exaggeration` | 0.5 | 0 to 2, emotion intensity. Not on Turbo. |
+| `cfg_weight` | 0.5 | 0 to 1. 0 turns guidance off and halves the T3 work. Not on Turbo. |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty` | 0.8, 1.0, 0, 0.05, 1.2 (Turbo 0.8, 0.95, 1000, 0, 1.2) | Sampling. Temperature under 1e-5 is greedy. `min_p` is not on Turbo. |
+| `n_cfm_timesteps` | 10 (Turbo 2) | S3Gen Euler steps. |
+| `max_output_tokens` | up to `max_new_tokens_limit` | Speech tokens, 25 a second. |
+| `watermark` | `true` | `false` turns the PerTh mark off. |
+| `language_id` | `default_language` (`en`) | Multilingual only. |
+| `sentence_chunking` | off | `true` splits long text into sentence groups of up to 400 characters, at most 32. |
+
+Deployment `model_kwargs`: `max_new_tokens_limit` (1000 in the shipped configs, sized with `max_concurrent_requests` to fit the T3 KV pool; raise `resources.t3_kv.max_num_pages` with it), `voices_dir`, `watermark`, `default_language`, `stream_chunk_tokens` (`0` synthesizes whole utterances, the reference path) and `stream_context_tokens`.
+
+## Limits {#limits}
+
+- Keep a request to a sentence or two. Text over 512 tokens is refused, and quality drops well before that, as in the reference package. Use `sentence_chunking: true` for long text.
+- Turbo answers a non-zero `cfg_weight`, `exaggeration` or `min_p` with a 400. `language_id` on a non-multilingual checkpoint is logged as ignored, and so is `speed`.
+- `ref_audio` clips over 60 s or below 8 kHz are refused, and paths on the server are never read. Only the first 30 s of a clip is used. Turbo refuses a reference clip shorter than 5 s.
+- Startup refuses a `max_concurrent_requests` whose requests at `max_new_tokens_limit` do not fit the T3 KV pool.
+- Streamed audio is not sample-identical to a whole-utterance decode.

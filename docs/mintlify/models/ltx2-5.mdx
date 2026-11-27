@@ -1,0 +1,75 @@
+---
+title: "LTX-2.5"
+description: "Text to video with sound using LTX-2.5 (beta)."
+---
+
+LTX-2.5 is a 22B joint audio-video DiT with a Gemma-4 text encoder. It takes a text prompt and returns an H.264 video and 48 kHz stereo audio, using the distilled 8-step recipe without guidance. The model is in beta.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `ltx2_5` | [Lightricks/LTX-2.5-Diffusers](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) | `configs/ltx2_5.yaml` | 2 | `all` |
+
+The weights are gated and under the LTX-2.x Community License. Accept the license on Hugging Face and export a token before the first start:
+
+```bash
+uv pip install --torch-backend=auto -e ".[all]"
+export HF_TOKEN=<your token>
+mstar serve ltx2_5 --gpus 0,1
+```
+
+Muxing the audio into the mp4 needs the `ffmpeg` binary on the server's `PATH`, and `ffprobe` too when the request sets `fps`. If the mux fails, the reply carries the video alone.
+
+## Send a request {#request}
+
+`POST /v1/videos/generations` returns one mp4 with the audio as an AAC track. Send `"audio": false` for video alone.
+
+```bash
+curl -sS http://localhost:8000/v1/videos/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a dog barking on a beach at sunset", "size": "960x544", "num_frames": 121, "seed": 0}' \
+  | python -c "import sys,json,base64; open('out.mp4','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+```
+
+Request knobs, in `model_kwargs` or the video request body:
+
+| Knob | Default | Rule |
+|---|---|---|
+| `height`, `width` | 544, 960 (1088, 1920 for `two_stage`) | Multiples of 32, or of 64 for `two_stage`. |
+| `num_frames` | 121 | `8k+1`. |
+| `fps` | 24 | Enters the video positions and the container. |
+| `recipe` | `single` | `single`: 8 steps at the requested size. `two_stage`: 8 steps at half size, the x2 latent upsampler, then 3 steps at full size. |
+| `seed` | none | Fixes the noise for a repeatable result. |
+
+`num_inference_steps` and the guidance scales are accepted and not honoured. On `/generate`, `output_modalities` picks the decoders (`video`, `audio` or both); the model always denoises both.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/ltx2_5.yaml` | 2 | none | Default. The DiT alone on GPU 0; the text encoder and decoders on GPU 1, so one request's encode and decode overlap another's denoise. |
+| `configs/ltx2_5_tp2.yaml` | 2 | `tp_size: 2` on the DiT | Captures both 544x960 and 1088x1920, so `two_stage` replays graphs in both stages. |
+| `configs/ltx2_5_sp2.yaml` | 2 | `sp_size: 2` on the DiT | Each rank holds the whole DiT and half the video tokens. Captures 544x960 only. |
+
+## Options {#options}
+
+Set these under `model_kwargs` in the config.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `compile` | `true` | Compile the DiT. |
+| `accelerator_graph` | `true` | Capture the denoise step for `capture_shapes` and `capture_batch_sizes`. |
+| `capture_shapes` | `[[544, 960, 121, 24]]` | `[height, width, num_frames, fps]` shapes captured. Other shapes run compiled without a graph and pay a compile on first use. |
+| `capture_batch_sizes` | `[1, 2]` | Batch sizes captured per shape. |
+| `max_batch_size` | `4` | Requests per denoise step. |
+| `vae_compile` | `false` | Compile the video VAE decoder for `vae_compile_shapes` (default: the capture shapes). The shipped configs turn it on; set `false` for bit-exact output. |
+| `vae_tile_min_pixels` | `921600` (1280x720) | Frames larger than this area decode in tiles. |
+| `max_video_tokens` | `65536` | Latent-token ceiling for one request. Larger requests are a 400. |
+| `async_scheduling` | `true` | Build the next step while the current one runs. |
+
+## Limits {#limits}
+
+- Text to video only: `image` and `video` in the request are a 400.
+- The full (non-distilled) transformer, image-to-video and the duration head are not ported.
+- `backend: sdpa` on an attention resource that reads split keys is refused on SP ranks, so `ltx2_5_sp2.yaml` keeps the ragged resources.
+- Per-request LoRA is not served.

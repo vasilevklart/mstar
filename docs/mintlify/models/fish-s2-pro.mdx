@@ -1,0 +1,85 @@
+---
+title: "Fish Audio S2-Pro"
+description: "Text in, 44.1 kHz speech out with Fish Audio S2-Pro, with voice cloning and inline prosody tags."
+---
+
+Fish Audio S2-Pro is dual-AR text-to-speech: a Qwen3-4B Slow AR and a 4-layer Fast AR over 10 codebooks, decoded by a causal 44.1 kHz DAC codec. It clones a voice from one reference clip and takes inline `[tag]` prosody control in the text.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `fish_s2_pro` | [fishaudio/s2-pro](https://huggingface.co/fishaudio/s2-pro) | `configs/fish_s2_pro.yaml` | 1 | `fish_s2_pro` |
+
+The weights are under the Fish Audio Research License: research and non-commercial use only. M\* downloads them at runtime and does not redistribute them; read the license before deploying.
+
+```bash
+uv pip install --torch-backend=auto -e ".[fish_s2_pro]"
+mstar serve fish_s2_pro
+```
+
+`fish_s2_pro.yaml` runs three warmup requests before the server binds, one of them a voice clone from `samples/af_heart_0.wav` in `hexgrad/Kokoro-82M`. A machine without network access needs that file in its Hugging Face cache; without it that warmup is skipped with a warning and the first clone pays the one-time cost.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+client.tts("Hello there.").to_wav("out.wav")
+client.tts("Hello there.", reference_audio="ref.wav",
+           ref_text="Transcript of the reference clip.").to_wav("clone.wav")
+```
+
+The OpenAI route, cloning from a clip sent as base64 (`ref_audio` and `ref_text` go in `extra_body` with the OpenAI client):
+
+```python
+import base64
+
+import requests
+
+ref = base64.b64encode(open("ref.wav", "rb").read()).decode()
+r = requests.post("http://localhost:8000/v1/audio/speech", json={
+    "model": "fish_s2_pro", "input": "Hello there.",
+    "ref_audio": ref, "ref_text": "Transcript of the reference clip.",
+})
+r.raise_for_status()
+open("out.wav", "wb").write(r.content)
+```
+
+Without a reference clip, the model picks a voice.
+
+## Configs {#configs}
+
+| File | GPUs | Layout | Use |
+|---|---|---|---|
+| `fish_s2_pro.yaml` | 1 | RefEncoder and AR on one worker, codec beside them, cap 64, warmup requests | Default |
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech`, all but `temperature`, `top_p` and `seed` go in `extra_body`):
+
+| Field | Default | Effect |
+|---|---|---|
+| `ref_audio`, `ref_text` | none | A clip to clone (data URL or bare base64; an http(s) URL only with `MSTAR_ALLOW_REMOTE=1`) and its transcript. |
+| `temperature`, `top_p`, `top_k` | 0.8, 0.8, 30 | The reference's sampling defaults. |
+| `do_sample` | `true` | `false` decodes greedily. |
+| `repetition_penalty` | 1.0 (off) | M\*'s penalty counts the whole generation, not the reference's 16-token window. |
+| `max_new_tokens` | 2048 | Codec frames of 2048 samples at 44.1 kHz. |
+| `ignore_eos` | `false` | Decode all `max_new_tokens`, for fixed-length benchmarks. |
+| `sentence_chunking` | on from 600 characters | Ordered sentence chunks of about 400 characters. |
+
+Deployment settings:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `model_kwargs.codec_exact_fp32` | `false` | The codec decodes with TF32. `true` runs it in fp32 with TF32 off, so streamed audio matches the whole-utterance decode to within one int16 step. |
+| `resources.codec_state.max_slots` | 65 (64 streams and a sink slot) | A request holds a codec stream until it ends; startup refuses a `max_concurrent_requests` above the streams. |
+| `resources.slow_ar_attn.flashinfer_backend` | `fa2` in the config | The attention backend for the Slow AR. |
+
+## Limits {#limits}
+
+- `voice` and `speed` are not S2-Pro controls and are logged as ignored.
+- At the same sampling values, M\*'s sampler keeps a slightly different token set per step than the reference: it applies the temperature before top-k and top-p, and keeps the token that carries the running total past top-p.
+- `max_new_tokens` is at most 4096 frames.
+- A reference clip must be 0.5 to 30 s long.

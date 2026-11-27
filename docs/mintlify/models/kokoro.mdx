@@ -1,0 +1,79 @@
+---
+title: "Kokoro"
+description: "Text in, speech out with the 82M-parameter Kokoro TTS model and its bundled voices."
+---
+
+Kokoro-82M is a small text-to-speech model that is not autoregressive: misaki G2P, PL-BERT prosody and an iSTFTNet vocoder. It ships bundled voices and voice blends, streams sentence by sentence and batches across requests. Output is 24 kHz mono.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `kokoro` | [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | `configs/kokoro.yaml` | 1 | `kokoro` |
+
+```bash
+uv pip install --torch-backend=auto -e ".[kokoro]"
+python -m spacy download en_core_web_sm
+mstar serve kokoro
+```
+
+misaki downloads the spaCy tagger itself on first use when it has network access. `pip install 'misaki[en]'` adds espeak-ng (GPL), which Kokoro uses for out-of-dictionary English words and as the G2P for the Spanish, French, Hindi, Italian and Portuguese voices; without it those words are skipped and those voices are refused. Japanese and Mandarin voices need `misaki[ja]` and `misaki[zh]`.
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+client.tts("Hello there.", voice="af_heart").to_wav("out.wav")
+print(client.voices())
+```
+
+The OpenAI route, streamed sentence by sentence:
+
+```bash
+curl --fail http://localhost:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "kokoro", "input": "Hello there.", "voice": "af_heart", "stream": true}' \
+  -o out.wav
+```
+
+`GET /v1/audio/voices` lists the bundled voices whose G2P language is installed on the server. `examples/livekit_kokoro.py` and `examples/pipecat_kokoro.py` connect LiveKit Agents and Pipecat through their OpenAI TTS plugins.
+
+## Configs {#configs}
+
+| File | GPUs | Use |
+|---|---|---|
+| `kokoro.yaml` | 1 | Default; the model runs in float32 |
+| `kokoro_bf16.yaml` | 1 | The vocoder trunk in bfloat16 for more throughput; float32 is the parity-tested path |
+
+## Options {#options}
+
+Request fields (on `/v1/audio/speech` the non-OpenAI ones go in `extra_body`):
+
+| Field | Default | Effect |
+|---|---|---|
+| `voice` | `af_heart` | A bundled voice, or a blend such as `af_bella+af_sky` or `af_bella(2)+af_sky(1)`. |
+| `speed` | 1.0 | 0.25 to 4.0. |
+| `lang_code` | the voice's prefix | G2P language: `a` American English, `b` British, `e` Spanish, `f` French, `h` Hindi, `i` Italian, `p` Portuguese, `j` Japanese, `z` Mandarin. |
+| `phonemes` | none | Skip G2P and synthesize this phoneme string. |
+
+Deployment `model_kwargs` (see the comments in `configs/kokoro.yaml`):
+
+| Knob | Default | Effect |
+|---|---|---|
+| `lang_code` | per voice | Fixes the G2P language for every request. |
+| `espeak_fallback` | `true` | `false` skips espeak-ng even when it is installed. |
+| `default_voice` | `af_heart` | The voice when a request names none. |
+| `chunk_target_phonemes`, `first_chunk_target_phonemes` | 200, 80 | Sentence packing. A short first chunk gives early first audio. |
+| `text_buckets`, `frame_buckets`, `capture_batch_sizes`, `max_batch_frames` | see config | The CUDA graphs captured at startup. Use fewer buckets on a smaller GPU. |
+| `compile_decoder` | `true` | `false` skips `torch.compile` of the vocoder: startup in seconds, lower throughput. |
+| `decoder_dtype` | `float32` | `bfloat16` runs the vocoder trunk in bf16. |
+
+## Limits {#limits}
+
+- Text input only. An empty `voice` or `lang_code`, or a `speed` outside 0.25 to 4.0, is a 400.
+- A voice whose G2P package is missing is refused with the `pip install` command that adds it.
+- Text is cut at sentence boundaries into chunks of at most 510 phonemes, the PL-BERT window.
+- `temperature` and `top_p` are ignored: Kokoro does not sample.
+- With the default `compile_decoder: true`, the first start on a GPU compiles the vocoder; see [Cold start](/cold-start#compile-cache).

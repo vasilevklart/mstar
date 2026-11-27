@@ -1,0 +1,83 @@
+---
+title: "FLUX.2 klein and Z-Image"
+description: "Text to image with FLUX.2 [klein] and Z-Image-Turbo, and reference-image editing with klein."
+---
+
+FLUX.2 [klein] is a step-distilled rectified-flow model for text-to-image and multi-reference image editing (4 steps, no guidance). Z-Image-Turbo is an 8-step distilled DiT for text-to-image only, on the same scaffold.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `flux2_klein` | [black-forest-labs/FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | `configs/flux2_klein.yaml` | 1 | `flux2_klein` |
+| `flux2_klein_9b` | [black-forest-labs/FLUX.2-klein-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) | `configs/flux2_klein_9b.yaml` | 1 | `flux2_klein` |
+| `z_image_turbo` | [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | `configs/z_image_turbo.yaml` | 1 | `all` |
+
+The 4B and Z-Image weights are Apache-2.0. The 9B weights are under the FLUX Non-Commercial License; check it before deploying.
+
+```bash
+uv pip install --torch-backend=auto -e ".[flux2_klein]"
+mstar serve flux2_klein
+```
+
+## Send a request {#request}
+
+```python
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+png = client.generate_image("a cat holding a sign that says hello world", width=1024, height=1024, seed=0)
+open("cat.png", "wb").write(png)
+
+# FLUX.2 klein only: edit with up to four reference images, in order
+open("edit.png", "wb").write(client.edit_image("make it a watercolor painting", "cat.png", seed=1))
+```
+
+The OpenAI routes are `POST /v1/images/generations` (`size` as `WxH`, `seed`, `n`; other knobs through `extra_body`) and, for klein, `POST /v1/images/edits` with one `image` and a `prompt`:
+
+```bash
+curl -sS http://localhost:8000/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a lighthouse at dusk", "size": "1024x1024", "seed": 0}' \
+  | python -c "import sys,json,base64; open('out.png','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+```
+
+Request knobs: `width` and `height` (multiples of 16), `num_inference_steps` (klein 4, Z-Image 8) and `seed`. `guidance_scale` is accepted and ignored with a log line.
+
+## Configs {#configs}
+
+| File | GPUs | Parallelism | When to use |
+|---|---|---|---|
+| `configs/flux2_klein.yaml` | 1 | none | Default; up to 8 requests per step. |
+| `configs/flux2_klein_9b.yaml` | 1 | none | Default; up to 4 requests per step. |
+| `configs/z_image_turbo.yaml` | 1 | none | Default; up to 8 requests per step. |
+
+Each captures the denoise step at 1024x1024 and sets `resources: dit_attn: backend: sdpa`.
+
+## Options {#options}
+
+Set these under `model_kwargs` in the config.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `compile` | `true` | `torch.compile` of the transformer, one trace per shape. |
+| `compile_eager_rounding` | `true` | Inductor rounds intermediates where eager PyTorch does and fuses no FMAs. |
+| `compile_exact_ops` | `false` | `true` or a list of `norms`, `activations`: those modules keep the eager result inside the compiled forward. The klein configs ship `[norms]`; Z-Image ships `false`, and `[norms]` makes it match the reference at a latency cost. |
+| `accelerator_graph` | `true` | Capture the denoise step for each `capture_sizes` entry (`[[1024, 1024]]`) and `capture_batch_sizes` entry (`[1, 2, 4, 8]`). Other shapes run eager. |
+| `capture_edit_sizes` | `capture_sizes` | klein only: edit shapes with one reference image of the output size. `[]` captures none. |
+| `capture_caption_lengths` | `[32, 64]` | Z-Image only: caption lengths captured per batch size. |
+| `max_batch_size` | `8` | Rows per denoise step. |
+| `max_image_area` | `4194304` (2048x2048) | Larger requests are a 400. |
+| `vae_compile` | `false` | Compiled VAE decode. The shipped configs turn it on; set `false` for bit-exact, repeatable output. |
+| `async_scheduling` | `true` | Build the next denoise step while the current one runs. `false` is lockstep. |
+| `linear_dtype` | `bf16` | `mxfp8` or `nvfp4` runs the block linears through cuBLASLt's block-scaled GEMM. Needs compute capability 10.0 or higher; other GPUs stay on bf16 with a warning. Images change against bf16, so it is off by default. |
+| `linear_keep_bf16` | none | Module-name patterns kept in bf16 under a low-precision `linear_dtype`, for example `single_blocks.0-3.*`. |
+| `linear_dtype_steps` | none | Run some denoise steps in bf16: a count of leading steps, or a dtype per step. Holds a second copy of the weights. |
+| `lora` | none | klein only: adapters merged into the weights at load, `[{path: ..., scale: ...}]` (diffusers, PEFT or BFL-layout safetensors). |
+
+`backend` on the `dit_attn` resource picks the attention kernel: `sdpa` runs torch's SDPA, as the configs ship, and a ragged-attention backend such as `flashinfer` runs the engine's ragged attention resource. Remove the block to let the GPU's kernel table choose.
+
+## Limits {#limits}
+
+- Z-Image refuses reference images and sides over 8192 px.
+- `/v1/images/edits` takes one image and no mask. Send several reference images through the SDK or `/generate`.
+- klein's `lora` is a merge at load, not a per-request adapter, and a DoRA adapter is refused. Neither model serves [per-request LoRA](/models/lora).

@@ -1,0 +1,125 @@
+---
+title: "World models and robot policies"
+description: "Waypoint, LingBot-World, V-JEPA 2 and pi0.5: interactive video, camera-controlled video, video embeddings and robot actions."
+---
+
+These models take frames, actions or camera poses and return frames, hidden states or robot actions. None has an OpenAI adapter; they are served on `/generate` and `/generate/ws`, and pi0.5 with `configs/pi05_droid.yaml` also on openpi's WebSocket.
+
+## Serve {#serve}
+
+| Key | Checkpoint | Default config | GPUs | Extra |
+|---|---|---|---|---|
+| `waypoint` | [Overworld/Waypoint-1.5-1B](https://huggingface.co/Overworld/Waypoint-1.5-1B) | `configs/waypoint.yaml` | 1 | `waypoint`, plus TAEHV and flash-attn-4 |
+| `lingbot_world_1_3b` | [robbyant/lingbot-world-v2-1.3b-causal-fast](https://huggingface.co/robbyant/lingbot-world-v2-1.3b-causal-fast) | `configs/lingbot_world_1_3b.yaml` | 1 | `lingbot_world` |
+| `vjepa2` | [facebook/vjepa2-vitl-fpc64-256](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | `configs/vjepa2.yaml` | 1 | `vjepa2` |
+| `vjepa2_ac` | `vjepa2-ac-vitg.pt` from `dl.fbaipublicfiles.com`, fetched on first load | `configs/vjepa2_ac.yaml` | 1 | `vjepa2_ac` |
+| `pi05` | [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base) | `configs/pi05.yaml` | 1 | `pi05` |
+
+- LingBot-World's weights are CC-BY-NC-SA-4.0 (non-commercial); check the license before deploying.
+- pi0.5 loads its tokenizer from the gated [google/paligemma-3b-pt-224](https://huggingface.co/google/paligemma-3b-pt-224). Accept its license and `export HF_TOKEN=<your token>`, or the server refuses to start.
+
+### Waypoint: TAEHV and flash-attn-4 {#waypoint-install}
+
+TAEHV is installed from a pinned source archive, which needs uv 0.4.0 or newer, or pip 24.3 or newer (an older pip can report success and build an empty `UNKNOWN` wheel):
+
+```bash
+uv pip install --torch-backend=auto -e ".[waypoint]"
+uv pip install --no-deps \
+  "taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip"
+```
+
+The DiT's attention runs torch flex-attention on the `FLASH` backend, which needs flash-attn-4 (`flash_attn.cute`) and torch 2.11 or newer. Install it after flash-attn, whose package ships an older `flash_attn/cute`:
+
+```bash
+git clone https://github.com/Dao-AILab/flash-attention
+git -C flash-attention checkout 1bda8f9290cd48d030f1516f0e680cd464ef3554
+uv pip install --torch-backend=auto ./flash-attention/flash_attn/cute
+```
+
+Its kernels compile on first use, which slows the first startup. Without it the server logs a warning and runs the Triton flex kernel. `MSTAR_FLEX_BACKEND=TRITON` picks Triton; `MSTAR_FLEX_BACKEND=FLASH` fails at startup instead of falling back.
+
+### LingBot-World: flash-attn {#lingbot-install}
+
+flash-attn is needed only for `model_kwargs: {reference_numerics: true}`, which runs the reference's FlashAttention-2 numerics. No extra installs it. A prebuilt wheel must match the installed torch and its CUDA build. The wheels stop at torch 2.10, and for 2.10 only CUDA 13 builds exist:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+uv pip install \
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+```
+
+On any other torch or CUDA build, build it against the installed torch, limited to your GPU's compute capability (`90` for H100):
+
+```bash
+uv pip install psutil
+FLASH_ATTN_CUDA_ARCHS="90" uv pip install flash-attn==2.8.3.post1 --no-build-isolation
+python -c "import flash_attn; print(flash_attn.__version__)"
+```
+
+## Send a request {#request}
+
+A pi0.5 request sends one image per camera, the task and optionally the robot state, and gets float32 actions `[50, 32]` (`[15, 32]` with `configs/pi05_droid.yaml`):
+
+```python
+import numpy as np
+from mstar import MStarClient
+
+client = MStarClient("http://localhost:8000")
+res = client.generate(text="pick up the cup", images=["base.png", "wrist.png"],
+                      output_modalities=("action",), robot_state=[0.0] * 8)
+action = next(r for r in res.raw if r["modality"] == "action")
+actions = np.frombuffer(action["bytes"], dtype=np.float32).reshape(-1, 32)
+```
+
+`mstar serve pi05 --config configs/pi05_droid.yaml` serves the DROID fine-tune and openpi's policy protocol at the server root, so openpi's client connects unchanged (see [openpi WebSocket](/clients#openpi-websocket)):
+
+```python
+from openpi_client import websocket_client_policy
+
+policy = websocket_client_policy.WebsocketClientPolicy("localhost", 8000)
+actions = policy.infer({
+    "observation/exterior_image_1_left": exterior,  # uint8 [224, 224, 3]
+    "observation/wrist_image_left": wrist,
+    "observation/joint_position": joints,           # 7 floats
+    "observation/gripper_position": gripper,        # 1 float
+    "prompt": "put the marker in the cup",
+})["actions"]                                       # float32 (15, 8)
+```
+
+What the other models read:
+
+| Key | `output_modalities` | Request |
+|---|---|---|
+| `waypoint` | `["video_frame"]`, streamed | One seed image and `model_kwargs.actions`: 1 to 512 dicts `{"mouse": [dx, dy], "buttons": [...], "scroll": s}`, one frame each. A live `/generate/ws` call, opened with a `request_id` and `"end_input": false`, appends more as `{"request_id": ..., "append": {"model_kwargs": {"actions": [...]}}}`. |
+| `lingbot_world_1_3b` | `["video_frame"]`, streamed | A prompt, one image, `camera_poses` (`[F, 4, 4]` or `[F, 3, 4]` OpenCV camera-to-world, F at least 13) and `intrinsics` (`[fx, fy, cx, cy]` at 480x832). The whole `model_kwargs` part is capped at 1 MiB. |
+| `vjepa2` | `["video"]` | One video. Returns predicted hidden states as float32; `skip_predictor: true` returns the encoder's. |
+| `vjepa2_ac` | `["video"]` | One video plus per-step `actions` and `states`. |
+
+## Configs {#configs}
+
+| File | GPUs | When to use |
+|---|---|---|
+| `waypoint.yaml` | 1 | 720p, 2 worlds at once. |
+| `waypoint_360p.yaml` | 1 | 360p checkpoint, 8 worlds at once. |
+| `lingbot_world_1_3b.yaml` | 1 | Default: deterministic compile. |
+| `lingbot_world_1_3b_fast.yaml` | 1 | Autotuned DiT kernels; a seed's rollout differs between server processes. |
+| `pi05.yaml` | 1 | `lerobot/pi05_base`. |
+| `pi05_droid.yaml` | 1 | `lerobot/pi05_droid`, two cameras, openpi's DROID normalization and socket. |
+| `vjepa2.yaml`, `vjepa2_ac.yaml` | 1 | Default. |
+
+## Options {#options}
+
+| Key | Knob | Effect |
+|---|---|---|
+| `waypoint` | `max_concurrent_requests` with `resources: kv: num_sessions` | Worlds resident at once; raise both together. |
+| `waypoint` | `step_batch_size` | Rows per rollout step, at most `num_sessions`. |
+| `lingbot_world_1_3b` | `reference_numerics` | `true` runs the reference's numerics (needs flash-attn). |
+| `pi05` | `num_cameras` | Images per request. The class default is 3; `pi05.yaml` leaves it, `pi05_droid.yaml` sets 2. |
+| `pi05` | `norm_stats` | Normalize the raw `robot_state` as openpi does. |
+
+## Limits {#limits}
+
+- LingBot-World runs one rollout at a time and refuses any other `max_concurrent_requests`.
+- pi0.5 refuses more images than `num_cameras` with a 400; cameras left out are masked. `node_groups` must put `LLM` and `action_expert` in one entry.
+- Waypoint ignores the prompt.
+- The OpenAI generation routes return 404 for all five keys. Per-request LoRA is not served.
