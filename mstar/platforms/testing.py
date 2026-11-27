@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import functools
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from unittest import mock
 
 import torch
 
@@ -39,14 +37,9 @@ class FakePlatform(Platform):
 
 @contextmanager
 def use_platform(platform: Platform) -> Iterator[Platform]:
-    """Make ``platform`` the current one: registered under its name, named by
-    ``MSTAR_PLATFORM``, and the resolve and capability caches cleared. All of it is undone on
-    exit, and an entry it displaced comes back.
-
-    ``mstar.platforms.resolve_platform`` is patched to return it, so code that reads it
-    through the module (``current_platform`` among them) sees it; a module that imported the
-    function by name keeps the original.
-    """
+    """Make ``platform`` the current one as a plugin named by ``MSTAR_PLATFORM`` becomes it:
+    registered under its name, named by the variable, and the resolve and capability caches
+    cleared. All of it is undone on exit, and an entry it displaced comes back."""
     displaced = next((e for e in registered_platforms() if e.name == platform.name), None)
     register_platform(PlatformEntry(
         platform.name, lambda: platform, getattr(platform, "device_type", "cpu"),
@@ -54,10 +47,10 @@ def use_platform(platform: Platform) -> Iterator[Platform]:
     ), replace=True)
     env = os.environ.get(ENV_VAR)
     os.environ[ENV_VAR] = platform.name
+    platforms.resolve_platform.cache_clear()
     clear_capabilities_cache()
     try:
-        with mock.patch.object(platforms, "resolve_platform", functools.cache(lambda: platform)):
-            yield platform
+        yield platform
     finally:
         if env is None:
             os.environ.pop(ENV_VAR, None)
@@ -68,4 +61,5 @@ def use_platform(platform: Platform) -> Iterator[Platform]:
         else:
             # in place, so detection order is unchanged
             register_platform(displaced, replace=True)
+        platforms.resolve_platform.cache_clear()
         clear_capabilities_cache()

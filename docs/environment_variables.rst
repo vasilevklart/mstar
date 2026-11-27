@@ -905,3 +905,23 @@ Compilation
        when that falls back to torch's). An exported value wins. Holds Triton's compiled
        kernels, Inductor's and those compiled outside it; without it, where a kernel
        lands depends on whether Inductor compiled first.
+
+Hardware platform
+-----------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_PLATFORM``
+     - unset
+     - The platform every process runs on: ``cuda``, ``rocm``, ``xpu``, ``cpu``, or
+       the name of an installed plugin's ``mstar.platforms`` entry point, of which only
+       that one is loaded (read by
+       :func:`mstar.platforms.registry.select_platform`). Unset, the first in-tree
+       accelerator torch can see, then the one installed plugin whose device is
+       available, then ``cpu``. Two available plugins and no setting is an error. Set it
+       the same way on every node.

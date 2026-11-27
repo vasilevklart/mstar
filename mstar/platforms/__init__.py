@@ -39,12 +39,9 @@ __all__ = [
 @functools.cache
 def resolve_platform() -> Platform:
     """The stack whose devices this process can see, decided on first use."""
-    if torch.cuda.is_available():
-        return RocmPlatform() if torch.version.hip is not None else CudaPlatform()
-    xpu = getattr(torch, "xpu", None)
-    if xpu is not None and xpu.is_available():
-        return XpuPlatform()
-    return CpuPlatform()
+    from mstar.platforms.registry import resolve_registered
+
+    return resolve_registered()
 
 
 class _CurrentPlatform:

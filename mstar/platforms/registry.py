@@ -18,6 +18,7 @@ one available plugin; then the CPU.
 
 from __future__ import annotations
 
+import functools
 import importlib.metadata
 import logging
 import os
@@ -81,7 +82,9 @@ def registered_platforms() -> tuple[PlatformEntry, ...]:
     return tuple(_ENTRIES.values())
 
 
+@functools.cache
 def _entry_points() -> tuple[importlib.metadata.EntryPoint, ...]:
+    # read once: listing the installed distributions takes milliseconds
     return tuple(importlib.metadata.entry_points(group=ENTRY_POINT_GROUP))
 
 

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar import platforms
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform, _built_for, registry
 from mstar.platforms.registry import (
     ENTRY_POINT_GROUP,
@@ -32,9 +33,12 @@ def _own_registry(monkeypatch):
     """Each test registers into a copy, and imports its plugins afresh."""
     monkeypatch.setattr(registry, "_ENTRIES", dict(registry._ENTRIES))
     monkeypatch.setattr(registry, "_LOADED", set())
+    monkeypatch.delenv("MSTAR_PLATFORM", raising=False)
     for module in PLUGINS:
         monkeypatch.delitem(sys.modules, module, raising=False)
+    registry._entry_points.cache_clear()
     yield
+    registry._entry_points.cache_clear()
     for module in PLUGINS:
         sys.modules.pop(module, None)
 
@@ -78,6 +82,7 @@ def install(tmp_path, monkeypatch):
         (dist / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {module}\nVersion: 0.1\n")
         (dist / "entry_points.txt").write_text(f"[{ENTRY_POINT_GROUP}]\n{name} = {module}:entry\n")
         monkeypatch.syspath_prepend(str(tmp_path))  # also invalidates the import caches
+        registry._entry_points.cache_clear()
 
     return add
 
@@ -230,3 +235,32 @@ def test_a_name_registers_once_unless_replaced():
 def test_resolve_registered_builds_the_selected_platform(monkeypatch):
     monkeypatch.setenv("MSTAR_PLATFORM", "cpu")
     assert isinstance(resolve_registered(), CpuPlatform)
+
+
+# --- resolve_platform asks the registry ----------------------------------------------------------
+
+
+def test_current_platform_is_the_one_mstar_platform_names(build, monkeypatch):
+    build(cuda=True)
+    monkeypatch.setenv("MSTAR_PLATFORM", "cpu")
+    platforms.resolve_platform.cache_clear()
+    assert platforms.current_platform.is_cpu()
+
+
+def test_current_platform_is_an_installed_plugin_on_a_host_without_an_in_tree_one(install):
+    install("dummy")
+    platforms.resolve_platform.cache_clear()
+    assert platforms.current_platform.name == "dummy"
+    assert type(platforms.resolve_platform()).__module__ == PLUGINS[0]
+
+
+def test_the_installed_plugins_are_listed_once(install, monkeypatch):
+    install("dummy", available=False)
+    listings = []
+    real = registry.importlib.metadata.entry_points
+    monkeypatch.setattr(registry.importlib.metadata, "entry_points",
+                        lambda **kwargs: listings.append(kwargs) or real(**kwargs))
+    for _ in range(3):
+        platforms.resolve_platform.cache_clear()
+        assert platforms.current_platform.is_cpu()
+    assert len(listings) == 1
