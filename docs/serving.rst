@@ -54,6 +54,11 @@ mstar serve
    * - ``--config``
      - model default
      - Override the resolved default config with a path to your own YAML.
+   * - ``--compile-bundle``
+     - off
+     - Before starting, unpack the compile-cache bundle for this stack from a bundle or a
+       root of bundles (``mstar cache``; *Compile-cache bundles* in the Mintlify docs). With
+       no bundle for this stack it starts cold, with a warning.
    * - ``--cache-dir``
      - HF default
      - HuggingFace weight cache directory.

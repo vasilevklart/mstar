@@ -28,6 +28,7 @@ mi325x-vf/torch-2.12.1+rocm7.2-hip-7.2.53211-triton-3.7.1
 
 - The arch, torch, HIP or CUDA, and Triton versions must match, and on CUDA the product too. Inductor and Triton key their own entries on them (on CUDA, Inductor's graph key holds the GPU's name, so an H100's graphs miss on an H200), so a bundle from another stack would unpack without error and its compiled graphs would never be read. `mstar cache unpack` refuses it (`--force` unpacks it anyway).
 - On ROCm the product doesn't have to match, since Inductor keys graphs on the gfx arch there. Autotuning picks are timings taken on the product that compiled them: an MI300X bundle loads on an MI325X (both gfx942) and starts warm, but its kernels were tuned on the MI300X. The startup line says so. A root is searched only under this host's product, so pass such a bundle's own directory.
+- Inductor's graph key also holds the device index, so tensor-parallel ranks share no entries: a bundle serves the GPU layout it was warmed on, the same TP size and the same mapping of graph nodes to GPUs.
 - Nothing in the key covers the driver, `ptxas` or the M\* version. A newer M\* that changes a captured forward's graph compiles that graph again on first start and keeps the rest.
 
 ## Layout {#layout}
@@ -47,6 +48,12 @@ A bundle root holds one directory per key; each is a bundle:
 Each tar is uncompressed and holds its directory's files as `./<path>`, so it can be read and merged with plain `tar`. `unpack` and `pack` find these directories the way a server started from the same environment does: an exported variable, else M\*'s default for Inductor and Triton (`~/.cache/mstar/torchinductor` and its `triton` subdirectory, see [Compilation](/environment_variables#compilation)), else the library's own (MIOpen's `~/.config/miopen` and `~/.cache/miopen`). `mstar cache dirs` prints them.
 
 Not in a bundle: FlashInfer's JIT builds (`FLASHINFER_WORKSPACE_BASE`), AITER's and FlyDSL's on ROCm (`AITER_JIT_DIR`, `FLYDSL_RUNTIME_CACHE_DIR`), which are keyed by their own package versions rather than by this key, and the weights.
+
+On NVIDIA, FlashInfer decides whether a start from a bundle is warm. Its JIT builds took 126-259 s of each cold start on an H200, and a copied build directory rebuilds at a new path, since its ninja files name outputs by absolute path: Qwen3.5-0.8B with every cache directory copied to a new path still took 306 s to start. Install FlashInfer's prebuilt kernels wherever a bundle is unpacked, with `flashinfer install-jit-cache-wheel --mode minimal` (this machine's GPUs) or `flashinfer download-kernels` (every architecture), which pick the wheels for the installed `flashinfer-python`. With them, Qwen3.5-0.8B started from a bundle in 112 s, against 284 s with empty Inductor and Triton caches, the same as a warm restart.
+
+## Trust {#trust}
+
+A bundle is code. Inductor's entries are pickled graphs and Triton's are compiled kernels (`.so`, `.cubin`, `.hsaco`), and a server loads and runs them. Unpack only bundles you built or got from a source you trust, as you would a container image, and keep a shared bundle root writable only by those who pack into it. `unpack` refuses a member whose path or link leaves its cache directory; that keeps a damaged tar from writing elsewhere, and says nothing about what the files in it do.
 
 ## Building a bundle {#building-a-bundle}
 
