@@ -11,6 +11,9 @@ change:
 - ``openai_stream``: one streaming request, its chunks, usage and failures.
 - ``streams``: the per-request streams a node keeps in flight, polled without
   blocking, cancelled on request removal, retried only before the first output.
+- ``resource``: the node's one resource, which runs those streams through the
+  resource lifecycle (budget, start at the prompt step's commit, readiness
+  from what landed, cancel on removal). No engine builds it yet.
 
 Requires ``aiohttp``. Nothing outside this package imports it.
 """
