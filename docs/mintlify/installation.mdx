@@ -8,7 +8,7 @@ description: "Install M* from source with its Rust runtime, add the extras a mod
 - Linux with an NVIDIA GPU. A CUDA 13 build of torch needs an r580 or newer driver. BAGEL also runs on Intel GPUs from the [XPU image](#docker). [Supported hardware](/hardware) lists what is tested.
 - Python 3.12 or newer, and [uv](https://docs.astral.sh/uv/).
 - For the Rust build, [rustup](https://rustup.rs) and a C/C++ compiler ([Rust](#rust) has the install command).
-- At run time, `nvcc` from a CUDA toolkit with the same major version as torch's CUDA ([Match the CUDA toolkit](#cuda-toolkit)): FlashInfer and the MoE align kernel compile kernels on first use.
+- At run time, `nvcc` from a CUDA toolkit: FlashInfer and the MoE align kernel compile kernels on first use. The builds that go through `torch.utils.cpp_extension` (the MoE align kernel, flash-attn from source) also need its major version to match torch's CUDA ([Match the CUDA toolkit](#cuda-toolkit)).
 - PyTorch `>=2.10,<2.13`, which the install pulls in. CI and the CUDA Docker image use 2.10.0.
 - The GPUs the model's default config uses; [Supported models](/models#matrix) gives the count per key.
 
@@ -32,7 +32,7 @@ mstar serve bagel
 - `--torch-backend=auto` makes uv read the NVIDIA driver's CUDA version, not the toolkit's, and install the torch built for it. Pass it on every install, or `export UV_TORCH_BACKEND=auto`. If your uv rejects the flag, update uv. If the driver is newer than your `nvcc`, see [Match the CUDA toolkit](#cuda-toolkit).
 - `".[bagel]"` installs the core runtime, the `mstar` and `mstar-serve` commands and BAGEL's dependencies. For another model, use its extra from the Extra column of [Supported models](/models#matrix).
 - `maturin develop` builds the `mstar_rust` extension (graph runtime, control mesh, SHM tensor arena) into the virtualenv. `cargo build` builds the `mstar-server` HTTP frontend into `rust/server/target/release/`. The server needs both.
-- `mstar serve bagel` downloads about 30 GB of weights into `$HF_HOME` (default `~/.cache/huggingface`), then compiles the model before it listens. Measured on 1x H200, 2026-11-27, with the weights already downloaded: the first start took 8.6 minutes, nearly all of it compilation and FlashInfer kernel builds, and a restart took 68 seconds. [Cold start](/cold-start) explains the wait and how to keep the caches.
+- `mstar serve bagel` downloads about 30 GB of weights into `$HF_HOME` (default `~/.cache/huggingface`), then compiles the model before it listens. Measured on 1x H200, 2026-11-27, with the weights downloaded and in the page cache: the first start took 8.6 minutes, nearly all of it compilation and FlashInfer kernel builds, and a restart took about 70 to 80 seconds. Read cold from a network filesystem, the weights took about 142 seconds to load and the first start 11.1 minutes (664 s). [Cold start](/cold-start) explains the wait and how to keep the caches.
 
 ## Rust extension and mstar-server {#rust}
 
@@ -53,6 +53,12 @@ touch rust/build.rs rust/server/build.rs && cargo build --release --manifest-pat
 ```
 
 `mstar serve` looks for `mstar-server` in this order: `--rust-frontend-bin`, `MSTAR_SERVER_BIN`, the environment's scripts directory, `$PATH`, `rust/server/target/release/mstar-server`. In a checkout it skips a binary built from other `rust/` or `rust/server/` sources and, if none is left, stops at startup with the second command above. A stale binary named by the flag or the variable runs with a warning. `mstar-server --source-hash` prints the source hashes a binary was built from. An installed package has no `rust/` beside it, so neither check runs there.
+
+With `CARGO_TARGET_DIR` set, `cargo build` puts the binary in `$CARGO_TARGET_DIR/release/`, which `mstar serve` does not search. [Verify](#verify) and `mstar serve` then find no binary, or skip an older one in `rust/server/target/release/`, and the rebuild command they print builds into `$CARGO_TARGET_DIR` again. Point the variable at the new binary:
+
+```bash
+export MSTAR_SERVER_BIN="$CARGO_TARGET_DIR/release/mstar-server"
+```
 
 ## Install from PyPI {#install-from-pypi}
 

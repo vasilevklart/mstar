@@ -31,13 +31,14 @@ Launch to the first healthy `/health` with the default config and `-O1`, measure
 | Key | Empty caches | Warm caches |
 |---|---|---|
 | `bagel` | 516 s | 68 s |
+| `bagel`, weights not in the page cache | 664 s | 79 s |
 | `qwen3_5_0.8b` | 504 s | not measured |
 | `qwen3_5_9b` | 544 s | not measured |
 | `phi4mm` | 467 s | not measured |
 
-`bagel` ran on a host with 192 CPU cores. The other three ran at the same time on one 8x H200 node, each limited to 16 CPU cores, so their compiles may have been slower than on an idle host.
+Both `bagel` runs saw 192 CPU cores. In the first the weights were in the page cache. In the second they were read cold from a network filesystem (JuiceFS) on a node where other jobs used other GPUs. The other three ran at the same time on one 8x H200 node, each limited to 16 CPU cores, so their compiles may have been slower than on an idle host.
 
-Loading weights is a small part; compilation takes most of it. Of BAGEL's 516 s, 484 s went to compiling one graph per capture bucket (63 for the LLM) and up to 223 s of that to FlashInfer building four JIT modules; the first request then took 0.15 s. Configs that capture many shapes take longer: `z_image_turbo` spent about 6 minutes on 16 DiT captures at 1024x1024 and was ready after 640 s. The log can go quiet for over two minutes during these builds (156 s at most in BAGEL's start). `-O0` shortens the compile, and a [warm cache](#compile-cache) skips most of it.
+With the weights in the page cache, loading them is a small part (9 s of BAGEL's 516 s); read cold, they took about 142 s of its 664 s. Compilation takes most of the rest. Of BAGEL's 516 s, 484 s went to compiling one graph per capture bucket (63 for the LLM) and up to 223 s of that to FlashInfer building four JIT modules; the first request then took 0.15 s. Configs that capture many shapes take longer: `z_image_turbo` spent about 6 minutes on 16 DiT captures at 1024x1024 and was ready after 640 s. The log can go quiet for over two minutes during these builds (156 s at most in BAGEL's start). `-O0` shortens the compile, and a [warm cache](#compile-cache) skips most of it.
 
 ## Compile levels {#compile-levels}
 
@@ -114,17 +115,18 @@ Nothing prunes the cache. Deleting it is safe and costs the next start's compile
 | `Worker worker_1 (pid N) exited with ...` | Setup failed: fewer GPUs than the config's ranks (`--gpus 0` for a 2-GPU config), or out of memory. | Read the error above it; match `--gpus` to the config. |
 | `mstar-server: could not listen on http://0.0.0.0:8000`, exit code 3 | Port taken; found only after loading. | Another `--port`. |
 | `another mstar deployment already holds ...` | Two servers on one IPC socket prefix. | Another `--port` or `--socket-path-prefix`. |
-| `mstar-server binary not found` or `No mstar-server built from ...` | Frontend binary missing or stale. | Build it ([Installation](/installation#rust)) or run the command the error prints. |
+| `mstar-server binary not found` or `No mstar-server built from ...` | Frontend binary missing or stale. | Build it ([Installation](/installation#rust)) or run the command the error prints. With `CARGO_TARGET_DIR` set, export `MSTAR_SERVER_BIN="$CARGO_TARGET_DIR/release/mstar-server"`. |
 | `The graph runtime needs the mstar_rust extension` | Checkout without the Rust extension. | `uv pip install maturin`, then `maturin develop --release -m rust/Cargo.toml` |
 | `KeyError` or `OSError` from `getpass.getuser()` | Container user with no passwd entry and no `USER`. | `export USER=mstar` before `mstar serve`. |
 | `IncompleteSnapshotError`, or `FileNotFoundError` for a file in the Hugging Face cache | Part of the model's repo is missing from the cache, offline (`HF_HUB_OFFLINE=1`) or on a model such as `voxcpm2` that skips the download once its main weights are cached. | With network access and the server's `HF_HOME`, download the whole repo: `hf download <repo>`. |
 
 ## Log lines that are not failures {#harmless-log-lines}
 
-Starts on H200 printed these on 2026-11-27, and the server still came up:
+Builds and starts on H200 printed these on 2026-11-27, and the server still came up:
 
 | Line | Meaning |
 |----|----|
+| `Warning: Failed to set rpath for .../libmstar_rust.so: Failed to execute 'patchelf'`, from `maturin develop` | maturin sets no rpath on the extension when `patchelf` is not installed; `mstar_rust` still imports. The warning's hint, installing `patchelf`, is optional. |
 | `No valid triton configs. OutOfMemoryError: out of resource: triton_mm Required: 262144 Hardware limit:232448`, at `E` level during a first start's autotuning | Inductor skips a GEMM candidate that needs more shared memory than the GPU has. |
 | `flash_attn is not available; BagelViT will fall back to torch SDPA` | flash-attn is optional for BAGEL ([Manual installs](/installation#manual-installs)). |
 | `Ragged attention backend 'dense' requested, but no varlen kernel is available` | The FA3 kernel did not load, so dense attention uses its fallback. |

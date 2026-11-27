@@ -27,7 +27,7 @@ cargo build --release --manifest-path rust/server/Cargo.toml
 mstar serve bagel
 ```
 
-Leave it running. The first start downloads `ByteDance-Seed/BAGEL-7B-MoT` (about 30 GB, into `$HF_HOME`, default `~/.cache/huggingface`), then compiles the model and builds FlashInfer kernels before it listens on port 8000. On 1x H200 (2026-11-27), with the weights already downloaded, that took 8.6 minutes, and a restart that reused the compile caches took 68 seconds ([Startup time](#startup-time)).
+Leave it running. The first start downloads `ByteDance-Seed/BAGEL-7B-MoT` (about 30 GB, into `$HF_HOME`, default `~/.cache/huggingface`), then compiles the model and builds FlashInfer kernels before it listens on port 8000. On 1x H200 (2026-11-27), with the weights downloaded and in the page cache, that took 8.6 minutes. Read cold from a network filesystem, the weights took about 142 seconds to load and the start 11.1 minutes (664 s). A restart that reused the compile caches took about 70 to 80 seconds ([Startup time](#startup-time)).
 
 ## Check health {#check-health}
 
@@ -71,7 +71,7 @@ curl -s http://localhost:8000/generate \
   python -c "import base64, json, sys; print(b''.join(base64.b64decode(c['data']) for c in json.load(sys.stdin)['outputs']['text']).decode())"
 ```
 
-Without `streaming=false` the reply is an NDJSON stream with one base64 chunk per token ([Clients](/clients#native-generate)).
+Without `streaming=false` the reply is an NDJSON stream with one base64 chunk per token, ending with a chunk whose `data` is empty ([Clients](/clients#native-generate)).
 
 For the OpenAI-compatible routes, install the client:
 
@@ -133,5 +133,5 @@ mstar serve bagel
 ## Startup time {#startup-time}
 
 <Note>
-Before it listens, the server loads the weights, compiles and captures the model, and runs any warmup requests in the config. On a cold cache this is the long part: of BAGEL's 8.6-minute first start above, 8 minutes went to compiling, up to 3.7 of them to FlashInfer JIT builds, and the log went quiet for up to 2.6 minutes at a time; the first request then took 0.15 seconds. Compiled kernels are cached under `~/.cache/mstar` and `~/.cache/flashinfer` and reused on later starts. `mstar serve bagel -O0` skips compile tuning for the fastest start. See [Cold start](/cold-start).
+Before it listens, the server loads the weights, compiles and captures the model, and runs any warmup requests in the config. On a cold cache this is the long part: of BAGEL's 8.6-minute first start above (weights in the page cache), 8 minutes went to compiling, up to 3.7 of them to FlashInfer JIT builds, and the log went quiet for up to 2.6 minutes at a time; the first request then took 0.15 seconds. Compiled kernels are cached under `~/.cache/mstar` and `~/.cache/flashinfer` and reused on later starts. `mstar serve bagel -O0` skips compile tuning for the fastest start. See [Cold start](/cold-start).
 </Note>
