@@ -186,6 +186,14 @@ DIT_KERNEL_SETTINGS = {
 }
 
 
+def vae_shard_spec(label: str) -> SeqShardSpec:
+    """The VAE decoder's sequence shard, which splits each request's ``label`` units (H3's clips, H3-Image's tiles),
+    which nothing exchanges (``exchanges=False``); every request of a decoder batch is one layout, so one count
+    (``axis`` 1). The decoder has no arrays, so its shard is written by hand, not a `SeqShard`, and only here: the
+    MiniMax-H3 family's models share it."""
+    return SeqShardSpec(resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(label,), axis=1, exchanges=False)
+
+
 class H3Model(Model):
     """MiniMax-H3 (33B DiT, guidance-distilled) joint audio-video generation."""
 
@@ -266,13 +274,8 @@ class H3Model(Model):
     def get_node_resources(self) -> list[SeqShardSpec]:
         """The video decoder's sequence shard, which splits each request's clips, which nothing exchanges
         (``exchanges=False``); every request of a decoder batch is one layout, so one clip count (``axis`` 1). The
-        decoder has no arrays, so its shard is written by hand, not a `SeqShard`."""
-        return [
-            SeqShardSpec(
-                resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3VideoDecoderSubmodule.CLIPS,), axis=1,
-                exchanges=False,
-            ),
-        ]
+        decoder has no arrays, so its shard is written by hand, not a `SeqShard` (`vae_shard_spec`)."""
+        return [vae_shard_spec(H3VideoDecoderSubmodule.CLIPS)]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def text_node(*inputs: str) -> GraphNode:

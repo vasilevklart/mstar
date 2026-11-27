@@ -28,6 +28,7 @@ import pytest
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
+    "mstar/model/minimax_h3_image",
     "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
     "mstar/model/higgs_audio", "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
@@ -69,8 +70,8 @@ ALLOWED = {
     ("mstar.engine.resources.kv.config", "DEFAULT_PAGE_SIZE"):
         "the page size a model's default pool sizes count in, until the pool sizes itself",
     ("mstar.engine.resources", "SeqShardSpec"): (
-        "MiniMax-H3's video decoder's sequence shard, written by hand: a contract SeqShard brackets a label an array "
-        "opens, and the decoder has no arrays"
+        "the MiniMax-H3 family's VAE decoder's sequence shard (`vae_shard_spec`, H3's and H3-Image's), written by "
+        "hand: a contract SeqShard brackets a label an array opens, and the decoder has no arrays"
     ),
 }
 _LORA = (
@@ -103,6 +104,12 @@ ALLOWED_IN_FUNCTION = {
     ("mstar/model/minimax_h3/submodules.py", "H3VideoDecoderSubmodule.declare_step", "sequence_shard"):
         "the video decoder's hand-written sequence shard, which a contract SeqShard can't declare (no arrays)",
     ("mstar/model/minimax_h3/submodules.py", "H3VideoDecoderSubmodule.run_batch", "sequence_shard"):
+        "the same hand-written shard",
+    ("mstar/model/minimax_h3_image/minimax_h3_image_model.py", "H3ImageModel.get_node_resources", "def"):
+        "the image decoder's sequence shard over its tiles, MiniMax-H3's hand-written one (`vae_shard_spec`)",
+    ("mstar/model/minimax_h3_image/submodules.py", "H3ImageDecoderSubmodule.declare_step", "sequence_shard"):
+        "the image decoder's hand-written sequence shard, which a contract SeqShard can't declare (no arrays)",
+    ("mstar/model/minimax_h3_image/submodules.py", "H3ImageDecoderSubmodule.run_batch", "sequence_shard"):
         "the same hand-written shard",
     ("mstar/model/qwen3_omni/components/code2wav.py", "Qwen3OmniMoeCode2WavTransformerModel.forward", "disable"):
         "the vocoder's transformer, which keeps no state",
@@ -422,6 +429,8 @@ def test_an_allowed_import_stands_only_in_the_file_that_needs_it():
     source = "from mstar.engine.resources import SeqShardSpec"
     assert _violations(source, "mstar/model/minimax_h3/minimax_h3_model.py")[0] == []
     assert len(_violations(source, "mstar/model/wan22/wan22_model.py")[0]) == 1
+    # H3-Image takes H3's shard (`vae_shard_spec`), not the import
+    assert len(_violations(source, "mstar/model/minimax_h3_image/minimax_h3_image_model.py")[0]) == 1
 
 
 def test_the_lint_passes_the_contract_itself():
@@ -434,14 +443,17 @@ def test_the_lint_lets_a_ported_file_declare_lora_roots():
     assert _violations(source) == ([], {(modules, "PER_SEGMENT"), (modules, "LoraRoot")})
 
 
-def test_minimax_h3s_entry_covers_only_its_own_get_node_resources():
-    path = "mstar/model/minimax_h3/minimax_h3_model.py"
+@pytest.mark.parametrize("path, model", [
+    ("mstar/model/minimax_h3/minimax_h3_model.py", "H3Model"),
+    ("mstar/model/minimax_h3_image/minimax_h3_image_model.py", "H3ImageModel"),
+], ids=["minimax_h3", "minimax_h3_image"])
+def test_minimax_h3s_entry_covers_only_its_own_get_node_resources(path, model):
     source = (
-        "class H3Model:\n    def get_node_resources(self): return []\n"
+        f"class {model}:\n    def get_node_resources(self): return []\n"
         "class H3Other:\n    def get_node_resources(self): return []\n"
     )
     found, used = _violations(source, path)
-    assert used == {(path, "H3Model.get_node_resources", "def")}
+    assert used == {(path, f"{model}.get_node_resources", "def")}
     expected = ["def get_node_resources at line 4, which writes resource specs by hand"]
     assert found == expected, "the entry covers another class's get_node_resources"
 

@@ -22,7 +22,6 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import SeqShardSpec
 from mstar.engine.state import Array, SeqShard
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -36,7 +35,6 @@ from mstar.model.minimax_h3.config import (
     TEXT_ENCODER_NODE,
     VAE_DECODER_NODE,
     VAE_ENCODER_NODE,
-    VAE_SHARD,
 )
 from mstar.model.minimax_h3.keyframes import presentation, vision_spans
 from mstar.model.minimax_h3.minimax_h3_model import (
@@ -45,6 +43,7 @@ from mstar.model.minimax_h3.minimax_h3_model import (
     _positive_int,
     dit_state,
     import_image_processor,
+    vae_shard_spec,
 )
 from mstar.model.minimax_h3.submodules import (
     COND_LATENTS,
@@ -167,16 +166,11 @@ class H3ImageModel(Model):
     def kernel_settings(self) -> dict[str, dict[str, object]]:
         return {key: dict(settings) for key, settings in DIT_KERNEL_SETTINGS.items()}
 
-    def get_node_resources(self) -> list[SeqShardSpec]:
-        """The decoder's sequence shard, which splits each request's tiles, which nothing
-        exchanges (``exchanges=False``); a decoder batch is one layout, so one tile count
-        (``axis`` 1)."""
-        return [
-            SeqShardSpec(
-                resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3ImageDecoderSubmodule.TILES,), axis=1,
-                exchanges=False,
-            ),
-        ]
+    def get_node_resources(self) -> list:
+        """The decoder's sequence shard, which splits each request's tiles: MiniMax-H3's
+        (``vae_shard_spec``), written by hand as its video decoder's is, since the decoder has no
+        arrays for a contract ``SeqShard`` to bracket."""
+        return [vae_shard_spec(H3ImageDecoderSubmodule.TILES)]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def text_node(*inputs: str) -> GraphNode:

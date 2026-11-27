@@ -2509,7 +2509,9 @@ Text-to-image and reference-image editing on **MiniMax-H3-Image**
 33B packed-sequence DiT without its audio stream, distilled twice over (guidance baked in,
 and a fixed six-step grid with one output head per step), the same Qwen3-VL-32B conditioner
 as ``minimax_h3`` (byte-identical shards), and an image VAE (H3's video encoder on one frame,
-a 2D ViT decoder). The model shares ``minimax_h3``'s DiT, conditioner node and loaders.
+a 2D ViT decoder). The model shares ``minimax_h3``'s DiT, conditioner node and loaders,
+and its state declared on the state contract (``dit_state``); the decoder's sequence shard
+over its tiles is H3's, written by hand as its video decoder's is.
 Not ported: the H3-Image-Context-IR prompt rewriter.
 
 Nodes: ``text_encoder`` (``minimax_h3``'s: Qwen3-VL to layer 50, the references through its
