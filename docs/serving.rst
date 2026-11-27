@@ -41,7 +41,9 @@ mstar serve
        and ``/metrics`` (see :ref:`api-key`).
    * - ``--gpus``
      - all visible
-     - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
+     - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``), and on ROCm
+       ``HIP_VISIBLE_DEVICES`` too, which HIP reads first. Without ``--gpus`` on
+       ROCm, a server whose two variables name different GPUs won't start.
    * - ``-O``, ``--compile-level``
      - ``MSTAR_COMPILE_LEVEL``, else ``1``
      - How much the captured forwards' compiles tune at startup. ``-O0``: torch.compile's
