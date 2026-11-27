@@ -548,8 +548,12 @@ def test_oom_still_reports_allocation_failed():
     """The offload refusal must not have swallowed the real OOM signal."""
     mgr = _make_manager(max_num_pages=4)
     mgr.ingest_request("r0")
+    mgr.ingest_request("r1")
+    # r1 holds two of the pool's three pages, so r0's two fit the pool but not
+    # what is free; a request bigger than the pool is refused for good instead
+    assert _grow(mgr, "r1", "main", 2 * PAGE_SIZE).ok
 
-    outcome = _grow(mgr, "r0", "main", 8 * PAGE_SIZE)
+    outcome = _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
     assert not outcome.ok
     assert isinstance(outcome.reason, AllocationFailed)
     assert outcome.reason.pages_short > 0
