@@ -27,13 +27,27 @@ VAE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 VAE_MAX_DECODE_BATCH = 8
 
 
-def compile_vae_decode(vae: nn.Module):
+def vae_compile_mode_at_level() -> str | None:
+    """The VAE decode's compile mode at the server's compile level (``mstar serve -O``):
+    ``VAE_COMPILE_MODE`` at ``-O2``, torch.compile's defaults (None) below it.
+
+    FLUX.2 klein 4B on one H200, 1024^2, empty compile caches: the four warmed batch sizes
+    took 239.5 s under max-autotune and 33.1 s at the defaults (ready 342.5 -> 134.1 s), and
+    images per minute stayed level (c=1 194 -> 196, c=8 216 -> 215). Most of max-autotune's
+    cost is coordinate-descent tuning at each kernel's first launch, then the conv and GEMM
+    template search."""
+    from mstar.engine.accelerator_graph_runner import compile_level
+
+    return VAE_COMPILE_MODE if compile_level() >= 2 else None
+
+
+def compile_vae_decode(vae: nn.Module, mode: str | None = VAE_COMPILE_MODE):
     """
-    ``vae.decode`` compiled per static shape with inductor autotuning (no cudagraphs: the
-    engine's runner owns capture). Static, not symbolic: a symbolic batch dimension decoded
-    batch 8 in 346 ms against 223 ms for the per-size graph. A fresh max-autotune compile costs
-    tens of seconds, so the decoder warms every batch size it will ever call at load and splits
-    larger batches into those sizes (see ``decode_in_chunks``).
+    ``vae.decode`` compiled per static shape in ``mode``, None for torch.compile's defaults
+    (no cudagraphs: the engine's runner owns capture). Static, not symbolic: a symbolic batch
+    dimension decoded batch 8 in 346 ms against 223 ms for the per-size graph. A fresh
+    max-autotune compile costs tens of seconds, so the decoder warms every batch size it will
+    ever call at load and splits larger batches into those sizes (see ``decode_in_chunks``).
 
     Numerics: not bit-exact with the eager decode. Inductor's own reductions, the nearest-x2
     upsamples folded into their convs (``UpStage.fold_upsample``) and the split-reduction
@@ -47,8 +61,9 @@ def compile_vae_decode(vae: nn.Module):
     for module in vae.modules():
         if callable(getattr(module, "fold_upsample", None)):
             module.fold_upsample()
+    mode_kwargs = {} if mode is None else {"mode": mode}
     return with_inductor_rounding(
-        torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE),
+        torch.compile(vae.decode, fullgraph=False, dynamic=False, **mode_kwargs),
         eager_rounding=True,
     )
 
@@ -78,15 +93,16 @@ class WarmedDecode:
     before the first request. Only a warmed shape runs compiled: any other decodes
     eager, since a fresh max-autotune compile inside a request cost 40-100 s
     (measured on 1024x768 / 512^2 edits). Eager, any batch decodes in one call.
+    ``compile_mode`` is ``compile_vae_decode``'s ``mode``.
     """
 
     def __init__(
         self, vae: nn.Module, compile_decode: bool, decode_batch_sizes: Sequence[int],
-        warm_shapes: Iterable[tuple[int, int, int]], device,
+        warm_shapes: Iterable[tuple[int, int, int]], device, compile_mode: str | None = VAE_COMPILE_MODE,
     ):
         self.vae = vae
         self._compiled = bool(compile_decode)
-        self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
+        self._decode_one = compile_vae_decode(vae, compile_mode) if compile_decode else vae.decode
         self._batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
         self._warmed: set[tuple[int, int, int]] = set()  # (batch, H, W) decoded compiled at load
         # Before the warm-up, not after: the loader leaves requires_grad=True and

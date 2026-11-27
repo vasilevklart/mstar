@@ -21,7 +21,8 @@ model_kwargs:
   # max_batch_size, then max_batch_size)
   capture_batch_sizes: [1, 2, 3, 4]
   max_batch_size: 4
-  # compiled VAE decode (max-autotune), not bit-exact with the eager decode: before the folded upsample and split
+  # compiled VAE decode (max-autotune at -O2, torch.compile's defaults below it), not bit-exact with the eager
+  # decode: before the folded upsample and split
   # GroupNorm it was 3x faster at 1024^2 and ~56 dB from eager, and the autotuner may pick other conv kernels in another
   # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true

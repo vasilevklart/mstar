@@ -214,7 +214,7 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
             self.eager.append(tuple(x.shape))
             return x
 
-    def fake_compile(vae):
+    def fake_compile(vae, mode):
         def compiled(x):
             vae.compiled.append(tuple(x.shape))
             return x
@@ -233,6 +233,28 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
     node._vae_decode(torch.zeros(1, c, h * p // 2, w * p))  # unwarmed grid: eager
     assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2, 1]
+
+
+@pytest.mark.parametrize("level", ["0", "1", "2"])
+def test_vae_decoder_keeps_max_autotune_at_every_compile_level(monkeypatch, level):
+    """FLUX.2 klein's decode autotunes at -O2 only; Z-Image's keeps max-autotune until its cold
+    start and images/min are measured at the defaults."""
+    from mstar.engine import accelerator_graph_runner as runner
+    from mstar.model.components.diffusion.decode_utils import VAE_COMPILE_MODE
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.submodules import ZImageVaeDecoderSubmodule
+
+    seen = []
+    monkeypatch.setenv("MSTAR_COMPILE_LEVEL", level)
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: seen.append(kw) or fn)
+    vae = torch.nn.Linear(1, 1)
+    vae.decode = lambda x: x
+    runner.compile_level.cache_clear()
+    try:
+        ZImageVaeDecoderSubmodule(vae, ZImageConfig(), compile_decode=True)
+    finally:
+        runner.compile_level.cache_clear()
+    assert seen == [{"fullgraph": False, "dynamic": False, "mode": VAE_COMPILE_MODE}]
 
 
 def test_blank_prompts_are_rejected():
