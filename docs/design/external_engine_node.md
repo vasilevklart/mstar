@@ -4,7 +4,7 @@ orphan: true
 
 # External-engine nodes (design note, partly implemented)
 
-Status: proposed. The client half is in `mstar/integrations/external/` (the `external:` config block and the per-request streams, with tests against a fake endpoint). Nothing in the worker, the engine or the graph runtime uses it yet; the last section lists what does.
+Status: proposed. The client half and the node's resource are in `mstar/integrations/external/` (the `external:` config block, the per-request streams, and `ExternalStream`, which runs them through the resource lifecycle), with tests against a fake endpoint. Nothing in the worker, the engine or the graph runtime builds them yet; the last section lists what does.
 
 ## The problem
 
@@ -46,15 +46,17 @@ The model's graph walks, `process_prompt`, tokenizer and output handling don't c
 
 Invariant 3 rules out I/O in a forward, and invariant 1 says a schedulable condition must be backpressure, not an exception. The resource lifecycle already has a hook for "data for this row is arriving from elsewhere": `Resource.admit_retrieve` is how a decode node waits for a KV transfer from a prefill worker, and the micro-scheduler asks it on every scan of a graph-ready row (`MicroScheduler._scan_ready` → `Admission.check_ready` → `Engine.check_ready` → `StepRunner.admit_retrieve`). The remote stream is the same thing with a longer tail. Each request lifecycle call maps onto one call in `mstar/integrations/external/streams.py`:
 
-| Resource hook (`mstar/engine/resources/base.py`) | External stream |
+| Resource hook (`mstar/engine/resources/base.py`) | `ExternalStream` (`resource.py`) |
 | --- | --- |
-| `ask` / `reserve` | `has_room()`: past `max_in_flight` the request queues, as it would for KV pages |
-| the prefill step's `commit` | `start(rid, prompt_ids, settings)` |
-| `admit_retrieve` | `poll(rid)`: not ready until tokens land; a terminal outcome when the stream failed |
-| `plan` | hand the landed tokens to the step |
+| `ask` / `reserve` / `grew_since` | the `max_in_flight` budget: past it the request queues, as it would for KV pages, and starts when one ahead of it is removed |
+| `commit` of a step that carries the prompt (`ExternalStep.prompts`) | `start(rid, prompt_ids, settings)` |
+| `admit_retrieve` | `poll(rid)`: not ready until a token can be emitted; a terminal outcome when the stream failed |
+| `plan` | the token each row emits and whether it is the row's last (`ExternalPlan`) |
 | `remove_request` | `cancel(rid)` |
 
-The requests run on an event loop of their own thread, so the worker's loop never waits on the network.
+The requests run on an event loop of their own thread, so the worker's loop never waits on the network. That thread calls back (`ExternalStreams.on_change`, `ExternalStream.bind_wake`) when output lands or a request ends.
+
+A token is emitted only once the token after it has landed or the stream has ended. Endpoints send the finish reason in an event of their own after the last token, so this is what lets the step that emits the last token know it is the last, and the stop check end the loop there instead of on a step with nothing to emit. It costs one event of latency per token.
 
 ### What it streams
 
@@ -73,7 +75,7 @@ In `openai_completions` mode the node needs token ids back, not text. The client
 - Before the first token, a 429, a 5xx or a dropped connection is retried, honouring `Retry-After`, up to `retries` times. While it waits the row is just not ready. A 4xx other than 408, 409 and 429 fails at once.
 - After the first token nothing is retried. The stream can't be resumed, and its prefix has already reached the client. An error event in the stream, a stream that ends without a finish reason, or a timeout between events (`read_timeout_s`) fails the request.
 
-A failure reaches the client through the existing path. `admit_retrieve` returns a terminal outcome, and `Admission.check_ready` fails the request with the resource's message, which the worker sends to the conductor as `FAIL_REQUESTS`. The node's state lives on the endpoint, where M\* can neither copy nor recompute it. So M\* can rebuild the request from its token ids only before the first output, and the node declares no rebuild policy.
+A failure reaches the client through the existing path. `admit_retrieve` returns a terminal outcome, and `Admission.check_ready` fails the request with the resource's message, which the worker sends to the conductor as `FAIL_REQUESTS`. A failure wins over tokens that landed before it and are still waiting to be emitted: emitting them would end the loop on the last one as if the endpoint had finished, and the client would get a short answer with no error. The node's state lives on the endpoint, where M\* can neither copy nor recompute it. So M\* can rebuild the request from its token ids only before the first output, and the node declares no rebuild policy.
 
 **Usage.** The prompt tokens are M\*'s own count, since M\* tokenized the prompt, and the completion tokens are the tokens the node emitted. The client sees the same usage it would from a local node. The endpoint's own usage (`stream_options.include_usage`) is kept as a per-request metric. Its cached prompt tokens (`prompt_tokens_details.cached_tokens`) are the endpoint's prefix-cache hits, which no local resource sees. A completion count that disagrees with M\*'s means the tokenizers drifted, and is logged.
 
@@ -93,15 +95,15 @@ An external node sends its prompts to a third party. That is decided per node in
 
 ## What is left
 
-Built: `config.py` (the block and its refusals), `openai_stream.py` (one streaming request, its chunks, usage and failures) and `streams.py` (per-request streams, polling, cancel, retry before the first output, the in-flight budget), with tests in `test/modular/test_external_config.py` and `test/modular/test_external_streams.py`.
+Built: `config.py` (the block and its refusals), `openai_stream.py` (one streaming request, its chunks, usage and failures), `streams.py` (per-request streams, polling, cancel, retry before the first output, the in-flight budget, a callback when output lands) and `resource.py` (`ExternalStream`, the table above), with tests in `test/modular/test_external_config.py`, `test_external_streams.py` and `test_external_resource.py`. The resource's tests drive the real `StepRunner` against a fake endpoint on loopback: one token per step with the last flagged, the endpoint's usage, a mid-stream error as a terminal outcome with the endpoint's message, removal closing the connection (also while the endpoint is silent), and the budget.
 
 Still to build, in order:
 
-1. **A GPU-less rank.** `deployment_workers` gives every rank the accelerator's device type (`mstar/conductor/workers.py`). Letting `rank_devices` say `cpu` for a rank means a worker on a GPU host can claim no GPU.
-2. **The `ExternalStream` resource**, from `streams.py`, through the real `StepRunner` lifecycle, with modular tests in the style of `test_resource_runner.py`.
-3. **The swap.** Where the engine builds a node's submodule and resources, build `ExternalSubmodule` and the resource for a node the config names `external`, and add the startup refusal for hidden-state edges. The submodule sets `enable_async_scheduling=False`: there is nothing to speculate.
-4. **Waking the worker.** The worker's loop sleeps on its `EventWakeup` when nothing is ready. The streams thread has to signal it when tokens land, the way tensor reads already register their futures with it.
-5. **A CPU end-to-end test**: a deployment whose LLM node is external, against the fake endpoint, through the conductor and the data worker.
+1. **Where the prompt reaches the resource.** The local LLM's prefill step emits the first token (`media_walks` sends `new_token` from it to the client). The external node's prompt step starts the stream when it commits, so it has no token yet. Either the node's prefill step emits nothing and the first token comes from the first decode step, which needs a step that sends nothing on the walk's `new_token` edge (or a span of zero tokens, `spanned_outputs`), or the prompt ids reach the resource before the prefill step, so that step waits for the first token like any decode step. Today a resource sees no input tensors before its step, and `CurrentForwardPassInfo` carries no prompt ids. This is the open design question, and it decides the shape of the next item.
+2. **The swap.** Where `EngineManager.build` calls `Model.get_submodule` and `serving_resources` builds the model's declared state, build `ExternalSubmodule` and an `ExternalStreamSpec` for a node `external_endpoints` names, and add the startup refusal for hidden-state edges. The submodule declares an `ExternalStep` (prompt ids and `SamplingSettings` from the request on the prompt step), its forward copies `ExternalPlan.token_ids` to the walk's output, its stop check reads `ExternalPlan.last`, and it sets `enable_async_scheduling=False`: there is nothing to speculate. Settings the endpoint can't honour are refused at ingest (`openai_stream.unsupported`).
+3. **Waking the worker.** Bind `ExternalStream.bind_wake` to the worker's `EventWakeup.signal`, through `EngineResourceInfo` or after `load_model`.
+4. **A GPU-less rank.** `deployment_workers` gives every rank the accelerator's device type (`mstar/conductor/workers.py`). Letting `rank_devices` say `cpu` for a rank means a worker on a GPU host can claim no GPU. A CPU-only deployment doesn't need it.
+5. **A CPU end-to-end test**: a deployment whose LLM node is external, against the fake endpoint, through the conductor, the worker and the data worker, text out on the OpenAI chat route: streaming, a mid-stream error as a clean error, a client abort reaching the endpoint, and usage. It needs a tokenizer available offline, and a Linux host: the worker's `EventWakeup` is an `os.eventfd`, which macOS doesn't have.
 6. **A live A/B** of the same model served locally and from an endpoint, with token-level agreement at temperature 0 from logprobs, TTFT and tokens per second from `benchmark.runner`.
 
 Later: rate limits as admission (requests and tokens per minute beside `max_in_flight`), a local and an external replica of one node with overflow routing in `mstar/conductor/routing.py`, and adapters for endpoints that serve speech models.
