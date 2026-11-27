@@ -108,6 +108,20 @@ def test_cors_preflight_needs_no_key_and_a_401_keeps_cors_headers(keyed):
     assert denied.status_code == 401 and "access-control-allow-origin" in denied.headers
 
 
+def test_cors_allows_any_origin_but_never_credentials(keyed):
+    """As mstar-server answers, so a page on another site can't send a cookie an ingress in front trusts."""
+    pre = keyed.options("/v1/chat/completions", headers={
+        "Origin": "https://elsewhere.example", "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "authorization,content-type",
+    })
+    assert pre.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-credentials" not in pre.headers
+    assert "authorization" in pre.headers["access-control-allow-headers"], "a page can no longer send the key"
+    denied = keyed.get("/v1/models", headers={"Origin": "https://elsewhere.example", "Cookie": "session=1"})
+    assert denied.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-credentials" not in denied.headers
+
+
 def test_an_oversized_body_without_the_key_is_a_401_and_with_it_a_413(keyed, monkeypatch):
     monkeypatch.setenv("MSTAR_MAX_BODY_MB", "1")
     client = TestClient(entrypoint.app.build_middleware_stack())

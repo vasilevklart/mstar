@@ -2252,10 +2252,13 @@ async def request_validation_error(request: Request, exc: RequestValidationError
             }},
         )
     return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
+# As mstar-server answers: `*`, and no credentials. With credentials allowed,
+# Starlette reflects any origin with Allow-Credentials, so a page on any site
+# could send a cookie an ingress in front authenticates with and read the reply.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
