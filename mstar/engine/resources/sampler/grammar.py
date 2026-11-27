@@ -17,8 +17,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from concurrent.futures import Future
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -41,6 +43,10 @@ GRAMMAR_AFTER_KWARG = "structured_outputs_after"
 GRAMMAR_KINDS = ("json", "json_object", "regex", "choice", "grammar")
 # a grammar compiles while its request waits for admission, so its size is bounded
 MAX_GRAMMAR_CHARS = 1 << 17
+# and so is a JSON schema's nesting: xgrammar (0.2.9) builds a schema in time cubic in its depth, on the
+# conductor's loop (`grammar_request`) and again in each rank's compile; 500 levels of nested arrays took
+# 3 s on an M3 Max, and 64 levels of JSON (63 nested arrays, or 32 nested objects) take 7 ms at most
+MAX_JSON_DEPTH = 64
 # xgrammar's batch fill starts every one of its threads on each call, however few the rows (about
 # 25 us of the caller's time per thread on the dev machine). A fill takes a thread per this many
 # rows, up to 8, and batches only from two threads (16 rows), filling row by row below that. The
@@ -112,6 +118,16 @@ def _regex_escape(text: str) -> str:
     return "".join("\\" + c if c in r"\^$.|?*+()[]{}/" else c for c in text)
 
 
+_BRACKET_STEP = {"[": 1, "{": 1, "]": -1, "}": -1}
+
+
+def _json_depth(text: str) -> int:
+    """How deeply ``text``'s arrays and objects nest, outside its strings: a linear scan (7 ms at
+    the size cap), which a nesting too deep for a JSON parser doesn't stop."""
+    outside = "".join(text.replace("\\\\", "").replace('\\"', "").split('"')[::2])
+    return max(accumulate(map(_BRACKET_STEP.__getitem__, re.findall(r"[\[\]{}]", outside))), default=0)
+
+
 # xgrammar is an optional dependency (the `grammar` extra), imported only where a grammar is built
 XGRAMMAR_INSTALL = "pip install 'mstar-ai[grammar]'"
 
@@ -149,6 +165,8 @@ def grammar_request(value: Any, after: str | None = None) -> GrammarRequest | No
     size = len(raw) + len(after or "")
     if size > MAX_GRAMMAR_CHARS:
         raise ValueError(f"structured_outputs is {size} characters; at most {MAX_GRAMMAR_CHARS} are served")
+    if kind == "json" and (depth := _json_depth(raw)) > MAX_JSON_DEPTH:
+        raise ValueError(f"structured_outputs json nests {depth} levels deep; at most {MAX_JSON_DEPTH} are served")
     request = GrammarRequest(kind, raw, after)
     try:
         request.grammar()

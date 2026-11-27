@@ -795,7 +795,7 @@ it doesn't close, the constraint starts once the reply holds ``</think>``. Until
 ``content`` holds the reasoning, ``</think>`` and then the reply its grammar holds; send
 ``chat_template_kwargs: {"enable_thinking": false}`` for a ``content`` that is the JSON alone. An
 unsupported schema is a 400, and so is a request on a deployment without ``enable_grammar`` or a
-grammar over 131072 characters, or a ``structured_outputs`` with another key (``after`` included), or one that also sends ``min_tokens`` or
+grammar over 131072 characters or a JSON schema nested more than 64 levels deep, or a ``structured_outputs`` with another key (``after`` included), or one that also sends ``min_tokens`` or
 ``ignore_eos``.
 The grammar compiles in the background, on every rank, while its request waits and the requests
 behind it start. The captured sampler then applies a bitmask on every step but a greedy one

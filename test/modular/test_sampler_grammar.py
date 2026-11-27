@@ -21,7 +21,12 @@ from mstar.engine.accelerator_graph_runner import capture_into_graph  # noqa: E4
 from mstar.engine.resources import StepRunner  # noqa: E402
 from mstar.engine.resources.sampler import grammar, utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
-from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
+from mstar.engine.resources.sampler.grammar import (  # noqa: E402
+    MAX_GRAMMAR_CHARS,
+    MAX_JSON_DEPTH,
+    GrammarRequest,
+    grammar_request,
+)
 from mstar.engine.resources.sampler.resource import GrammarSamplerResource  # noqa: E402
 from mstar.engine.resources.step import ASKS, SlotLease, StepContext  # noqa: E402
 from mstar.engine.state.contract import Sampler, SampleSettings  # noqa: E402
@@ -522,6 +527,23 @@ def test_a_bad_grammar_is_refused(value, error):
         grammar_request(value)
     with pytest.raises(ValueError, match="at most"):
         grammar_request({"regex": "a"}, after="x" * MAX_GRAMMAR_CHARS)
+
+
+def test_a_json_schema_nested_past_the_cap_is_refused_before_it_is_built(monkeypatch):
+    """xgrammar builds a schema in time cubic in its depth, on the conductor's loop; brackets in
+    a string don't count."""
+    def arrays(depth):  # ``depth`` levels of JSON
+        return '{"type":"array","items":' * (depth - 1) + '{"type":"integer"}' + "}" * (depth - 1)
+
+    assert grammar_request({"json": arrays(MAX_JSON_DEPTH)}).kind == "json"
+    assert grammar_request({"json": {"type": "string", "description": '[{\\"' * 100}}).kind == "json"
+    built = []
+    monkeypatch.setattr(GrammarRequest, "grammar", lambda self: built.append(self.kind))
+    over = arrays(MAX_JSON_DEPTH + 1)
+    for value, depth in ((over, MAX_JSON_DEPTH + 1), (json.loads(over), MAX_JSON_DEPTH + 1), (arrays(5000), 5000)):
+        with pytest.raises(ValueError, match=f"nests {depth} levels deep; at most {MAX_JSON_DEPTH}"):
+            grammar_request({"json": value})
+    assert built == []
 
 
 @pytest.mark.parametrize("response_format, want", [
