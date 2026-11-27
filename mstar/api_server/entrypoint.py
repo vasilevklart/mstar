@@ -3096,7 +3096,7 @@ def _ws_max_size(config: dict) -> int:
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
-    # docs/serving.rst); on by default, as uvicorn's. With no log config of its
+    # docs/mintlify/reference/config.mdx); on by default, as uvicorn's. With no log config of its
     # own, uvicorn's records reach the root logger and its writer thread.
     return uvicorn.Config(
         app, host=host, port=port, access_log=False, log_config=None,
@@ -3128,18 +3128,25 @@ def main(argv: list[str] | None = None):
     import yaml
 
     parser = argparse.ArgumentParser(
-        description="mstar — launch API server and conductor from a config file"
+        description="Start an M* server from a deployment config file."
     )
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--config", type=str, required=True, help="Path to the deployment YAML")
+    parser.add_argument(
+        "--host", type=str, default="0.0.0.0",
+        help="Address to bind (default: 0.0.0.0, every interface; an exported MSTAR_SERVER_HOST "
+             "overrides it for mstar-server)",
+    )
+    parser.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
     parser.add_argument(
         "--api-key", type=str, default=None,
         help=f"Require 'Authorization: Bearer <key>' on every route except /health and "
              f"/metrics (default: {API_KEY_ENV}; unset means no check). Prefer the environment "
              f"variable: a flag shows in the process list",
     )
-    parser.add_argument("--mooncake-port", type=int, default=8080)
+    parser.add_argument(
+        "--mooncake-port", type=int, default=8080,
+        help="Accepted and ignored: Mooncake picks its own ports",
+    )
     parser.add_argument(
         "--socket-path-prefix", type=str, default=None,
         help="ZMQ IPC socket path prefix (shared with conductor/workers); "
@@ -3147,25 +3154,28 @@ def main(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--upload-dir", type=str, default="/tmp/mstar_uploads",
-        help="Directory for temporary uploaded files",
+        help="Directory for temporary uploaded files (default: /tmp/mstar_uploads)",
     )
     parser.add_argument(
         "--timeout", type=float, default=600.0,
-        help="Per-request timeout in seconds",
+        help="Per-request timeout in seconds (default: 600)",
     )
     parser.add_argument(
         "--enable-nvtx",
         action="store_true",
-        help="Enable NVTX markers during CUDA execution (disabled on XPU and CPU)",
+        help="Enable NVTX markers during CUDA execution (CUDA only; ignored on other devices)",
     )
     parser.add_argument(
         "--tensor-comm-protocol",
         type=str, default="RDMA",
-        help="Tensor transfer protocol: RDMA, TCP, or SHM (shared memory)"
+        help="Tensor transport between processes: RDMA (the default; needs Mooncake and an RDMA "
+             "network), TCP (needs Mooncake) or SHM (one machine; what mstar serve uses)"
     )
     parser.add_argument(
         "--tcp-transfer-device",
         type=str, default="",
+        help="Network device for the TCP tensor transport, passed to Mooncake "
+             "(default: empty, which leaves the choice to Mooncake)",
     )
     parser.add_argument(
         "--cache-dir", type=str, default=None,
@@ -3174,6 +3184,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level (default: INFO)",
     )
     parser.add_argument(
         "--log-stats",
@@ -3190,8 +3201,7 @@ def main(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--python-frontend", action="store_true",
-        help="Serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
-             "of mstar-server, the default",
+        help="Serve HTTP from the deprecated uvicorn/FastAPI frontend (mstar-server is the default)",
     )
     # the default since mstar-server became it; kept so existing commands run
     parser.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)

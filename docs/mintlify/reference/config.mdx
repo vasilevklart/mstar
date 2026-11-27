@@ -1,0 +1,138 @@
+---
+title: "Config reference"
+description: "Every top-level key of a deployment YAML, with its default and what it does."
+---
+
+A deployment config is the YAML file that `mstar serve <model> --config <path>` and `mstar-serve --config <path>` read. [Config files](/serving#config-files) and [Placement](/serving#placement) show how the keys fit together. Before any worker starts, the conductor checks the whole config and lists every problem it finds.
+
+## Required {#required}
+
+| Key | Meaning |
+|---|---|
+| `model` | Registry key of the model ([Supported models](/models)). |
+| `max_seq_len` | Must be present; startup checks only that it is. A KV cache's length limit is that cache's own `max_seq_len` under `resources`. |
+| `node_groups` | List of placements ([node_groups entries](/reference/config#node-groups)). |
+
+## node_groups entries {#node-groups}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `node_names` | required | Nodes this entry places. The names come from the model's graph walks. |
+| `ranks` | required | Worker ranks that run them. Rank `n` runs on device `n` unless `rank_devices` maps it. |
+| `graph_walks` | every walk | Only these walks of the nodes run on these ranks. |
+| `tp_size` | `1` | Tensor-parallel degree. The model must declare the node TP-enabled. |
+| `sp_size` | `1` | Sequence-parallel degree (Ulysses). |
+| `cfg_size` | `1` | Ranks the node's guidance branches are split over. It must divide the branch count. |
+| `ep_config` | experts TP-sharded | How MoE experts split over the group (table below). |
+| `side_stream` | `false` | Run the node's steps on a second CUDA stream beside the worker's main chain, for the walks its submodule declares in `side_stream_walks`. |
+
+A group's `ranks` form lockstep instances of `cfg_size * sp_size * tp_size` ranks, laid out `[cfg][sp][tp]`. More ranks than one instance make data-parallel replicas.
+
+`ep_config` keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `parallel` | `tp` | `tp` shards every expert over the group; `ep` gives each rank whole experts. |
+| `ep_group` | `tp` | The ranks EP spans. `tp`, the group's TP ranks, is the only value. |
+| `log_expert_load_every` | `0` | Log per-rank expert load every N steps. Needs `parallel: ep`. |
+| `mask_padding` | `false` | Skip graph-capture padding rows in the routed experts. |
+
+## Devices {#devices}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `rank_devices` | rank `n` on device `n` | Mapping of rank to device index, so several ranks share a GPU, for example `{1: 0}`. |
+| `gpu_memory_fraction` | unset | Share of its GPU's memory a worker plans its graph captures within, for workers that share a GPU. It counts PyTorch allocations, not the CUDA context or NCCL buffers. Unset, capture plans against whatever is free. |
+| `mps` | `false` | Run the workers as clients of a CUDA MPS daemon the conductor starts. NVIDIA only; needs `nvidia-cuda-mps-control` on `PATH`. |
+
+## Model setup {#model-setup}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `model_kwargs` | none | Arguments to the model's constructor, fixed at startup. Each model's page lists the ones it reads. |
+| `autocast_dtype` | the model's | Model-wide dtype that nodes are cast to and run under autocast in, unless a node sets its own: a torch dtype name such as `bfloat16` or `float16`, or `null`. A model that runs without autocast refuses any value but `null`. |
+| `resources` | the model's | Overrides per declared resource, keyed by the model's resource names ([Resource overrides](/serving#resources)). An unknown resource or key fails at startup. `resources: lora:` holds [LoRA adapters](/models/lora). |
+| `knobs` | see [knobs](/reference/config#knobs) | Engine knobs by name. |
+
+## Admission and memory {#admission}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_concurrent_requests` | no cap | Requests that run at once. Past it, requests wait in the conductor's queue, and a live call with open client input gets a 503. |
+| `unpausable_outputs` | `[audio]` | Output modalities a pause would break. A request that streams one of them reserves its whole KV footprint and is never preempted once it starts. `[]` gives a faster first chunk under KV pressure, at the cost of a pause when such a request is preempted. |
+| `rebuild_host_mb` | `64`, or `1024` where a node copies media | Pinned host MiB per worker for the prompts that dropped requests are rebuilt from. `0` turns dropping off on that node. |
+| `routing_weights` | `{load: 1.0, prefix: 8.0}` | Weights of the data-parallel replica pick ([Data parallelism](/serving#data-parallelism)). Each from 0 to 1e6; `load: 0` with `prefix` above 0 is refused. |
+
+How the KV pool admits and preempts requests: [KV admission and preemption](/serving#kv-admission).
+
+## Steps and scheduling {#scheduling}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_batch_tokens` | the model's | Per node, one token budget for every budgeted walk, or a mapping of walk to budget. `null` turns a walk's chunking off ([Chunked prefill](/serving#chunked-prefill)). |
+| `min_chunk_tokens` | `128` | Fewest tokens a cut prompt runs in a step, or the whole budget if that is smaller. |
+| `batch_builder` | `fifo` | `fifo` serves prompts in the order they started; `fair_share` splits the budget max-min fair over every waiting prompt. |
+| `can_override_mixed_max_tokens` | none | Per node, `true` lets a walk inside a combined walk take its own budget under the step's. |
+| `speculate_mid_prefill` | `true` | Per node, or per walk: a prompt mid-prefill takes its next chunk in the step speculated during the current one. |
+| `speculation_mixes_walks` | on where the combined walk has a budget | Per node, or per walk: a speculation chain merges ready rows of the other walks of its combined walk. |
+| `scheduling` | `policy: priority` | Which node and walk a worker steps next: `policy` (`priority` or `round_robin`), `max_wait`, and `walk_priorities` entries of `{node, walk, priority, max_wait}`. |
+
+## Startup and captures {#startup}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `warmup_requests` | none | Requests run before the server binds, so no client pays a shape's first-request cost. Fields: `text`, `files` (paths or `hf://<owner>/<repo>/<path>`), `output_modalities`, `model_kwargs`, `repeat`. A failing warmup is logged and skipped. |
+| `prefill_token_buckets` | the model's | Token counts the packed graph captures are taken at (below). |
+
+### prefill_token_buckets {#prefill-token-buckets}
+
+Per node, a mapping from a walk name, or a captured region's label such as BAGEL's `vit_block_loop`, to the token counts its packed captures are taken at, in place of the model's. A step pads to the smallest count that holds it and runs eagerly past the largest, and each count adds captures, graph memory and startup time. A ladder can also map a minimum batch size to a list, as in `{1: [...], 2: [...]}`. From `configs/qwen3_5_9b.yaml`:
+
+```yaml
+prefill_token_buckets:
+  LLM:
+    prefill_text: [32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048]
+    mixed: [32, 64, 128, 256, 512, 1024, 2048]
+```
+
+## Parallel groups {#parallel-groups}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tp_allreduce` | `nccl` | Small-message all-reduce of every TP, SP and CFG group: `nccl`, `symm_oneshot`, `symm_multimem` or `flashinfer`. Falls back to NCCL with a warning where the chosen path cannot be set up. |
+| `tp_allreduce_max_kb` | `512` | Largest message, in KiB, the non-NCCL path takes. |
+| `tp_async_sched` | `true` | Async scheduling for parallel nodes: `true`, `false` or a list of node names. `MSTAR_TP_ASYNC_SCHED` overrides it. |
+| `dist_timeout_s` | PyTorch's default | Timeout in seconds for the NCCL groups during weight load and warmup. Serving then goes back to PyTorch's default. |
+| `sharding_config` | the model's | `shard_dim`: a mapping of an edge or signal name to the dimension it is split along over a TP group, over the model's own. Refused on a group with `sp_size` or `cfg_size` above 1. |
+
+## API server {#api-server}
+
+| Key | Default | Meaning |
+|---|---|---|
+| `preprocess_workers` | from the CPU count, at most 8 | Requests the data worker prepares at once, for a model that declares `PREPROCESS_PARALLEL`. `1` prepares inline. Must be a positive integer. |
+| `preprocess_torch_threads` | the model's, else a quarter of the unpinned CPUs, at most 4 | Torch intra-op threads of the API server process, which preprocesses media. `null` keeps torch's default. |
+| `max_call_input_mb` | `512` | For a model with live client input: MiB of files, append text and appended audio one call may send over its life. |
+| `client_streams` | the model's | Per client stream, by edge name such as `audio_in`: `max_items`, to set or lower the limit the model declares. |
+| `ws_max_message_mb` | the HTTP body limit, `MSTAR_MAX_BODY_MB` | Largest WebSocket message read, in MiB. A larger one closes the socket with code `1009`. |
+| `ws_per_message_deflate` | `true` | Offer per-message deflate on WebSocket routes. Applies only under `--python-frontend`; `mstar-server` never offers it. |
+| `openpi` | none | For a robot policy (Pi0.5): serve openpi's policy WebSocket at `/`. Keys: `images`, `state`, `action_dims`, `metadata` ([openpi WebSocket](/clients#openpi-websocket)). |
+
+## knobs {#knobs}
+
+`knobs:` sets engine knobs by name, for example `knobs: {gc_gen0_threshold: 50000}`. A knob's environment variable overrides it when set, and an unknown name fails at startup. What each one does is in [Environment variables](/environment_variables). Knobs with no values listed take `true`, `false` or an integer.
+
+| Knob | Variable | Values |
+|---|---|---|
+| `device_loopback` | `MSTAR_DEVICE_LOOPBACK` | |
+| `sampler_ingraph_scatter` | `MSTAR_SAMPLER_INGRAPH_SCATTER` | |
+| `sampler_slots` | `MSTAR_SAMPLER_SLOTS` | |
+| `ingraph_decode_rope` | `MSTAR_INGRAPH_DECODE_ROPE` | |
+| `kv_chain_lazy_steps` | `MSTAR_KV_CHAIN_LAZY_STEPS` | |
+| `kv_pinned_indptrs` | `MSTAR_KV_PINNED_INDPTRS` | |
+| `gc_gen0_threshold` | `MSTAR_GC_GEN0_THRESHOLD` | |
+| `pre_plan` | `MSTAR_PRE_PLAN_SPEC` | |
+| `compile_deterministic` | `MSTAR_COMPILE_DETERMINISTIC` | Reaches Qwen3.5's text walks only. |
+| `step_threads` | `MSTAR_STEP_THREADS` | `threaded` (default) or `serial` |
+| `step_thread_core` | `MSTAR_STEP_THREAD_CORE` | `auto` (default), `always`, `siblings`, `off` or a CPU number |
+| `idle_hold` | `MSTAR_IDLE_HOLD` | `off` (default) or `qos` |
+| `resident_planning` | `MSTAR_RESIDENT_PLANNING` | `auto` (default) or `off` |

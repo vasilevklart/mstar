@@ -1,14 +1,14 @@
-"""The ``mstar`` command — a one-command quickstart wrapper.
+"""The ``mstar`` command: ``mstar serve <model>`` starts a server from the model's default config.
 
-    mstar serve bagel                 # defaults, port 8000
-    mstar serve qwen3_omni --gpus 0,1,2
+    mstar serve bagel                          # one GPU, port 8000
+    mstar serve qwen3_omni --gpus 0,1          # its default config uses two GPUs
     mstar serve orpheus --port 9000
+    mstar serve qwen3_5_9b --config my.yaml    # your own config; the model name is still required
 
-``serve <model>`` resolves a sensible default config, fills in the
-plumbing that the low-level ``mstar-serve`` requires (socket/upload dirs, a
-single-node-safe tensor protocol, HF cache), and then delegates to the same
-server entry point. Power users can still call ``mstar-serve --config ...``
-directly, or pass ``--config`` here to override the default.
+``serve <model>`` looks up the model's default config and calls the entry
+point of ``mstar-serve`` with it, a per-user socket prefix and upload dir, and
+the SHM tensor transport. ``mstar-serve --config ...`` runs that entry point
+directly.
 """
 
 from __future__ import annotations
@@ -311,35 +311,58 @@ def _serve(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mstar", description="mstar multimodal inference CLI")
+    parser = argparse.ArgumentParser(prog="mstar", description="Serve M* models.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    serve = sub.add_parser("serve", help="launch a server for a model (one command)")
-    serve.add_argument("model", help=f"model name ({', '.join(sorted(DEFAULT_CONFIGS))}) or use --config")
-    serve.add_argument("--host", default="0.0.0.0")
-    serve.add_argument("--port", type=int, default=8000)
+    serve = sub.add_parser("serve", help="start a server for a model from its default config")
+    serve.add_argument(
+        "model",
+        help="model key, such as bagel or qwen3_5_9b (an unknown key prints the list); "
+             "required with --config too, where the config's model: decides what is served",
+    )
+    serve.add_argument(
+        "--host", default="0.0.0.0",
+        help="address to bind (default: 0.0.0.0, every interface; an exported MSTAR_SERVER_HOST "
+             "overrides it for mstar-server)",
+    )
+    serve.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
     serve.add_argument(
         "--api-key", default=None,
         help="require 'Authorization: Bearer <key>' on every route except /health "
              "and /metrics (default: MSTAR_API_KEY; unset means no check)",
     )
-    serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    serve.add_argument(
+        "--gpus", default=None,
+        help="GPUs to use: sets CUDA_VISIBLE_DEVICES, e.g. 0 or 0,1 (default: leave it unchanged)",
+    )
     serve.add_argument(
         # unset leaves MSTAR_COMPILE_LEVEL alone, whose own default is 1
         "-O", "--compile-level", dest="compile_level", type=int, default=None, choices=[0, 1, 2],
-        help="how much captured forwards' compiles tune (sets MSTAR_COMPILE_LEVEL): -O0 no tuning, "
-             "fastest start; -O1 (default) coordinate descent; -O2 full max-autotune",
+        help="compile tuning at startup for captured forwards (sets MSTAR_COMPILE_LEVEL): "
+             "-O0 no tuning, fastest start; -O1 (default) coordinate-descent tuning; "
+             "-O2 max-autotune-no-cudagraphs, slowest start",
     )
-    serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
+    serve.add_argument(
+        "--config", default=None,
+        help="path to your own deployment YAML instead of the model's default",
+    )
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
-    serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")
-    serve.add_argument("--upload-dir", default=None, help="temp dir for uploaded media")
+    serve.add_argument(
+        "--socket-path-prefix", default=None,
+        help="ZMQ IPC socket prefix (default: /tmp/mstar_<user>_<port>/)",
+    )
+    serve.add_argument(
+        "--upload-dir", default=None,
+        help="temp dir for uploaded media (default: /tmp/mstar_uploads_<user>/)",
+    )
     serve.add_argument(
         "--tensor-comm-protocol", default="SHM",
-        help="tensor transfer protocol (SHM is the safe single-node default; also TCP/RDMA)",
+        help="tensor transport between processes: SHM (default, one machine), TCP or RDMA "
+             "(both need Mooncake)",
     )
     serve.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="log level (default: INFO)",
     )
     serve.add_argument(
         "--log-stats", action="store_true",
@@ -355,7 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--enable-nvtx", action="store_true",
-        help="emit NVTX markers for CUDA profiling (disabled on XPU and CPU)",
+        help="emit NVTX markers for CUDA profiling (CUDA only; ignored on other devices)",
     )
     serve.add_argument(
         "--timeout", type=float, default=None,
@@ -363,12 +386,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--tcp-transfer-device", default=None,
-        help="network device for TCP tensor transport (default: auto)",
+        help="network device for the TCP tensor transport, passed to Mooncake "
+             "(default: empty, which leaves the choice to Mooncake)",
     )
     serve.add_argument(
         "--python-frontend", action="store_true",
-        help="serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
-             "of mstar-server, the default",
+        help="serve HTTP from the deprecated uvicorn/FastAPI frontend (mstar-server is the default)",
     )
     # the default since mstar-server became it; kept so existing commands run
     serve.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)

@@ -1,0 +1,79 @@
+---
+title: "CLI reference"
+description: "Every flag of mstar serve and mstar-serve, their exit statuses, and the other commands M* installs."
+---
+
+`mstar serve <model>` starts a model from its default config and calls `mstar-serve`, which takes an explicit config. [Serving](/serving) explains when to use which. `--help` on either command prints its flags.
+
+## mstar serve {#serve}
+
+```bash
+mstar serve <model> [options]
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `model` | required | Model key from [Supported models](/models). Required with `--config` too; then the config's `model:` key decides what is served, and the name only picks the example calls printed at startup. |
+| `--host` | `0.0.0.0` | Address to bind. An exported `MSTAR_SERVER_HOST` wins over it on `mstar-server`. |
+| `--port` | `8000` | HTTP port. |
+| `--api-key` | `MSTAR_API_KEY`, else no check | Require `Authorization: Bearer <key>` on every route except `/health` and `/metrics`. An empty value turns the check off ([API key](/serving#api-key)). |
+| `--gpus` | unchanged | Sets `CUDA_VISIBLE_DEVICES`, for example `0` or `0,1`. It sets no other variable. |
+| `-O`, `--compile-level` | `MSTAR_COMPILE_LEVEL`, else `1` | Compile tuning at startup for captured forwards: `0` is `torch.compile`'s default mode, `1` adds coordinate-descent tuning, `2` uses `max-autotune-no-cudagraphs`. A forward whose model sets its own compile mode keeps it. Sets `MSTAR_COMPILE_LEVEL` ([Compile levels](/cold-start#compile-levels)). |
+| `--config` | the model's default | Path to your own deployment YAML. The command exits if the path does not exist. |
+| `--cache-dir` | Hugging Face default | Weight cache directory. |
+| `--socket-path-prefix` | `/tmp/mstar_<user>_<port>/` | ZMQ IPC socket prefix. Two servers on one prefix take over each other's sockets. |
+| `--upload-dir` | `/tmp/mstar_uploads_<user>/` | Temporary directory for uploaded media. |
+| `--tensor-comm-protocol` | `SHM` | `SHM`, `TCP` or `RDMA`, in uppercase. `TCP` and `RDMA` need Mooncake ([Tensor transport](/serving#tensor-transport)). |
+| `--tcp-transfer-device` | empty | Network device for the `TCP` transport, passed to Mooncake's transfer engine. Empty leaves the choice to Mooncake. |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
+| `--log-stats` | off | Print a profile of each request when it finishes ([Request profiling](/serving#request-profiling)). |
+| `--log-stats-file` | none | Append the profiles to this file instead of stdout. Implies `--log-stats`. |
+| `--enable-metrics` | off | Serve Prometheus metrics at `/metrics`. Needs `mstar-ai[metrics]` ([Metrics](/metrics)). |
+| `--enable-nvtx` | off | Emit NVTX markers for CUDA profiling. Ignored on other devices. |
+| `--timeout` | `600` | Per-request timeout in seconds. |
+| `--python-frontend` | off | Serve HTTP from the deprecated uvicorn/FastAPI frontend instead of `mstar-server`. Cannot be combined with `--rust-frontend-bin`. |
+| `--rust-frontend-bin` | lookup | Path to the `mstar-server` binary. Without it the launcher tries `MSTAR_SERVER_BIN`, the environment's scripts directory, `$PATH`, then `rust/server/target/release` ([Frontends](/serving#frontends)). |
+
+`mstar serve` sets `CUDA_VISIBLE_DEVICES` and `MSTAR_COMPILE_LEVEL` from `--gpus` and `-O`, then calls `mstar-serve` with the resolved config, `--host`, `--port`, `--socket-path-prefix`, `--upload-dir`, `--tensor-comm-protocol` and `--log-level`, plus every other flag you set.
+
+It prints example calls for the model before the model loads. The server accepts connections once it is ready; poll `/health` ([Cold start](/cold-start#startup-sequence)).
+
+## mstar-serve {#mstar-serve}
+
+```bash
+mstar-serve --config <yaml> [options]
+```
+
+It takes the flags of `mstar serve` except `model`, `--gpus` and `-O` (set `CUDA_VISIBLE_DEVICES` and `MSTAR_COMPILE_LEVEL` instead), plus `--mooncake-port`. These differ:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--config` | required | Path to the deployment YAML. |
+| `--tensor-comm-protocol` | `RDMA` | `RDMA` needs Mooncake and an RDMA network. On one machine pass `SHM`. |
+| `--upload-dir` | `/tmp/mstar_uploads` | Temporary directory for uploaded media, shared by every user on the host. |
+| `--mooncake-port` | `8080` | Accepted and ignored. Mooncake picks its own ports. |
+
+The other flags have the defaults in the table above.
+
+```bash
+mstar-serve --config configs/kokoro.yaml --tensor-comm-protocol SHM --port 8001
+```
+
+## Exit status {#exit-status}
+
+| Status | Meaning |
+|---|---|
+| `0` | Stopped with Ctrl-C. |
+| `1` | A worker or the conductor died, or startup failed: an unknown model, a missing `--config` path, no usable `mstar-server` binary, `--python-frontend` with `--rust-frontend-bin` on `mstar serve`, or an uncaught error. |
+| `2` | Bad arguments, such as a missing `model`, `--enable-metrics` without `mstar-ai[metrics]`, or `--python-frontend` with `--rust-frontend-bin` on `mstar-serve`. |
+| `3` | `mstar-server` exited with an error, for example because it could not bind the port after the model loaded. Under `--python-frontend`, the uvicorn server never started. |
+
+## Other entry points {#other-entry-points}
+
+| Command | What it does | Notes |
+|---|---|---|
+| `python -m mstar.cli.main serve <model>` | The same as `mstar serve`. | There is no `python -m mstar`. |
+| `mstar-server` | The Rust HTTP frontend that the launcher starts. | Not meant to be run by hand: it takes positional arguments and reads its settings from environment variables the launcher sets. |
+| `python -m mstar.integrations.dynamo --config <yaml> --model-path <dir>` | Serves a deployment as an NVIDIA Dynamo backend worker. | Needs `mstar-ai[dynamo]`. Its `--tensor-comm-protocol` also defaults to `RDMA`. |
+| `python -m mstar.model.audio_watermark detect <files>` | Scores audio files for the AudioSeal watermark. | Needs `mstar-ai[audioseal]`, and `soundfile` (`mstar-ai[audio]`) even for `--help`. |
+| `python -m benchmark.eval <command>` | The evaluation and benchmark runner (`run`, `report`, `compare` and more). | Needs a source checkout, since `benchmark/` is not in the wheel. Install `mstar-ai[eval]` for it. See [Evaluation](/evaluation). |
