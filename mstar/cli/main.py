@@ -447,19 +447,23 @@ def _serve(args: argparse.Namespace) -> None:
 
     from mstar.api_server.auth import resolve_api_key
 
-    if _port_in_use(args.host, args.port):
+    # The address the frontend binds, which the port check, the URLs and the
+    # ready check use: entrypoint.main only sets MSTAR_SERVER_HOST to --host
+    # when it is unset, so an exported one is what mstar-server binds.
+    host = args.host if args.python_frontend else os.environ.get("MSTAR_SERVER_HOST", args.host)
+    if _port_in_use(host, args.port):
         sys.exit(f"error: port {args.port} is already in use, so the server could not listen on it "
                  f"once the model has loaded.\n       Stop the process that holds it "
                  f"(`ss -ltnp | grep :{args.port}` names it) or pass another --port.")
     # The server listens only after the weights load and the model compiles,
     # minutes later on a first start, so "serving" waits for /health.
-    print(_starting(args.model, args.host, args.port), file=sys.stderr)
-    banner = _next_steps(args.model, args.host, args.port,
+    print(_starting(args.model, host, args.port), file=sys.stderr)
+    banner = _next_steps(args.model, host, args.port,
                          api_key_set=resolve_api_key(args.api_key) is not None)
 
     from mstar.api_server.entrypoint import main as serve_main
 
-    stop_watching = _announce_when_healthy(f"{_base_url(args.host, args.port)}/health", banner)
+    stop_watching = _announce_when_healthy(f"{_base_url(host, args.port)}/health", banner)
     try:
         serve_main(argv)
     finally:

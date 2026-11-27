@@ -63,6 +63,7 @@ def _serve_with(monkeypatch, port, fake_main):
     monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake)
     # the stand-in /health holds the port the launch would otherwise refuse
     monkeypatch.setattr(cli, "_port_in_use", lambda host, port: False, raising=False)
+    monkeypatch.delenv("MSTAR_SERVER_HOST", raising=False)  # mstar-server would bind that instead
     cli._serve(cli.build_parser().parse_args(["serve", "kokoro", "--host", "127.0.0.1", "--port", str(port)]))
 
 
