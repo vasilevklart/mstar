@@ -14,10 +14,12 @@ directly, or pass ``--config`` here to override the default.
 from __future__ import annotations
 
 import argparse
+import difflib
 import getpass
 import http.client
 import json
 import os
+import re
 import sys
 import threading
 import urllib.request
@@ -111,6 +113,32 @@ def _repo_root() -> Path:
     return Path(mstar.__file__).resolve().parent.parent
 
 
+def _squash(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _likely_models(model: str) -> list[str]:
+    """The model keys ``model`` most likely meant: the key with the same
+    letters and digits (``qwen3_5_9b`` for the Hugging Face id
+    ``Qwen/Qwen3.5-9B``), else the longest key the name starts with (``bagel``
+    for ``ByteDance-Seed/BAGEL-7B-MoT``), else, for a name that isn't a repo
+    id, the closest spellings."""
+    name = model.rstrip("/").rsplit("/", 1)[-1]
+    squashed = _squash(name)
+    if not squashed:
+        return []
+    same = [key for key in DEFAULT_CONFIGS if _squash(key) == squashed]
+    if same:
+        return same
+    prefixes = [key for key in DEFAULT_CONFIGS if squashed.startswith(_squash(key))]
+    if prefixes:
+        longest = max(len(_squash(key)) for key in prefixes)
+        return sorted(key for key in prefixes if len(_squash(key)) == longest)
+    if "/" in model:
+        return []  # a repo M* has no config for; a near spelling would be another model
+    return difflib.get_close_matches(re.sub(r"[^a-z0-9.]+", "_", name.lower()), list(DEFAULT_CONFIGS), n=3)
+
+
 def _resolve_config(model: str, override: str | None) -> str:
     if override:
         p = Path(override)
@@ -119,7 +147,10 @@ def _resolve_config(model: str, override: str | None) -> str:
         return str(p)
     if model not in DEFAULT_CONFIGS:
         avail = ", ".join(sorted(DEFAULT_CONFIGS))
-        sys.exit(f"error: unknown model {model!r}. Known models: {avail}\n"
+        hint = " mstar serve takes a model key, not a Hugging Face repo id." if "/" in model else ""
+        if likely := _likely_models(model):
+            hint += f" Did you mean {' or '.join(likely)}?"
+        sys.exit(f"error: unknown model {model!r}.{hint} Known models: {avail}\n"
                  f"       (or pass --config <path.yaml> for a custom deployment)")
     name = DEFAULT_CONFIGS[model]
     # A pip install ships the default configs as package data under
