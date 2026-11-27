@@ -17,8 +17,8 @@ The example uses a local Qwen judge and an optional OpenAI judge. Start the loca
 python -m benchmark.eval data fdb-v15 --out ~/eval-data/fdb --per-category 12   # or all
 
 # a local judge on the same GPU, started first so it gets a fixed share of memory:
-# any OpenAI-compatible server for Qwen/Qwen3.8-27B at revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0,
-# served as qwen3.8-27b on port 30000 with a qwen3 reasoning parser, 42% of GPU memory
+# vLLM or SGLang (not M*) serving Qwen/Qwen3.8-27B at revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+# as qwen3.8-27b on port 30000 with --reasoning-parser qwen3, 42% of GPU memory
 # and a 65536-token context
 
 python -m benchmark.eval run fdb --serve nemotron_duplex \
@@ -43,9 +43,9 @@ Failed sessions stay in every denominator and are never timed or judged.
 
 ## Judges and agreement {#judges-and-agreement}
 
-A judge is any OpenAI-compatible chat endpoint, named with `--judge NAME=...`:
+A judge is an OpenAI-compatible chat endpoint, named with `--judge NAME=...`:
 
-- **Local**: `NAME=http://host:port/v1` (any OpenAI-compatible server, M\* included if it serves the model). The model sent is the endpoint's `/v1/models` entry (`URL#name` picks one), and every reply must report it. Behavior labels decode as the reference judge does: non-thinking, temperature 0, top_p 1, 512 tokens, retry seeds 1 to 3. The semantic judge runs in thinking mode, temperature 0, seed 1, in batches of 8 pairs; serve it with a reasoning parser (`--reasoning-parser qwen3`) so the JSON answer arrives in `content`. `Qwen/Qwen3.8-27B` is the reference runner's choice.
+- **Local**: `NAME=http://host:port/v1`, served by vLLM or SGLang. M\* cannot be the judge: the behavior requests send `top_k: -1`, which M\* refuses (`top_k` must be 0 or more), and the semantic requests need a reasoning parser and a `json_schema` response format, which M\* does not have. The model sent is the endpoint's `/v1/models` entry (`URL#name` picks one), and every reply must report it. Behavior labels decode as the reference judge does: non-thinking, temperature 0, top_p 1, top_k -1, 512 tokens, retry seeds 1 to 3. The semantic judge runs in thinking mode, temperature 0, seed 1, in batches of 8 pairs; start the server with `--reasoning-parser qwen3` so the JSON answer arrives in `content`. `Qwen/Qwen3.8-27B` is the reference runner's choice.
 - **API**: `NAME=openai` is `gpt-4o-2024-08-06`, the paper's judge, with the official decoding. It reads `OPENAI_API_KEY` (and `OPENAI_BASE_URL`) from the environment and is skipped, with the reason in the results file and the report, when the key is not set. Keys are never written anywhere.
 
 Labels from different judges are kept apart (`<category>.<judge>.<label>`), so compare runs only under the same judge. With two or more judges, every repeat also records `agreement.<a>.<b>.agreement` and `.kappa` (Cohen's) over the pairs both labeled validly, and `agreement` pools them over repeats into a confusion matrix with per-category agreement and each judge's label shares. A local judge's numbers are for comparing like with like; use the API judge to compare with published results.
