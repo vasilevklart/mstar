@@ -837,8 +837,9 @@ reply is parsed but not constrained, so a call the model writes badly comes back
 Qwen3.5's call format with the grammar sampler, so they need ``enable_grammar`` (a 400
 without it). Such a reply makes one call when ``parallel_tool_calls`` is false (under ``auto``
 with no strict tool, it has no effect), and a call's arguments follow its tool's schema only
-when the tool is ``strict`` (vLLM's rule). ``tool_choice`` ``none`` keeps the
-tools in the prompt and asks for no call, and a call written anyway stays text. Calls are found
+when the tool is ``strict`` (vLLM's rule). ``tool_choice`` ``none`` leaves the tools out of
+the prompt (vLLM's ``exclude_tools_when_tool_choice_none``) and asks for no call, and a call
+written anyway stays text. Calls are found
 only after the reasoning, and a call cut off by ``max_tokens`` stays text, with
 ``finish_reason`` ``length``. Refused with a 400: ``functions`` / ``function_call`` (send
 ``tools``), and ``tools`` with a JSON ``response_format`` unless ``tool_choice`` is ``none``. On

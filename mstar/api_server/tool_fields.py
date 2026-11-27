@@ -20,7 +20,8 @@ _TOOL_CHOICE_SHAPE = 'tool_choice must be none, auto, required or {"type": "func
 
 def check_tools(mk: dict) -> None:
     """A request's tool fields, checked and kept. ``tools`` empty drops them all; ``tool_choice``
-    ``none`` keeps ``tools`` in the prompt and asks for no call. The older ``functions`` /
+    ``none`` asks for no call and keeps ``tools``, checked, though Qwen3.5 leaves them out of its
+    prompt. The older ``functions`` /
     ``function_call`` aren't served. The Rust frontend's ``check_tools`` is the same, word for word."""
     function_call = mk.get("function_call")
     if (mk.get("functions") not in (None, []) and function_call != "none") \

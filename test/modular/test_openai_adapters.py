@@ -277,7 +277,7 @@ def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields)
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
     sa = adapter().chat_to_request(req, tmp_path)
     assert sa.text == "hi", "a client's default tool fields refused a plain chat"
-    # an adapter that serves tools keeps listed ones (tool_choice none renders them)
+    # an adapter that serves tools keeps listed ones (the model reads tool_choice none)
     kept = {"tools", "tool_choice"} if adapter.serves_tools and fields.get("tools") else set()
     assert set(fields).intersection(sa.model_kwargs) == kept
 

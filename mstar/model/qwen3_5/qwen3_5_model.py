@@ -359,11 +359,15 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         # The released checkpoints are chat models (base ones say `-Base`), so
         # always use the chat template. `enable_thinking=False` emits an empty,
         # pre-closed `<think>` block, which is how Qwen turns reasoning off.
+        # tool_choice none leaves the tools out, as GLM's chat does and as vLLM
+        # does with exclude_tools_when_tool_choice_none: a model shown them may
+        # call one anyway, and a reply under none isn't parsed, so the call
+        # would reach the client as text.
+        tools = kwargs.get("tools") if kwargs.get("tool_choice") != "none" else None
         try:
             text = self.tokenizer.apply_chat_template(
                 messages_from_parts(parts),
-                # with tool_choice none too, as vLLM renders them by default
-                tools=kwargs.get("tools") or None,
+                tools=tools or None,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=enable_thinking,

@@ -242,3 +242,40 @@ def test_on_the_released_template_qwen3_5s_answer_is_the_prompts(chat, thinking)
         ids = torch.tensor(model.tokenizer.encode(text, add_special_tokens=False))
         from_prompt = after_reasoning(model.text_output(), ids) is not None
         assert model.reply_starts_in_reasoning({"enable_thinking": thinking}) is from_prompt is thinking
+
+
+# a chat's tools ahead of its turns, each as `tojson` writes it, as the released template lists them
+TOOLS_TEMPLATE = (
+    "{%- if tools -%}{{ '<|im_start|>system\n<tools>' }}{%- for tool in tools -%}{{ tool | tojson }}"
+    "{%- endfor -%}{{ '</tools><|im_end|>\n' }}{%- endif -%}" + CHAT_TEMPLATE
+)
+
+
+def _prompt_text(worker, **client) -> str:
+    """The prompt the data worker renders for a one-turn chat, from either frontend's kwargs."""
+    from mstar.api_server.request_types import PreprocessInput
+
+    [ids] = worker._prepare_input(PreprocessInput(
+        request_id="r", text="Weather in Paris?", file_paths=None, input_modalities=["text"],
+        output_modalities=["text"], model_kwargs={"prefix_cache": False, **client},
+    )).tensors["text_inputs"]
+    return worker.model.tokenizer.decode(ids)
+
+
+@pytest.mark.parametrize("choice, shown", [(None, True), ("auto", True), ("none", False)])
+def test_tool_choice_none_leaves_the_tools_out_of_qwen3_5s_prompt(tmp_path, choice, shown):
+    """As GLM's chat leaves them out, and vLLM with exclude_tools_when_tool_choice_none: a model shown
+    the tools under none may call one anyway, and that call reaches the client as text. Both frontends
+    hand the data worker the same tools and tool_choice (the ``none`` case of the Rust parity test in
+    ``test_rust_openai_adapters.py``), and it renders the prompt."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    repo = _repo(tmp_path / "repo", None)
+    (repo / "chat_template.jinja").write_text(TOOLS_TEMPLATE)
+    worker = _worker(Qwen3_5DenseModel(str(repo)))
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+    client = {"tools": tools} if choice is None else {"tools": tools, "tool_choice": choice}
+    text = _prompt_text(worker, **client)
+    assert ("<tools>" in text and "get_weather" in text) is shown, text
+    if not shown:
+        assert text == _prompt_text(worker), "the prompt of the same chat sent without tools"
