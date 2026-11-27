@@ -3144,7 +3144,8 @@ def main(argv: list[str] | None = None):
              f"/metrics (default: {API_KEY_ENV}; unset means no check). Prefer the environment "
              f"variable: a flag shows in the process list",
     )
-    parser.add_argument("--mooncake-port", type=int, default=8080)
+    # read by nothing (Mooncake picks its own ports at startup); kept so existing commands run
+    parser.add_argument("--mooncake-port", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--socket-path-prefix", type=str, default=None,
         help="ZMQ IPC socket path prefix (shared with conductor/workers); "
