@@ -79,5 +79,34 @@ class DockerSpacyTaggerTests(unittest.TestCase):
             )
 
 
+def run_steps(path, package):
+    """The image's `RUN uv pip install` steps that name ``package``, continuation lines joined."""
+    text = path.read_text().replace("\\\n", " ")
+    return re.findall(rf'^RUN uv pip install [^\n]*"{re.escape(package)}==[^\n]*$', text, re.MULTILINE)
+
+
+class DockerManualInstallTests(unittest.TestCase):
+    """What no extra can carry, each image installs on its own."""
+
+    def test_images_install_qwen_tts_without_its_pins_at_the_version_the_codec_names(self):
+        model = (REPO_ROOT / "mstar/model/qwen3_tts/qwen3_tts_model.py").read_text()
+        install = re.search(r"^QWEN_TTS_INSTALL = '(.*)'$", model, re.MULTILINE).group(1)
+        pin = re.search(r'"(qwen-tts==[^"]+)"', install).group(1)
+        for path in DOCKERFILES:
+            steps = run_steps(path, "qwen-tts")
+            self.assertEqual(len(steps), 1, path.name)
+            self.assertIn("--no-deps", steps[0], path.name)
+            self.assertIn(f'"{pin}"', steps[0], path.name)
+
+    def test_images_install_flash_attn_3_from_the_torch_index(self):
+        # PyPI's flash_attn_3 is an empty 0.0.0 placeholder, so the step must not reach PyPI
+        for path in DOCKERFILES:
+            steps = run_steps(path, "flash_attn_3")
+            self.assertEqual(len(steps), 1, path.name)
+            self.assertIn("--no-deps", steps[0], path.name)
+            self.assertIn("--index-url ${TORCH_INDEX}", steps[0], path.name)
+            self.assertNotIn("--extra-index-url", steps[0], path.name)
+
+
 if __name__ == "__main__":
     unittest.main()

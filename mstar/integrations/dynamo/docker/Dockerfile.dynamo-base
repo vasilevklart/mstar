@@ -54,6 +54,12 @@ RUN uv venv --python 3.12 --seed /opt/mstar/venv \
         torchaudio==${TORCHAUDIO_VERSION} \
     && uv pip install --python /opt/mstar/venv/bin/python ${FLASH_ATTN_WHEEL}
 
+# FlashAttention-3's paged kernel for asynchronous speculative decoding, from
+# the torch index, as in the sibling Dockerfile (which says why).
+ARG FLASH_ATTN_3_VERSION=3.0.1
+RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps \
+        --index-url ${TORCH_INDEX} "flash_attn_3==${FLASH_ATTN_3_VERSION}"
+
 WORKDIR /opt/mstar/src
 COPY . .
 

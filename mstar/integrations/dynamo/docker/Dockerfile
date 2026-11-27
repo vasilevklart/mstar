@@ -69,6 +69,15 @@ RUN uv venv --python 3.12 --seed /opt/mstar/venv \
         torchaudio==${TORCHAUDIO_VERSION} \
     && uv pip install --python /opt/mstar/venv/bin/python ${FLASH_ATTN_WHEEL}
 
+# FlashAttention-3 with its paged kernel, which asynchronous speculative
+# decoding verifies drafts on (fa3-fwd in [all] is built without paged KV).
+# It is not on PyPI, where the flash_attn_3 name is an empty 0.0.0 placeholder:
+# the torch index above has one abi3 wheel per CUDA build, for torch 2.9 and
+# newer. --no-deps: it needs only torch, einops, packaging and ninja.
+ARG FLASH_ATTN_3_VERSION=3.0.1
+RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps \
+        --index-url ${TORCH_INDEX} "flash_attn_3==${FLASH_ATTN_3_VERSION}"
+
 WORKDIR /opt/mstar/src
 COPY . .
 
