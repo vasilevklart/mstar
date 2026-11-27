@@ -32,6 +32,7 @@ from mstar.model.components.diffusion.compile_utils import (
 from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
     WarmedDecode,
+    vae_compile_mode_at_level,
 )
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
@@ -270,11 +271,14 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         # H100, moving the image by <= 5.6e-2 in [-1, 1] (~56 dB), before the folded upsample and the
         # split GroupNorm (compile_vae_decode). Not bit-exact, so it is a deployment knob and stays off
         # for the bit-exact parity path. CUDA graphs would add nothing: the compiled decode is not
-        # launch-bound (measured), so the node declares no captures.
+        # launch-bound (measured), so the node declares no captures. It autotunes at -O2 only: below
+        # that the defaults served as many images per minute and warmed in 33 s instead of 240 s on
+        # an H200 (vae_compile_mode_at_level).
         ph, pw = config.vae.patch_size
         self._vae_decode = WarmedDecode(
             vae, compile_decode, geometric_batch_sizes(min(max_batch_size, VAE_MAX_DECODE_BATCH)),
             [(config.vae.latent_channels, h * ph, w * pw) for h, w in warmup_grids], self.get_device(),
+            compile_mode=vae_compile_mode_at_level(),
         )
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:

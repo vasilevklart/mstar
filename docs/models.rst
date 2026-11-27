@@ -2590,9 +2590,13 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    Rows batched per denoise step.
 
 ``vae_compile``
-   ``torch.compile`` of the VAE decode with inductor autotuning, each nearest-x2 upsample
-   folded into its conv and the GroupNorms (with their SiLU) on a split-reduction kernel.
-   Before those two it measured 89 to 29 ms at 1024² on an H100 and about 55 dB PSNR from
+   ``torch.compile`` of the VAE decode, each nearest-x2 upsample folded into its conv and
+   the GroupNorms (with their SiLU) on a split-reduction kernel. Z-Image compiles it with
+   inductor's max-autotune; klein only at ``-O2``, and at torch.compile's defaults below it:
+   on an H200 at 1024² klein 4B's decode then warmed in 33 s instead of 240 s (ready 134 s
+   instead of 343 s with empty caches) at the same images per minute (196 vs 194 at one
+   request, 215 vs 216 at eight). Before the fold and the split GroupNorm the max-autotune
+   decode measured 89 to 29 ms at 1024² on an H100 and about 55 dB PSNR from
    the eager decode on every prompt; neither figure is re-measured since. The compiled
    decode is not bit-exact, and the autotuner may pick different conv kernels in another
    server process, so set it to ``false`` for bit-exact, repeatable output — which is how the

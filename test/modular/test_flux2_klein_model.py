@@ -458,7 +458,7 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
             self.shapes.append(tuple(x.shape))
             return x
 
-    monkeypatch.setattr(subs, "compile_vae_decode", lambda vae: vae.decode)  # no inductor on CPU tests
+    monkeypatch.setattr(subs, "compile_vae_decode", lambda vae, mode: vae.decode)  # no inductor on CPU tests
     config = Flux2KleinConfig()
     vae = RecordingVae()
     node = KleinVaeDecoderSubmodule(
@@ -487,7 +487,7 @@ def test_encoder_graphs_and_vae_compiles_cover_the_max_batch(monkeypatch, max_ba
     from mstar.model.components.diffusion.qwen3.submodule import Qwen3TextEncoderSubmodule
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
-    monkeypatch.setattr(subs, "compile_vae_decode", lambda vae: None)  # no inductor on CPU tests
+    monkeypatch.setattr(subs, "compile_vae_decode", lambda vae, mode: None)  # no inductor on CPU tests
 
     config = Flux2KleinConfig()
     text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), config.text_encoder, max_batch_size=max_batch_size,
@@ -644,6 +644,32 @@ def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypa
     compile_vae_decode(vae)()
     assert seen == [True]
     assert inductor_config.emulate_precision_casts is False
+
+
+@pytest.mark.parametrize("level, mode", [(None, None), ("0", None), ("1", None), ("2", "max-autotune-no-cudagraphs")])
+def test_the_vae_decode_autotunes_only_at_O2(monkeypatch, level, mode):
+    """Max-autotune took 239.5 s of a 342.5 s cold start (FLUX.2 klein 4B, H200, 1024^2) for no
+    images/min, so below -O2 the decode compiles at torch.compile's defaults; unset is -O1."""
+    from mstar.engine import accelerator_graph_runner as runner
+    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
+
+    seen = []
+    if level is None:
+        monkeypatch.delenv("MSTAR_COMPILE_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("MSTAR_COMPILE_LEVEL", level)
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: seen.append(kw) or fn)
+    vae = torch.nn.Linear(1, 1)
+    vae.decode = lambda x: x
+    runner.compile_level.cache_clear()
+    try:
+        KleinVaeDecoderSubmodule(vae, Flux2KleinConfig(), compile_decode=True)
+    finally:
+        runner.compile_level.cache_clear()
+    expected = {"fullgraph": False, "dynamic": False}
+    if mode is not None:
+        expected["mode"] = mode
+    assert seen == [expected]
 
 
 def test_requests_above_max_image_area_are_rejected():
