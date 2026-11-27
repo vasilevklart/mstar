@@ -100,7 +100,9 @@ class BaseCommunicator(ABC):
         if self.protocol != CommProtocol.IPC or my_id not in DEPLOYMENT_LOCK_ENTITIES:
             return
         path = self._endpoint(my_id).removeprefix("ipc://") + ".lock"
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        # O_NOFOLLOW: in a socket directory someone else made, a planted symlink
+        # would have us create a file wherever it points
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

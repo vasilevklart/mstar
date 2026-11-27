@@ -13,7 +13,7 @@ import tempfile
 
 import pytest
 
-from mstar.communication.communicator import DEPLOYMENT_ANCHOR_ENTITY, CommProtocol
+from mstar.communication.communicator import DEPLOYMENT_ANCHOR_ENTITY, BaseCommunicator, CommProtocol
 from mstar.communication.rust_communicator import RustZMQCommunicator
 
 
@@ -77,3 +77,24 @@ def test_tcp_does_not_lock():
     comm = _comm("/tmp/mstar_unused/", DEPLOYMENT_ANCHOR_ENTITY,
                  protocol=CommProtocol.TCP)
     assert not hasattr(comm, "_deployment_lock_fd")
+
+
+class _Locker:
+    """Just the lock, with no sockets (and no Rust extension) behind it."""
+
+    protocol = CommProtocol.IPC
+    _endpoint = BaseCommunicator._endpoint
+    _lock_deployment = BaseCommunicator._lock_deployment
+
+    def __init__(self, prefix):
+        self.ipc_socket_path_prefix = prefix
+
+
+def test_the_lock_does_not_follow_a_planted_symlink(tmp_path):
+    """In a socket directory another user made first, a symlink at the lock's
+    name would have the server create a file wherever it points."""
+    target = tmp_path / "elsewhere"
+    (tmp_path / f"{DEPLOYMENT_ANCHOR_ENTITY}.ipc.lock").symlink_to(target)
+    with pytest.raises(OSError):
+        _Locker(str(tmp_path))._lock_deployment(DEPLOYMENT_ANCHOR_ENTITY)
+    assert not target.exists()
