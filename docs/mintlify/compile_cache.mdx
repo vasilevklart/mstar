@@ -54,11 +54,17 @@ Not in a bundle: FlashInfer's JIT builds (`FLASHINFER_WORKSPACE_BASE`), AITER's 
 2. Start each config you want warm and send it a request of every shape that compiles on first use, such as each image size a diffusion model will serve. Most of the work happens before `/health` answers: every capture bucket is compiled at startup.
 3. Stop the servers, then `mstar cache pack ROOT`. Packing must not run while a server is writing to the caches.
 
-`pack` adds to the bundle for this host's key under `ROOT`, creating it if needed. It appends the Inductor and Triton files the bundle doesn't have and those whose size or modification time differ from its last copy; their entries never change once written. MIOpen keeps each database in one file (the find and perf databases as `key=value` text, compiled kernels in SQLite), so a changed one is merged with the bundle's copy, this host's record winning where both have one: caches warmed separately, each from empty, add up rather than replace each other. Each tar is copied, appended to and renamed into place, so a concurrent `unpack` never reads a partial tar, and the lock serializes packs, so several hosts with the same key can add to one bundle in turn.
+`pack` adds to the bundle for this host's key under `ROOT`, creating it if needed. It appends the Inductor and Triton files the bundle doesn't have and those whose size or modification time differ from its last copy; their entries never change once written. MIOpen keeps each database in one file (the find and perf databases as `key=value` text, compiled kernels in SQLite), so a changed one is merged with the bundle's copy, this host's record winning where both have one: caches warmed separately, each from empty, add up rather than replace each other. Each tar is copied, appended to and renamed into place, so a concurrent `unpack` never reads a partial tar, and the lock serializes packs, so several hosts with the same key can add to one bundle in turn. `pack` runs the system `tar` (GNU or BSD); `unpack` needs only Python.
 
 ## Unpacking {#unpacking}
 
-`mstar cache unpack SRC` takes a bundle or a root of bundles, picks the one for this host's key, and extracts each tar into its cache directory over what is there; where both have a file, the bundle's copy wins, and with repeated copies in a tar the last one does. It exits with status 3 when `SRC` has no bundle for this stack, and `mstar serve --compile-bundle` then starts cold with a warning. `unpack` leaves `mstar-bundle.json` in the Inductor directory, naming the bundle and its key.
+`mstar cache unpack SRC` takes a bundle or a root of bundles, picks the one for this host's key, and extracts the last copy of each file in each tar into its cache directory:
+
+- A file the directory already has is kept, since Inductor and Triton entries never change once written.
+- A MIOpen database the directory already has is merged with the bundle's copy, the bundle's record winning where both have one, so the records only this host has stay.
+- Each file is written beside its name and renamed into place, and each directory is locked while it is written (`.mstar-unpack.lock` in it, which `pack` leaves out), so servers starting together on one host can unpack into the same caches.
+
+It exits with status 3 when `SRC` has no bundle for this stack, and `mstar serve --compile-bundle` then starts cold with a warning. `unpack` leaves `mstar-bundle.json` in the Inductor directory, naming the bundle and its key.
 
 At startup each worker logs its stack key and what it found:
 

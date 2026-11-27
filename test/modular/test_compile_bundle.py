@@ -1,6 +1,7 @@
 """Compile-cache bundles (mstar/utils/compile_bundle.py, ``mstar cache``): packing
-appends only what is new, unpacking restores the caches and marks them, a
-bundle for another stack is refused, and a bundle root laid out like the
+appends only what is new, unpacking restores the caches and marks them (keeping
+what a cache has, merging MIOpen's databases, one unpack per cache dir at a
+time), a bundle for another stack is refused, and a bundle root laid out like the
 golden copies the AMD benchmark scripts seed from (uncompressed per-kind tars
 of ``./`` members, no manifest) reads as a bundle."""
 
@@ -45,7 +46,9 @@ def _names(tar: Path) -> list[str]:
 
 
 def _tree(root: Path) -> dict[str, str]:
-    return {p.relative_to(root).as_posix(): p.read_text() for p in sorted(root.rglob("*")) if p.is_file()}
+    """The files under ``root``, less the lock unpack leaves in each cache dir."""
+    return {p.relative_to(root).as_posix(): p.read_text() for p in sorted(root.rglob("*"))
+            if p.is_file() and p.name != cb.DEST_LOCK}
 
 
 def test_key_path_round_trips_and_names_what_differs():
@@ -167,7 +170,7 @@ def test_a_golden_copy_layout_reads_as_a_bundle(tmp_path):
     for kind in ("inductor", "triton", "miopen"):
         exclude = ["--exclude=./triton"] if kind == "inductor" else []
         subprocess.run(["tar", "-cf", str(golden / f"{kind}.tar"), *exclude, "-C", str(built[kind]), "."],
-                       check=True)
+                       check=True, env={**os.environ, "COPYFILE_DISABLE": "1"})
     assert cb.find_bundles(tmp_path / "golden") == [golden]
     assert cb.bundle_key(golden) == cb.StackKey(**{**KEY.__dict__, "arch": None})
     out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t", "miopen": tmp_path / "o" / "m"}
@@ -202,6 +205,91 @@ def test_miopen_kernels_without_a_dir_of_their_own_go_to_the_db_dir(tmp_path):
     shared = {"inductor": tmp_path / "o" / "i", "miopen": tmp_path / "o" / "m"}
     cb.unpack(bundle, KEY, shared, log=lambda _: None)
     assert (shared["miopen"] / "3.5.1" / "x.ukdb").read_text() == "kernels"
+
+
+def test_unpack_merges_miopen_databases_with_the_hosts(tmp_path):
+    """MIOpen keeps each database in one file, so unpacking into a host that has
+    one must add the bundle's records to it (the bundle's winning on the same
+    key), not replace it."""
+    import sqlite3
+
+    built = tmp_path / "built" / "miopen"
+    _write(built / "x.ufdb.txt", "conv-a=S1:0.5\n")
+    _kernel_db(built / "x.ukdb", [("k1", "-O3")])
+    cb.pack(tmp_path / "b", KEY, {"miopen": built}, log=lambda _: None)
+    host = {"inductor": tmp_path / "h" / "i", "miopen": tmp_path / "h" / "m"}
+    _write(host["miopen"] / "x.ufdb.txt", "conv-a=S9:0.9\nconv-z=S9:0.1\n")
+    _kernel_db(host["miopen"] / "x.ukdb", [("k9", "-O3")])
+    lines = []
+    cb.unpack(tmp_path / "b", KEY, host, log=lines.append)
+    assert "miopen: 0 files added" in lines[0] and "2 merged" in lines[0]
+    assert (host["miopen"] / "x.ufdb.txt").read_text() == "conv-a=S1:0.5\nconv-z=S9:0.1\n"
+    con = sqlite3.connect(host["miopen"] / "x.ukdb")
+    assert sorted(r[0] for r in con.execute("SELECT kernel_name FROM kern_db")) == ["k1", "k9"]
+    con.close()
+
+    # the host now has every record the bundle has, so a second unpack leaves its files alone
+    def files():
+        return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in host["miopen"].glob("x.*")}
+
+    before = files()
+    cb.unpack(tmp_path / "b", KEY, host, log=lines.append)
+    assert "0 merged, 2 already there" in lines[-1]
+    assert files() == before
+
+
+def test_unpack_keeps_the_entries_a_cache_already_has(tmp_path):
+    dirs = _caches(tmp_path / "built")
+    root = tmp_path / "b"
+    cb.pack(root, KEY, dirs, log=lambda _: None)
+    _write(dirs["inductor"] / "wq" / "kernel.py", "code 2", mtime=1_700_000_100)
+    cb.pack(root, KEY, dirs, log=lambda _: None)  # inductor.tar now holds two copies of it
+    host = {"inductor": tmp_path / "h" / "i", "triton": tmp_path / "h" / "t"}
+    _write(host["inductor"] / "fxgraph" / "ab" / "entry", "this host's graph")
+    cb.unpack(root, KEY, host, log=lambda _: None)
+    assert (host["inductor"] / "fxgraph" / "ab" / "entry").read_text() == "this host's graph"
+    assert (host["inductor"] / "wq" / "kernel.py").read_text() == "code 2"  # the tar's last copy
+    # the marker and the lock stay out of a pack of what was unpacked, and mtimes survive
+    fresh = {"inductor": tmp_path / "f" / "i", "triton": tmp_path / "f" / "t", "miopen": tmp_path / "f" / "m"}
+    cb.unpack(root, KEY, fresh, log=lambda _: None)
+    assert (fresh["inductor"] / cb.DEST_LOCK).is_file() and (fresh["inductor"] / cb.MARKER).is_file()
+    _, again = cb.pack(root, KEY, fresh, log=lambda _: None)
+    assert {r.kind: r.added for r in again} == {"inductor": 0, "triton": 0, "miopen": 0}
+
+
+def test_unpack_waits_for_the_lock_on_its_destination(tmp_path):
+    """Two servers starting on one host unpack into the same caches one at a time."""
+    import threading
+
+    dirs = _caches(tmp_path / "built")
+    cb.pack(tmp_path / "b", KEY, dirs, log=lambda _: None)
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    out["inductor"].mkdir(parents=True)
+    done = threading.Event()
+
+    def unpack():
+        cb.unpack(tmp_path / "b", KEY, out, log=lambda _: None)
+        done.set()
+
+    with cb._locked(out["inductor"] / cb.DEST_LOCK):
+        t = threading.Thread(target=unpack, daemon=True)
+        t.start()
+        assert not done.wait(0.5)
+        assert not (out["inductor"] / "fxgraph").exists()
+    t.join(10)
+    assert done.is_set() and (out["inductor"] / "fxgraph" / "ab" / "entry").read_text() == "graph"
+
+
+def test_unpack_refuses_a_member_outside_the_cache_dir(tmp_path):
+    bundle = tmp_path / "b" / KEY.path
+    bundle.mkdir(parents=True)
+    _write(tmp_path / "payload", "x")
+    with tarfile.open(bundle / "triton.tar", "w") as tf:
+        tf.add(tmp_path / "payload", arcname="../escaped")
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    with pytest.raises(tarfile.OutsideDestinationError):
+        cb.unpack(bundle, KEY, out, log=lambda _: None)
+    assert not (tmp_path / "o" / "escaped").exists()
 
 
 def test_cli_wires_cache_subcommands(monkeypatch, tmp_path, capsys):

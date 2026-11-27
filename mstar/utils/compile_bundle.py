@@ -15,8 +15,9 @@ bundles for several stacks::
 
 Each tar holds its directory's files as ``./<path>`` and is uncompressed, so
 packing into an existing bundle appends only the files it lacks or holds an
-older copy of, and unpacking keeps the last copy of each file. The layout and
-the matching rules are in docs/mintlify/compile_cache.mdx.
+older copy of, and unpacking extracts the last copy of each file a cache dir
+lacks and merges MIOpen's databases with the host's. The layout and the
+matching rules are in docs/mintlify/compile_cache.mdx.
 """
 
 from __future__ import annotations
@@ -45,6 +46,8 @@ MANIFEST = "manifest.json"
 # written into the Inductor dir by unpack and read at server startup
 MARKER = "mstar-bundle.json"
 LOCK = ".append.lock"
+# taken in each cache dir while unpack writes to it; never packed
+DEST_LOCK = ".mstar-unpack.lock"
 KINDS = ("inductor", "triton", "miopen", "miopen-kernels")
 _KEY_DIR = re.compile(r"torch-(?P<torch>.+)-(?P<runtime>(?:hip|cuda)-[^-]+)-triton-(?P<triton>[^/]+)")
 
@@ -142,7 +145,7 @@ def _stamp(st: os.stat_result, link: bool) -> tuple[int, int]:
 
 def _files(root: Path, skip: list[Path]) -> dict[str, tuple[int, int]]:
     """Files and symlinks under ``root`` as tar names (``./a/b``), less the
-    marker and anything under ``skip``."""
+    marker, unpack's lock and anything under ``skip``."""
     skip_set = {p.resolve() for p in skip}
     out: dict[str, tuple[int, int]] = {}
     for top, dirnames, filenames in os.walk(root):
@@ -155,7 +158,7 @@ def _files(root: Path, skip: list[Path]) -> dict[str, tuple[int, int]]:
         for f in filenames:
             p = here / f
             rel = p.relative_to(root).as_posix()
-            if rel == MARKER:
+            if rel in (MARKER, DEST_LOCK):
                 continue
             st = os.lstat(p)
             out[f"./{rel}"] = _stamp(st, p.is_symlink())
@@ -186,9 +189,10 @@ def _add(tar: Path, src: Path, names: list[str]) -> None:
         try:
             if tar.exists():
                 shutil.copyfile(tar, tmp)
+            # COPYFILE_DISABLE: macOS's tar would add a ._<name> member per file with extended attributes
             subprocess.run(["tar", "-rf" if tar.exists() else "-cf", str(tmp), "-C", str(src),
                             "--no-recursion", "--null", "-T", listing.name],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, text=True, env={**os.environ, "COPYFILE_DISABLE": "1"})
             os.replace(tmp, tar)
         except subprocess.CalledProcessError as exc:
             tmp.unlink(missing_ok=True)
@@ -264,8 +268,8 @@ def _merge_miopen(tar: Path, src: Path, names: list[str], have: dict, tmp: Path)
 
 @contextlib.contextmanager
 def _locked(path: Path) -> Iterator[None]:
-    """One writer per bundle at a time, across hosts sharing the filesystem
-    when its locks work (they do on local disks and NFSv4)."""
+    """One writer at a time per lock file, across hosts sharing the
+    filesystem when its locks work (they do on local disks and NFSv4)."""
     with open(path, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
@@ -391,11 +395,68 @@ class Unpacked:
     kinds: dict[str, str]  # kind -> directory it went to
 
 
+@dataclass(frozen=True)
+class Extracted:
+    added: int  # files the cache dir lacked
+    merged: int  # MIOpen databases merged with the cache dir's copy
+    kept: int  # files the cache dir already had
+
+
+def _extract(tar: Path, dest: Path, merge_dbs: bool) -> Extracted:
+    """Extract the last copy of each file in ``tar`` that ``dest`` lacks. A file
+    ``dest`` has is kept, since Inductor and Triton entries never change once
+    written; with ``merge_dbs`` (MIOpen, one file per database) it is merged
+    with the bundle's copy instead, the bundle's record winning. Each file is
+    written beside its name and renamed into place, so a server reading
+    ``dest`` never sees part of one. tarfile rather than ``tar``, whose GNU and
+    BSD builds disagree on skipping existing files."""
+    last: dict[str, tarfile.TarInfo] = {}
+    added = merged = kept = 0
+    with tarfile.open(tar, "r:") as tf:
+        while (m := tf.next()) is not None:
+            tf.members.clear()
+            if m.isfile() or m.issym():
+                last[m.name if m.name.startswith("./") else f"./{m.name}"] = m
+        for m in last.values():
+            m = tarfile.data_filter(m, str(dest))  # refuses a path or link outside dest
+            path = dest / m.name
+            have = path.is_symlink() or path.exists()
+            if have and not (merge_dbs and m.isfile() and path.is_file() and not path.is_symlink()):
+                kept += 1
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # a prefix keeps the suffix that tells _merge_db a text database
+            tmp = path.with_name(f".unpack-{os.getpid()}-{path.name}")
+            out = path.with_name(f".merged-{os.getpid()}-{path.name}")
+            try:
+                if m.issym():
+                    os.symlink(m.linkname, tmp)
+                else:
+                    with tf.extractfile(m) as f, open(tmp, "wb") as w:
+                        shutil.copyfileobj(f, w)
+                    os.chmod(tmp, m.mode)
+                    os.utime(tmp, (m.mtime, m.mtime))
+                if not have:
+                    os.replace(tmp, path)
+                    added += 1
+                elif _merge_db(path, tmp, out):
+                    os.replace(out, path)
+                    merged += 1
+                else:
+                    kept += 1
+            finally:
+                tmp.unlink(missing_ok=True)
+                out.unlink(missing_ok=True)
+    return Extracted(added, merged, kept)
+
+
 def unpack(src: Path, key: StackKey, dirs: dict[str, Path], force: bool = False,
            log: Callable[[str], None] = print) -> Unpacked:
-    """Extract the bundle for ``key`` from ``src`` into ``dirs``, over what is
-    there (the bundle's copy of a file wins), and leave a marker for the
-    startup line. A bundle for another stack is refused unless ``force``."""
+    """Extract the bundle for ``key`` from ``src`` into ``dirs`` (see
+    :func:`_extract`) and leave a marker for the startup line. Each cache dir
+    is locked while it is written, so servers starting together on one host
+    can unpack into the same caches. A bundle for another stack is refused
+    unless ``force``."""
     bundle = select_bundle(src, key)
     bkey = bundle_key(bundle)
     diff = key.differences(bkey) if bkey is not None else []
@@ -413,10 +474,9 @@ def unpack(src: Path, key: StackKey, dirs: dict[str, Path], force: bool = False,
             log(f"{kind}: no {kind} cache on this platform, left out")
             continue
         dest.mkdir(parents=True, exist_ok=True)
-        p = subprocess.run(["tar", "-xf", str(tar), "-C", str(dest), "--no-same-owner"],
-                           capture_output=True, text=True, check=False)
-        if p.returncode != 0:
-            raise RuntimeError(f"tar failed extracting {tar} into {dest}: {p.stderr.strip()}")
+        with _locked(dest / DEST_LOCK):
+            n = _extract(tar, dest, merge_dbs=kind.startswith("miopen"))
+        log(f"{kind}: {n.added} files added to {dest}, {n.merged} merged, {n.kept} already there")
         done[kind] = str(dest)
     dirs["inductor"].mkdir(parents=True, exist_ok=True)
     _write_json(dirs["inductor"] / MARKER, {
