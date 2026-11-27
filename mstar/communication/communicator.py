@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from enum import Enum
 
 from mstar.communication.event import EventWakeup
+from mstar.graph.runtime.utils import missing_extension_hint
 
 logger = logging.getLogger(__name__)
 
@@ -153,9 +154,7 @@ def make_communicator(
     except ImportError as e:
         raise ImportError(
             "The control mesh runs on the mstar_rust extension, which this "
-            "environment does not have. The Linux wheels of mstar-ai on PyPI "
-            "carry it; from a checkout, build it with `maturin develop "
-            "--release -m rust/Cargo.toml` (see docs/installation.rst)."
+            f"environment does not have. {missing_extension_hint()}"
         ) from e
     from mstar.communication.rust_communicator import RustZMQCommunicator
 

@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from mstar.graph.runtime.utils import require_rust_extension
+from mstar.graph.runtime.utils import missing_extension_hint, require_rust_extension
 
 
 @pytest.fixture
@@ -38,3 +38,15 @@ def test_the_message_does_not_send_users_to_pypi_for_the_extension(no_extension,
     message = _message(tmp_path / "rust")
     assert "PyPI" not in message
     assert "pure-Python mstar-ai wheel (py3-none-any) does not include it" in message
+
+
+def test_the_control_mesh_gives_the_same_advice(no_extension):
+    # an installed package serving with --python-frontend needs it first for the API server's communicator
+    from mstar.communication.communicator import make_communicator
+
+    with pytest.raises(ImportError) as raised:
+        make_communicator("conductor", [])
+    message = str(raised.value)
+    assert message.startswith("The control mesh runs on the mstar_rust extension")
+    assert "PyPI" not in message
+    assert missing_extension_hint() in message
