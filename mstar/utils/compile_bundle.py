@@ -62,9 +62,11 @@ class StackKey:
 
     Inductor and Triton key their own entries on the GPU arch and the torch,
     HIP or CUDA, and Triton builds, so a bundle from another stack unpacks
-    harmlessly but is never read: those fields must match. The product is in
-    the key because autotuning picks are timings taken on it. An MI300X's
-    picks load on an MI325X (both gfx942) but were not tuned there.
+    harmlessly but is never read: those fields must match. On CUDA Inductor
+    keys its graphs on the GPU's name too, so there the product must match
+    as well. On ROCm it is in the key because autotuning picks are timings
+    taken on it: an MI300X's picks load on an MI325X (both gfx942) but were
+    not tuned there.
     """
 
     product: str
@@ -89,8 +91,11 @@ class StackKey:
     def differences(self, other: StackKey) -> list[str]:
         """What keeps ``other``'s entries from being read on this stack. A field
         either side doesn't know (a manifest-less bundle's arch) is no reason."""
+        names = ("arch", "torch", "runtime", "triton")
+        if self.runtime.startswith("cuda-"):
+            names = ("product", *names)
         out = []
-        for name in ("arch", "torch", "runtime", "triton"):
+        for name in names:
             here, there = getattr(self, name), getattr(other, name)
             if here and there and here != there:
                 out.append(f"{name} {there} (here {here})")
@@ -108,7 +113,7 @@ def stack_key(device: int | None = None) -> StackKey:
         raise RuntimeError("no CUDA or ROCm GPU is visible; a bundle is keyed by the GPU that compiled it")
     name = torch.cuda.get_device_name(device)
     product = re.sub(r"[^a-z0-9]+", "-", name.lower().replace("amd instinct", "")).strip("-")
-    runtime = f"hip-{torch.version.hip}" if torch.version.hip else f"cuda-{torch.version.cuda}"
+    runtime = f"hip-{torch.version.hip}" if current_platform.is_rocm() else f"cuda-{torch.version.cuda}"
     return StackKey(product=product, arch=current_platform.arch(device), torch=torch.__version__,
                     runtime=runtime, triton=triton.__version__)
 

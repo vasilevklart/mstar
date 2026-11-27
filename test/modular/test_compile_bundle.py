@@ -161,6 +161,28 @@ def test_a_bundle_for_another_stack_is_refused_unless_forced(tmp_path):
     assert not ok and "torch 2.11.0+rocm7.1 (here 2.12.1+rocm7.2)" in line
 
 
+CUDA_KEY = cb.StackKey(product="nvidia-h200", arch="sm_90", torch="2.12.1+cu129", runtime="cuda-12.9",
+                       triton="3.7.1")
+
+
+def test_on_cuda_a_bundle_from_another_gpu_model_is_refused_unless_forced(tmp_path):
+    """Inductor keys CUDA graphs on the GPU's name, so an H100's are never read
+    on an H200; on ROCm (above) the product alone is no reason."""
+    h100 = cb.StackKey("nvidia-h100-80gb-hbm3", CUDA_KEY.arch, CUDA_KEY.torch, CUDA_KEY.runtime, CUDA_KEY.triton)
+    assert CUDA_KEY.differences(h100) == ["product nvidia-h100-80gb-hbm3 (here nvidia-h200)"]
+    dirs = _caches(tmp_path / "built")
+    bundle, _ = cb.pack(tmp_path / "bundles", h100, {k: dirs[k] for k in ("inductor", "triton")}, log=lambda _: None)
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    with pytest.raises(cb.BundleMismatchError, match="has no bundle for nvidia-h200/"):
+        cb.unpack(tmp_path / "bundles", CUDA_KEY, out, log=lambda _: None)
+    with pytest.raises(cb.BundleMismatchError, match=r"product nvidia-h100-80gb-hbm3 \(here nvidia-h200\)"):
+        cb.unpack(bundle, CUDA_KEY, out, log=lambda _: None)
+    assert not out["inductor"].exists()
+    cb.unpack(bundle, CUDA_KEY, out, force=True, log=lambda _: None)
+    ok, line = cb.startup_line(CUDA_KEY, out)
+    assert not ok and "its entries are not used" in line
+
+
 def test_a_golden_copy_layout_reads_as_a_bundle(tmp_path):
     """$WORK/.cache/compile-golden/<product>/<stack>/{inductor,triton,miopen}.tar,
     made with ``tar -cf X.tar -C dir .``: no manifest, a ``./`` directory member."""

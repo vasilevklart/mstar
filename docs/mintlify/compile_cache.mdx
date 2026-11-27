@@ -26,8 +26,8 @@ mi325x-vf/torch-2.12.1+rocm7.2-hip-7.2.53211-triton-3.7.1
 
 `mstar cache key` prints this host's. The product is the GPU's name, lower-cased with `AMD Instinct` dropped. The manifest also records the GPU arch (`gfx942`, `sm_90`).
 
-- The arch, torch, HIP or CUDA, and Triton versions must match. Inductor and Triton key their own entries on them, so a bundle from another stack would unpack without error and never be read. `mstar cache unpack` refuses it (`--force` unpacks it anyway).
-- The product doesn't have to match. Autotuning picks are timings taken on the product that compiled them: an MI300X bundle loads on an MI325X (both gfx942) and starts warm, but its kernels were tuned on the MI300X. The startup line says so.
+- The arch, torch, HIP or CUDA, and Triton versions must match, and on CUDA the product too. Inductor and Triton key their own entries on them (on CUDA, Inductor's graph key holds the GPU's name, so an H100's graphs miss on an H200), so a bundle from another stack would unpack without error and its compiled graphs would never be read. `mstar cache unpack` refuses it (`--force` unpacks it anyway).
+- On ROCm the product doesn't have to match, since Inductor keys graphs on the gfx arch there. Autotuning picks are timings taken on the product that compiled them: an MI300X bundle loads on an MI325X (both gfx942) and starts warm, but its kernels were tuned on the MI300X. The startup line says so. A root is searched only under this host's product, so pass such a bundle's own directory.
 - Nothing in the key covers the driver, `ptxas` or the M\* version. A newer M\* that changes a captured forward's graph compiles that graph again on first start and keeps the rest.
 
 ## Layout {#layout}
@@ -73,6 +73,6 @@ Worker audio_encoder: compile cache: stack mi325x-vf/torch-...-triton-3.7.1; bun
 Worker decoder: compile cache: stack mi325x-vf/...; no bundle unpacked into /root/.cache/mstar/torchinductor
 ```
 
-A bundle built for another arch, torch, HIP, CUDA or Triton logs a warning instead, since its entries won't be used.
+A bundle built for another arch, torch, HIP, CUDA or Triton, or on CUDA for another GPU model, logs a warning instead, since its entries won't be used.
 
 `mstar cache show ROOT` lists the bundles under a root with their sizes and last packs.
