@@ -873,21 +873,27 @@ Compilation
        output reproduces across server processes and the cold start shrinks,
        at the cost of one-row decode speed. Only Qwen3.5's text walks read it
        (``knobs.compile_deterministic``).
-   * - ``TRITON_PTXAS_BLACKWELL_PATH``
-     - torch's ptxas, when needed
-     - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas
-       before 13.1.115, including the 13.1.80 that Triton 3.7.1 bundles,
-       miscompiles some integer floor divisions on sm_103 (Inductor's fused
-       interleaved mRoPE table came out wrong on B300). Unset, the conductor
-       points its workers at torch's ``torch/bin/ptxas`` when a compute
-       capability 10.x GPU is present, Triton's bundled ptxas predates
-       13.1.115 and torch's does not; it then also sets
+   * - ``TRITON_PTXAS_PATH``, ``TRITON_PTXAS_BLACKWELL_PATH``
+     - a ptxas at 13.1.115 or later, when needed
+     - Triton's own variables: the ptxas it runs for GPUs before sm_100, and
+       for sm_100 and up. ptxas before 13.1.115 miscompiles some integer
+       floor divisions on every GPU (Inductor's fused interleaved mRoPE table
+       came out wrong on B300 and on H200), and Triton 3.7.1 bundles 12.8.93
+       and 13.1.80. Unset, the conductor points its workers, for each GPU
+       family present whose bundled ptxas predates 13.1.115, at the first
+       ptxas at 13.1.115 or later that the driver loads (a 13.x ptxas needs
+       driver 580 or later) among torch's ``torch/bin/ptxas``, the
+       ``nvidia-cuda-nvcc`` wheel's, ``$CUDA_HOME``'s, ``$CUDA_PATH``'s,
+       ``/usr/local/cuda``'s and the one on ``PATH``. It then also sets
        ``TORCH_COMPILE_CACHE_KEY_TAG``, since Inductor's graph cache would
        otherwise reuse kernels compiled by the bundled ptxas (decided by
-       :func:`mstar.platforms.ptxas.blackwell_ptxas_env`). A value you set
-       is kept, and the cache tag then names the ptxas you chose, so a cache
-       another ptxas wrote is not reused. A ``TORCH_COMPILE_CACHE_KEY_TAG``
-       you set gets ``-ptxas-blackwell-<version>`` appended.
+       :func:`mstar.platforms.ptxas.ptxas_env`). When none qualifies, Triton
+       keeps its bundled ptxas and the conductor logs a warning: on CUDA 12
+       builds of torch, ``pip install "nvidia-cuda-nvcc>=13.1.115"`` gives
+       one. A value you set is kept, and the cache tag then names the ptxas
+       you chose, so a cache another ptxas wrote is not reused. A
+       ``TORCH_COMPILE_CACHE_KEY_TAG`` you set gets ``-ptxas-<version>`` or
+       ``-ptxas-blackwell-<version>`` appended.
    * - ``TORCHINDUCTOR_CACHE_DIR``
      - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
      - torch's own variable; M* sets this default when importing

@@ -1,12 +1,14 @@
-"""The process env default that points Triton at torch's ptxas for Blackwell.
+"""The process env defaults that point Triton at a ptxas at 13.1.115 or later.
 
-ptxas before 13.1.115 (Triton 3.7.1 bundles 13.1.80 for Blackwell) miscompiles a
-floor division of a periodic index under a range select when a thread holds two
-elements. The CUDA tests run such kernels at that launch config with the
-default applied; on sm_103 they fail with TRITON_PTXAS_BLACKWELL_PATH set to
-Triton's bundled ptxas.
+ptxas before 13.1.115 miscompiles a floor division of a periodic index under a
+range select when a thread holds two elements, on every GPU Triton 3.7.1 runs
+it for: its bundled 12.8.93 below sm_100 (H200 fails these CUDA tests) and its
+13.1.80 from sm_100 (so does B300). The CUDA tests run such kernels at that
+launch config with the defaults applied, so they fail on a box where no fixed
+ptxas the driver loads is found, which then serves wrong rotary tables too.
 """
 
+import logging
 import os
 import stat
 
@@ -18,54 +20,92 @@ import triton.language as tl
 from mstar import platforms
 from mstar.platforms import ptxas
 from mstar.platforms.interface import CudaPlatform
+from mstar.platforms.ptxas import BLACKWELL_PTXAS, PTXAS, NvidiaGpus
 
-BUNDLED = "/site-packages/triton/backends/nvidia/bin/ptxas-blackwell"
+BUNDLED = "/site-packages/triton/backends/nvidia/bin/ptxas"
+BUNDLED_BLACKWELL = "/site-packages/triton/backends/nvidia/bin/ptxas-blackwell"
 TORCH_PTXAS = os.path.join(os.path.dirname(torch.__file__), "bin", "ptxas")
+TOOLKIT_PTXAS = "/usr/local/cuda/bin/ptxas"
 USER_PTXAS = "/opt/cuda/bin/ptxas"
 TAG = "TORCH_COMPILE_CACHE_KEY_TAG"
+TRITON_37 = {BUNDLED: (12, 8, 93), BUNDLED_BLACKWELL: (13, 1, 80)}
+CU132, CU129 = (13, 2, 78), (12, 9, 86)
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
 
 
 @pytest.fixture(autouse=True)
 def _undecided():
-    ptxas.blackwell_ptxas_env.cache_clear()
+    ptxas.ptxas_env.cache_clear()
     yield
-    ptxas.blackwell_ptxas_env.cache_clear()
+    ptxas.ptxas_env.cache_clear()
+
+
+# (GPU capability majors, driver major, bundled versions, torch's, the CUDA toolkit's,
+#  a variable the user set, the defaults wanted, whether a warning says Triton may miscompile)
+CASES = {
+    "blackwell, torch's is fixed": (
+        {10}, 580, TRITON_37, CU132, None, None, {BLACKWELL_PTXAS.env: TORCH_PTXAS, TAG: "ptxas-blackwell-13.2.78"},
+        False),
+    "hopper, torch's is fixed": (
+        {9}, 580, TRITON_37, CU132, None, None, {PTXAS.env: TORCH_PTXAS, TAG: "ptxas-13.2.78"}, False),
+    "hopper, CUDA 12 torch, the toolkit's is fixed": (
+        {9}, 580, TRITON_37, CU129, (13, 1, 115), None, {PTXAS.env: TOOLKIT_PTXAS, TAG: "ptxas-13.1.115"}, False),
+    "hopper, none is fixed": ({9}, 580, TRITON_37, CU129, (13, 1, 80), None, {}, True),
+    "hopper, the driver predates CUDA 13": ({9}, 570, TRITON_37, CU129, (13, 1, 115), None, {}, True),
+    "hopper and blackwell": (
+        {9, 10}, 580, TRITON_37, CU132, None, None,
+        {PTXAS.env: TORCH_PTXAS, BLACKWELL_PTXAS.env: TORCH_PTXAS, TAG: "ptxas-13.2.78-ptxas-blackwell-13.2.78"},
+        False),
+    "triton 3.8 on blackwell": (
+        {10}, 580, {BUNDLED: (12, 9, 86), BUNDLED_BLACKWELL: (13, 3, 33)}, CU132, None, None, {}, False),
+    "bundled fixed": ({9}, 580, {BUNDLED: (13, 1, 115), BUNDLED_BLACKWELL: (13, 1, 115)}, CU132, None, None, {}, False),
+    "bundled unknown": ({9, 10}, 580, {}, CU132, None, None, {}, False),
+    "no nvidia gpu": (set(), None, TRITON_37, CU132, None, None, {}, False),
+    "already set": (
+        {10}, 580, TRITON_37, CU132, None, (BLACKWELL_PTXAS.env, (13, 2, 51)), {TAG: "ptxas-blackwell-13.2.51"},
+        False),
+    "already set, too old": ({9}, 580, TRITON_37, CU132, None, (PTXAS.env, CU129), {TAG: "ptxas-12.9.86"}, True),
+}
 
 
 @pytest.mark.parametrize(
-    ("blackwell", "bundled", "torch_version", "user", "want_torch_ptxas"),
-    [
-        (True, (13, 1, 80), (13, 2, 78), False, True),
-        (False, (13, 1, 80), (13, 2, 78), False, False),
-        (True, (13, 3, 33), (13, 2, 78), False, False),  # Triton 3.8
-        (True, (13, 1, 115), (13, 2, 78), False, False),
-        (True, (13, 1, 80), (13, 1, 80), False, False),
-        (True, (13, 1, 80), None, False, False),  # no ptxas in torch
-        (True, None, (13, 2, 78), False, False),
-        (True, (13, 1, 80), (13, 2, 78), True, False),
-    ],
-    ids=["affected", "not blackwell", "triton 3.8", "bundled fixed", "torch's too old", "torch has none",
-         "bundled unknown", "already set"],
+    ("majors", "driver", "bundled", "torch_version", "toolkit_version", "user", "want", "warns"),
+    list(CASES.values()), ids=list(CASES),
 )
-def test_torch_ptxas_only_on_blackwell_with_an_older_triton_ptxas(
-    monkeypatch, blackwell, bundled, torch_version, user, want_torch_ptxas,
+def test_triton_runs_a_fixed_ptxas_on_every_gpu_whose_bundled_one_predates_it(
+    monkeypatch, caplog, majors, driver, bundled, torch_version, toolkit_version, user, want, warns,
 ):
-    versions = {BUNDLED: bundled, TORCH_PTXAS: torch_version, USER_PTXAS: (13, 2, 51)}
-    monkeypatch.setattr(ptxas, "_has_blackwell_gpu", lambda: blackwell)
-    monkeypatch.setattr(ptxas, "_triton_blackwell_ptxas", lambda: BUNDLED)
+    versions = {**bundled, TORCH_PTXAS: torch_version, TOOLKIT_PTXAS: toolkit_version}
+    gpus = NvidiaGpus(frozenset(majors), driver) if majors else None
+    monkeypatch.setattr(ptxas, "_nvidia_gpus", lambda: gpus)
+    bundled_paths = {PTXAS: BUNDLED, BLACKWELL_PTXAS: BUNDLED_BLACKWELL}
+    monkeypatch.setattr(ptxas, "_triton_bundled_ptxas", bundled_paths.get)
+    monkeypatch.setattr(ptxas, "_candidate_ptxas", lambda: [TORCH_PTXAS, TOOLKIT_PTXAS])
+    for tool in (PTXAS, BLACKWELL_PTXAS):
+        monkeypatch.delenv(tool.env, raising=False)
+    if user:
+        env, version = user
+        monkeypatch.setenv(env, USER_PTXAS)
+        versions[USER_PTXAS] = version
     monkeypatch.setattr(ptxas, "ptxas_version", versions.get)
-    if user:
-        monkeypatch.setenv(ptxas.BLACKWELL_PTXAS_ENV, USER_PTXAS)
-    else:
-        monkeypatch.delenv(ptxas.BLACKWELL_PTXAS_ENV, raising=False)
 
-    want = {ptxas.BLACKWELL_PTXAS_ENV: TORCH_PTXAS, TAG: "ptxas-blackwell-13.2.78"} if want_torch_ptxas else {}
-    if user:
-        want = {TAG: "ptxas-blackwell-13.2.51"}  # the tag names the ptxas the user chose
-    defaults = {k: v(None) if callable(v) else v for k, v in CudaPlatform().process_env_defaults().items()}
-    assert {k: v for k, v in defaults.items() if k in (ptxas.BLACKWELL_PTXAS_ENV, TAG)} == want
+    with caplog.at_level(logging.INFO, logger=ptxas.__name__):
+        defaults = {k: v(None) if callable(v) else v for k, v in CudaPlatform().process_env_defaults().items()}
+    assert {k: v for k, v in defaults.items() if k in (PTXAS.env, BLACKWELL_PTXAS.env, TAG)} == want
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert bool(warned) == warns, warned
+    assert all("miscompile" in message for message in warned)
+
+
+def test_nvidia_smi_gives_each_capability_and_the_oldest_driver(monkeypatch, tmp_path):
+    fake = tmp_path / "nvidia-smi"
+    fake.write_text("#!/bin/sh\nprintf '9.0, 575.57.08\\n10.3, 580.95.05\\n'\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert ptxas._nvidia_gpus() == NvidiaGpus(frozenset({9, 10}), 575)
+    fake.write_text("#!/bin/sh\nexit 9\n")  # no driver loaded
+    assert ptxas._nvidia_gpus() is None
 
 
 @pytest.mark.parametrize(
@@ -77,7 +117,7 @@ def test_torch_ptxas_only_on_blackwell_with_an_older_triton_ptxas(
     ],
 )
 def test_the_ptxas_is_appended_once_to_a_tag_the_user_set(current, want):
-    (tag,) = ptxas._cache_tag((13, 2, 78)).values()
+    tag = ptxas._cache_tag("ptxas-blackwell-13.2.78")
     assert tag(current) == want
 
 
@@ -93,13 +133,26 @@ def test_ptxas_version_reads_the_build(tmp_path):
 def ptxas_default(monkeypatch, tmp_path):
     """M*'s process env defaults applied as a worker applies them, with a fresh
     Triton cache so no kernel another ptxas compiled is reused."""
-    for key in (ptxas.BLACKWELL_PTXAS_ENV, TAG):
+    if os.environ.get(PTXAS.env) == TORCH_PTXAS:
+        # Inductor's own pick in a process that compiled before, not a user's choice
+        monkeypatch.delenv(PTXAS.env)
+    for key in (PTXAS.env, BLACKWELL_PTXAS.env, TAG):
         # keep a value already set; otherwise set then delete, so teardown removes it
         monkeypatch.setenv(key, os.environ.get(key, ""))
         if not os.environ[key]:
             monkeypatch.delenv(key)
     platforms.apply_process_env_defaults()
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+
+
+def _ptxas_that_ran() -> str:
+    """Which ptxas Triton runs for this GPU, for a failure message."""
+    from triton.backends.nvidia.compiler import get_ptxas
+
+    major, minor = torch.cuda.get_device_capability()
+    path = get_ptxas(major * 10 + minor).path
+    return (f"Triton ran ptxas {ptxas._version_str(ptxas.ptxas_version(path))} ({path}) for sm_{major}{minor}; "
+            f"ptxas before 13.1.115 miscompiles this, see the warning from {ptxas.__name__}")
 
 
 @triton.jit
@@ -120,7 +173,7 @@ def test_floor_division_under_a_range_select(ptxas_default, xblock, num_warps):
     want = torch.where((x0 >= 1) & (x0 < 60), torch.div(x0 - 1, 3, rounding_mode="floor"), 0).int()
     out = torch.empty(n, device="cuda", dtype=torch.int32)
     _floor_div_under_range_select[(triton.cdiv(n, xblock),)](out, n, XBLOCK=xblock, num_warps=num_warps)
-    assert torch.equal(out, want)
+    assert torch.equal(out, want), _ptxas_that_ran()
 
 
 def _elems_per_thread(config) -> float:
@@ -183,5 +236,5 @@ def test_compiled_interleaved_mrope_matches_eager(ptxas_default, two_elements_pe
     torch._dynamo.reset()
     assert two_elements_per_thread, "no pointwise kernel ran at two elements per thread"
     # rounding differs by up to ~1e-4 at video positions; the miscompile is off by up to 2
-    torch.testing.assert_close(cos_c, cos_e, rtol=0, atol=1e-3)
-    torch.testing.assert_close(sin_c, sin_e, rtol=0, atol=1e-3)
+    for compiled, eager in ((cos_c, cos_e), (sin_c, sin_e)):
+        torch.testing.assert_close(compiled, eager, rtol=0, atol=1e-3, msg=lambda m: f"{m}\n{_ptxas_that_ran()}")

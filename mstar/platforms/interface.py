@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from mstar.platforms.ptxas import blackwell_ptxas_env
+from mstar.platforms.ptxas import ptxas_env
 
 
 class Platform:
@@ -156,7 +156,7 @@ class CudaPlatform(Platform):
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
-        return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
+        return {"NCCL_GRAPH_REGISTER": "0", **ptxas_env()}
 
 
 class RocmPlatform(Platform):
