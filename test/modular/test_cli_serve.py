@@ -65,3 +65,15 @@ def test_the_launcher_hands_mstar_server_the_resolved_host():
     source = inspect.getsource(entrypoint.main)
     assert "args.host = resolve_host(args.host)" in source
     assert "os.environ[SERVER_HOST_ENV] = args.host" in source
+
+
+def test_mstar_serve_hides_the_mooncake_port_it_never_used(capsys):
+    from mstar.api_server import entrypoint
+
+    with pytest.raises(SystemExit):
+        entrypoint.main(["--help"])
+    assert "--mooncake-port" not in capsys.readouterr().out, "the help offers a port nothing reads"
+    # still accepted, so existing commands keep running
+    with pytest.raises(SystemExit):
+        entrypoint.main(["--config", "c.yaml", "--mooncake-port", "9000", "--bogus"])
+    assert "unrecognized arguments: --bogus" in capsys.readouterr().err
