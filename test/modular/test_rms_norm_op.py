@@ -65,7 +65,9 @@ def test_fused_add_rms_norm_compiles_without_a_graph_break():
     pytest.importorskip("flashinfer")
     from mstar.model.components.norm import RMSNorm
 
-    norms = [RMSNorm(64).cuda().to(torch.bfloat16) for _ in range(3)]
+    # frozen, as the engine holds every submodule: the ops have no autograd
+    # formula, and with a weight that requires grad aot_eager traces a backward
+    norms = [RMSNorm(64).cuda().to(torch.bfloat16).requires_grad_(False) for _ in range(3)]
 
     def stream(x):
         h, residual = x, None
