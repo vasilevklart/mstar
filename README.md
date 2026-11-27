@@ -34,7 +34,7 @@ cargo build --release --manifest-path rust/server/Cargo.toml
 mstar serve bagel
 ```
 
-The first start downloads about 30 GB of weights, then compiles the model before the server listens. Measured on 1x H200, 2026-11-27, it took 8.5 to 12 minutes, nearly all of it compilation, and a restart took about 70 seconds ([Cold start](https://m-star-labs.mintlify.site/cold-start)). The `✓ mstar serving` line prints when startup begins; wait for `/health`. In a second terminal with the same `.venv` active:
+The first start downloads about 30 GB of weights, then compiles the model before the server listens. Measured on 1x H200, 2026-11-27, with the weights already downloaded, it took 8.6 minutes, 8 of them compiling, and a restart took 68 seconds ([Cold start](https://m-star-labs.mintlify.site/cold-start)). The `✓ mstar serving` line prints when startup begins; wait for `/health`. In a second terminal with the same `.venv` active:
 
 ```bash
 curl http://localhost:8000/health

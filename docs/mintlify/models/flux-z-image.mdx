@@ -20,7 +20,7 @@ uv pip install --torch-backend=auto -e ".[flux2_klein]"
 mstar serve flux2_klein
 ```
 
-On 1x H200 on 2026-11-27, `flux2_klein` and `z_image_turbo` each served a 256x256 image request ([Verified on H200](/models#verified-on-h200)). Z-Image's start captures 16 denoise graphs at 1024x1024; its first start took 640 s.
+On 1x H200 on 2026-11-27, `flux2_klein` and `z_image_turbo` each served a 256x256 image request ([Verified on H200](/models#verified-on-h200)). `configs/z_image_turbo.yaml` captures 16 denoise graphs at 1024x1024 at startup; there its first start took 640 s, about 6 minutes of it in those captures.
 
 ## Send a request {#request}
 

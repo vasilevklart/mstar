@@ -115,7 +115,7 @@ These keys have no OpenAI adapter, so their `/v1/*` generation routes answer 404
 
 ## Verified on H200 {#verified-on-h200}
 
-On 2026-11-27, each of these default configs started on H200 GPUs and answered one request with a correct output (text checked, audio transcribed, images and video decoded):
+On 2026-11-27, each of these default configs started on 1x or 2x H200 and answered a request with a correct output (text checked, audio transcribed, images and video decoded):
 
 | Config | Key | GPUs | Request |
 |---|---|---|---|
@@ -135,15 +135,15 @@ On 2026-11-27, each of these default configs started on H200 GPUs and answered o
 | `z_image_turbo.yaml` | `z_image_turbo` | 1 | images, 256x256 |
 | `wan22.yaml` | `wan22` | 1 | videos, 256x256, 5 frames |
 | `cosmos3_edge.yaml` | `cosmos3_edge` | 1 | videos, 192x320, 9 frames |
-| `lingbot_world_1_3b.yaml` | `lingbot_world_1_3b` | 1 | `/generate`, 29 streamed `video_frame`s |
+| `lingbot_world_1_3b.yaml` | `lingbot_world_1_3b` | 1 | `/generate`, 29 `video_frame` frames streamed in 2 chunks |
 
-Five more stopped at startup, each on the environment and none on the code:
+Five more stopped at startup because of the environment, not the code:
 
 - `qwen3_tts_1p7b`: `qwen-tts` was not installed, and the error names the command that installs it ([Qwen3-TTS](/models/qwen3-tts#serve)).
 - `omnivoice`: `No module named 'omnivoice'`; the package is a [manual install](/models/omnivoice#serve).
-- `minicpm_o`, `voxcpm2` and `vjepa2` ran offline (`HF_HUB_OFFLINE=1`) from caches that held the safetensors but not `assets/token2wav/flow.pt` and `hift.pt`, `audiovae.pth`, or `original/model.pth`. An online first start downloads these. For an offline host, download the whole repo with `hf download <repo>`.
+- `minicpm_o`, `voxcpm2` and `vjepa2` ran offline (`HF_HUB_OFFLINE=1`) from caches that held the safetensors but not `assets/token2wav/flow.pt` and `hift.pt`, `audiovae.pth`, or `original/model.pth`. An online first start on an empty cache downloads these, but `voxcpm2` skips its download once `model.safetensors` is cached. For an offline host or a partial cache, download the whole repo with `hf download <repo>`.
 
-The other keys were not run that day. Some of them also read other repositories at startup, so an offline host needs those in its cache too: `higgs_audio` (the `openai/whisper-large-v3` feature extractor), `canary_qwen` (the `Qwen/Qwen3-1.7B` tokenizer), `orpheus` (the `canopylabs/orpheus-3b-0.1-pretrained` tokenizer) and `pi05` (the gated `google/paligemma-3b-pt-224` tokenizer), as does `lingbot_world_1_3b` (`Wan-AI/Wan2.2-TI2V-5B-Diffusers` and `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`).
+The other keys were not run that day. Some keys also read other repositories at startup, so an offline host needs those in its cache too: `lingbot_world_1_3b` (`Wan-AI/Wan2.2-TI2V-5B-Diffusers` and `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`), `higgs_audio` (the `openai/whisper-large-v3` feature extractor), `canary_qwen` (the `Qwen/Qwen3-1.7B` tokenizer), `orpheus` (the `canopylabs/orpheus-3b-0.1-pretrained` tokenizer) and `pi05` (the gated `google/paligemma-3b-pt-224` tokenizer).
 
 ## GPU memory {#gpu-memory}
 

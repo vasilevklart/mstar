@@ -32,7 +32,7 @@ mstar serve bagel
 - `--torch-backend=auto` makes uv read the NVIDIA driver's CUDA version, not the toolkit's, and install the torch built for it. Pass it on every install, or `export UV_TORCH_BACKEND=auto`. If your uv rejects the flag, update uv. If the driver is newer than your `nvcc`, see [Match the CUDA toolkit](#cuda-toolkit).
 - `".[bagel]"` installs the core runtime, the `mstar` and `mstar-serve` commands and BAGEL's dependencies. For another model, use its extra from the Extra column of [Supported models](/models#matrix).
 - `maturin develop` builds the `mstar_rust` extension (graph runtime, control mesh, SHM tensor arena) into the virtualenv. `cargo build` builds the `mstar-server` HTTP frontend into `rust/server/target/release/`. The server needs both.
-- `mstar serve bagel` downloads about 30 GB of weights into `$HF_HOME` (default `~/.cache/huggingface`), then compiles the model before it listens. Measured on 1x H200, 2026-11-27: the first start took 8.5 to 12 minutes, nearly all of it compilation and FlashInfer kernel builds, and a restart took about 70 seconds. [Cold start](/cold-start) explains the wait and how to keep the caches.
+- `mstar serve bagel` downloads about 30 GB of weights into `$HF_HOME` (default `~/.cache/huggingface`), then compiles the model before it listens. Measured on 1x H200, 2026-11-27, with the weights already downloaded: the first start took 8.6 minutes, nearly all of it compilation and FlashInfer kernel builds, and a restart took 68 seconds. [Cold start](/cold-start) explains the wait and how to keep the caches.
 
 ## Rust extension and mstar-server {#rust}
 
@@ -112,14 +112,14 @@ FLASH_ATTN_CUDA_ARCHS="90" uv pip install flash-attn==2.8.3.post1 --no-build-iso
 
 ## Match the CUDA toolkit {#cuda-toolkit}
 
-Code that compiles on your machine (flash-attn from source, FlashInfer's JIT kernels, the MoE align kernel) uses the system CUDA toolkit, whose major version must match torch's CUDA. Set `CUDA_HOME` to that toolkit if it is not the default. Compare the two:
+Code that compiles on your machine (flash-attn from source, FlashInfer's JIT kernels, the MoE align kernel) uses the system CUDA toolkit. Set `CUDA_HOME` to that toolkit if it is not the default. Its major version should match torch's CUDA. Compare the two:
 
 ```bash
 python -c "import torch; print(torch.version.cuda)"
 nvcc --version
 ```
 
-A CUDA 13 driver with a CUDA 12 toolkit is common on cloud and NGC images. There `--torch-backend=auto` installs a CUDA 13 torch: on 1x H200 (2026-11-27, driver CUDA 13.0, nvcc 12.9) it picked `cu132`. BAGEL served with it, but builds that go through `torch.utils.cpp_extension` (the MoE align kernel of the MoE models, flash-attn from source) check that the two major versions match and stop. Install the torch for your toolkit instead:
+A CUDA 13 driver with a CUDA 12 toolkit is common on cloud and NGC images. There `--torch-backend=auto` installs a CUDA 13 torch: on 1x H200 (2026-11-27, driver CUDA 13.0, nvcc 12.9) it picked `cu132`. BAGEL served with it, and FlashInfer's JIT built with nvcc 12.9. Builds that go through `torch.utils.cpp_extension` (the MoE align kernel of the MoE models, flash-attn from source) check that the two major versions match and stop. In a new venv, install the torch for your toolkit instead (`cu129` for nvcc 12.9, `cu128` for 12.8; the configs in [Verified on H200](/models#verified-on-h200) ran on torch 2.12.1+cu129):
 
 ```bash
 uv pip install --torch-backend=cu129 -e ".[bagel]"
@@ -178,7 +178,7 @@ python -c "from mstar.api_server.rust_frontend import find_server_binary; print(
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.device_count())"
 ```
 
-The first fails on the PyPI 0.2.1 install, which reports the same version number as a checkout. The second prints the `mstar-server` that `mstar serve` will run, or the error it would stop with. The third should show a CUDA build of torch and enough GPUs for your config (on XPU, use `torch.xpu.device_count()`). Then serve a model and check [`/health`](/quickstart#check-health).
+The first fails on a PyPI 0.2.1 install, so it tells that install from a checkout, which reports the same version number. The second prints the `mstar-server` that `mstar serve` will run, or the error it would stop with. The third should show a CUDA build of torch and enough GPUs for your config (on XPU, use `torch.xpu.device_count()`). Then serve a model and check [`/health`](/quickstart#check-health).
 
 ## Troubleshooting {#troubleshooting}
 

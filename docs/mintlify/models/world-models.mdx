@@ -16,7 +16,7 @@ These models take frames, actions or camera poses and return frames, hidden stat
 | `pi05` | [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base) | `configs/pi05.yaml` | 1 | `pi05` |
 
 - LingBot-World's weights are CC-BY-NC-SA-4.0 (non-commercial); check the license before deploying. Its repo holds only the DiT; the text encoder and tokenizer come from `Wan-AI/Wan2.2-TI2V-5B-Diffusers` and the VAE from `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, so the first start downloads both. On 1x H200 on 2026-11-27, `configs/lingbot_world_1_3b.yaml` streamed 29 `video_frame`s at 832x464 for a 29-pose camera path, in two chunks ([Verified on H200](/models#verified-on-h200)).
-- V-JEPA 2 downloads the whole repo, including `original/model.pth`, which it does not read. Offline, a cache without that file stops startup with `IncompleteSnapshotError` (seen on 1x H200, 2026-11-27).
+- `vjepa2` downloads the whole `facebook/vjepa2-vitl-fpc64-256` repo, including `original/model.pth`, which it does not read. Offline, a cache without that file stops startup with `IncompleteSnapshotError` (seen on 1x H200, 2026-11-27).
 - pi0.5 loads its tokenizer from the gated [google/paligemma-3b-pt-224](https://huggingface.co/google/paligemma-3b-pt-224). Accept its license and `export HF_TOKEN=<your token>`, or the server refuses to start.
 
 ### Waypoint: TAEHV and flash-attn-4 {#waypoint-install}
