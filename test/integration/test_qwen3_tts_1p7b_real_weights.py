@@ -9,6 +9,7 @@ coverage, the Talker-to-predictor projection, and the prefill layouts.
 
 from __future__ import annotations
 
+import importlib.metadata
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +65,10 @@ def _prefill_info(rid: str, metadata: dict) -> SimpleNamespace:
 @pytest.fixture(scope="module", params=sorted(VARIANTS))
 def loaded(request):
     variant = request.param
+    try:  # the codec loads its speech tokenizer from this distribution
+        importlib.metadata.distribution("qwen-tts")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("the Qwen3-TTS codec needs the optional qwen-tts package, which is not installed")
     snapshot = _find_cached_snapshot(VARIANTS[variant])
     if snapshot is None:
         pytest.skip(f"{VARIANTS[variant]} is not in the local Hugging Face cache")
