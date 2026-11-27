@@ -189,8 +189,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
        The ``python -m mstar.model.audio_watermark detect`` CLI also needs ``.[audio]``.
    * - ``.[metrics]``
      - ``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at
-       ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a
-       model's runtime, so not part of ``.[all]``.
+       ``/metrics``, see :ref:`serving-metrics`). Part of ``.[all]``, so the Docker
+       images carry it. Without it, ``--enable-metrics`` stops the server at startup
+       with this install hint.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
    * - ``.[all]``

@@ -97,6 +97,7 @@ audio = [
 ]
 
 # Optional: Prometheus metrics at /metrics (``mstar serve --enable-metrics``).
+# Also in [all], so the Docker images, which install [all], can serve them.
 metrics = [
     "prometheus-client>=0.20",
 ]
@@ -444,6 +445,7 @@ all = [
     "soundfile",
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
+    "prometheus-client>=0.20",  # see the metrics extra; the images install [all]
     "av>=19",
     "diffusers>=0.39",
     "fa3-fwd",

@@ -9,8 +9,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKER_DIR = REPO_ROOT / "mstar/integrations/dynamo/docker"
 DOCKERFILES = [DOCKER_DIR / "Dockerfile", DOCKER_DIR / "Dockerfile.dynamo-base"]
-# extras that are not a model family's runtime
-NOT_MODEL_EXTRAS = {"all", "dev", "audio", "dynamo", "eval", "metrics", "omnivoice"}
+# extras [all] doesn't carry: tools, the Dynamo backend, audio (whose soundfile is in
+# [all] anyway) and omnivoice, which is empty since its package installs from git.
+# The serving features' extras (metrics, vad, audioseal) are in [all] like a model's.
+NOT_MODEL_EXTRAS = {"all", "dev", "audio", "dynamo", "eval", "omnivoice"}
 # model-extra packages [all] leaves out, with the reason
 NOT_IN_ALL = {
     # Intel XPU kernels; [all] targets CUDA
