@@ -75,6 +75,14 @@ class DockerPinTests(unittest.TestCase):
         self.assertGreater(install, build)
         self.assertGreater(step.index("rm -rf /tmp/rustup"), install)
 
+    def test_the_hosts_rust_builds_stay_out_of_the_build_context(self):
+        # COPY . . would put them in a layer the later rm -rf cannot shrink, and cargo
+        # could take a build made against the host's glibc as up to date
+        for path in DOCKERFILES:
+            ignored = path.with_name(f"{path.name}.dockerignore").read_text().splitlines()
+            for target in ("rust/target", "rust/server/target"):
+                self.assertIn(target, ignored, path.name)
+
     def test_asr_pins_the_images_torch_stack(self):
         # torchcodec declares no torch requirement and fails to load next to another torch
         # (0.17 on torch 2.10, 0.10 on torch 2.12), and torchaudio 2.11.0 declares no torch

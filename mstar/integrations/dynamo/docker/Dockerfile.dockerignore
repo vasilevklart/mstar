@@ -4,3 +4,6 @@
 .venv*
 **/__pycache__
 *.egg-info
+# The host's Rust builds: the image compiles rust/ and rust/server/ itself.
+rust/target
+rust/server/target
