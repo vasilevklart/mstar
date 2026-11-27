@@ -111,7 +111,7 @@ uv pip install --torch-backend=auto -e ".[kokoro]"
 mstar serve kokoro
 ```
 
-[Supported models](/models#matrix) lists all 61 keys. Some weights are gated on Hugging Face, for example the PaliGemma tokenizer that `pi05` loads and the `ltx2_5` checkpoint. Accept the license on the model page, then `export HF_TOKEN=<your token>` before `mstar serve`. A token also avoids Hugging Face's lower rate limit for unauthenticated downloads, which the server warns about at startup.
+[Supported models](/models#matrix) lists all 61 keys. Some weights are gated on Hugging Face: the `orpheus`, `flux2_klein_9b` and `ltx2_5` checkpoints and the PaliGemma tokenizer that `pi05` loads. Accept the license on the model page, then `export HF_TOKEN=<your token>` before `mstar serve`. A token also avoids Hugging Face's lower rate limit for unauthenticated downloads, which the server warns about at startup.
 
 ## GPUs, port and API key {#options}
 

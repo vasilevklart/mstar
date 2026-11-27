@@ -13,7 +13,7 @@ FLUX.2 [klein] is a step-distilled rectified-flow model for text-to-image and mu
 | `flux2_klein_9b` | [black-forest-labs/FLUX.2-klein-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) | `configs/flux2_klein_9b.yaml` | 1 | `flux2_klein` |
 | `z_image_turbo` | [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | `configs/z_image_turbo.yaml` | 1 | `all` |
 
-The 4B and Z-Image weights are Apache-2.0. The 9B weights are under the FLUX Non-Commercial License; check it before deploying.
+The 4B and Z-Image weights are Apache-2.0. The 9B weights are under the FLUX Non-Commercial License; check it before deploying. Their repo is gated on Hugging Face: accept the license on the model page, then `export HF_TOKEN=<your token>` before the first start.
 
 ```bash
 uv pip install --torch-backend=auto -e ".[flux2_klein]"

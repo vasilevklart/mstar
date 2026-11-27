@@ -18,6 +18,8 @@ mstar serve orpheus
 
 The tokenizer always comes from `canopylabs/orpheus-3b-0.1-pretrained`, which the first start also downloads, even when `model_kwargs: {model_path_hf: ...}` names another checkpoint.
 
+Both `canopylabs` repos are gated on Hugging Face. Accept the license on each model page, then `export HF_TOKEN=<your token>` before the first start; without it the download is refused.
+
 ## Send a request {#request}
 
 ```python
