@@ -45,8 +45,6 @@ class CurrentForwardPassInfo:
     # resource label -> PublishedInfo
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
 
-    # per_label_seq_info DEPRECATED
-    # per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default=DEFAULT_PARTITION)
 
     # Per-loop stop indices are worker-only, so they live on the graph runtime

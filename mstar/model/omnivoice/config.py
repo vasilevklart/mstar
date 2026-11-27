@@ -115,9 +115,6 @@ class OmniVoiceConfig:
     # and the q/k dtype have to agree.
     load_dtype: str = "float16"
 
-    # Set by _refresh_checkpoint_defaults; None until weights load.
-    checkpoint_dtype: str | None = None
-
     # Replay the backbone's layer stack from CUDA graphs, one per (requests,
     # packed-token bucket), with attention through the engine's ragged
     # resource. Eager, a step is launch-bound: ~400 kernels for ~2 ms of GPU
