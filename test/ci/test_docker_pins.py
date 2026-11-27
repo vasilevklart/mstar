@@ -61,6 +61,20 @@ class DockerPinTests(unittest.TestCase):
             self.assertIsNotNone(pin, f"{path.name}: no setuptools floor in the .[all] install")
             self.assertGreaterEqual(version(pin.group(1)), build_floor, path.name)
 
+    def test_the_serve_stage_builds_mstar_server_onto_path(self):
+        # mstar serve's default frontend; without it the image serves only with --python-frontend
+        text = DOCKERFILES[0].read_text().replace("\\\n", " ")
+        serve = text[text.index("FROM ${CUDA_IMAGE} AS serve"):text.index("FROM serve AS dynamo")]
+        rust = re.search(r"^RUN [^\n]*rustup toolchain install[^\n]*$", serve, re.MULTILINE)
+        self.assertIsNotNone(rust, "no Rust build step in the serve stage")
+        step = rust.group(0)
+        # in the step that has the pinned toolchain, which it deletes at its end
+        build = step.find("cargo build --release --locked --manifest-path rust/server/Cargo.toml")
+        install = step.find("install -m 755 rust/server/target/release/mstar-server /usr/local/bin/mstar-server")
+        self.assertGreater(build, step.index("rustup default"))
+        self.assertGreater(install, build)
+        self.assertGreater(step.index("rm -rf /tmp/rustup"), install)
+
     def test_asr_pins_the_images_torch_stack(self):
         # torchcodec declares no torch requirement and fails to load next to another torch
         # (0.17 on torch 2.10, 0.10 on torch 2.12), and torchaudio 2.11.0 declares no torch

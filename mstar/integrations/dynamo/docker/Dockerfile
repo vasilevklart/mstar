@@ -95,16 +95,19 @@ RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all]" \
 # transformers==4.57.3 pin out of the environment (docs/installation.rst).
 RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps "qwen-tts==0.1.1"
 
-# The graph runtime is Rust, and an editable install does not compile it. The
-# toolchain rust-toolchain.toml pins goes away again once the extension is in
-# the venv.
+# The graph runtime and mstar-server, mstar serve's HTTP frontend, are Rust,
+# and an editable install compiles neither. mstar-server goes on PATH, where
+# find_server_binary looks, as in docker/Dockerfile.xpu. The toolchain
+# rust-toolchain.toml pins goes away again once both are built.
 RUN export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo PATH=/tmp/cargo/bin:$PATH \
     && curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
     && rustup toolchain install \
     && rustup default "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
     && uv pip install --python /opt/mstar/venv/bin/python ./rust \
-    && rm -rf /tmp/rustup /tmp/cargo rust/target
+    && cargo build --release --locked --manifest-path rust/server/Cargo.toml \
+    && install -m 755 rust/server/target/release/mstar-server /usr/local/bin/mstar-server \
+    && rm -rf /tmp/rustup /tmp/cargo rust/target rust/server/target
 
 # Mooncake's default wheel is built for CUDA 12 (it links libcudart.so.12), so
 # a CUDA 13 image swaps it for the -cuda13 build of the version the extras
