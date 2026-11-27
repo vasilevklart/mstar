@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from mstar.kernels import DeviceKey, registry, table
+from mstar.platforms import current_platform
 from mstar.utils.fused_moe import kernels
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="fused MoE requires CUDA")
@@ -193,18 +194,46 @@ def test_compiled_fused_experts_is_one_graph():
     assert explain.graph_count == 1
 
 
+# Launch options only Triton's HIP backend takes: a CUDA launch raises on them
+# ("Keyword argument ... was specified but unrecognised").
+HIP_LAUNCH_OPTIONS = frozenset({"waves_per_eu", "matrix_instr_nonkdim", "kpack"})
+
+
+def _tuned_on_amd(path) -> bool:
+    """Whether a shipped table is for AMD GPUs: named for one (``AMD_Instinct_MI300X``) or for
+    its architecture (``gfx942``)."""
+    return path.stem.startswith(("AMD_", "gfx"))
+
+
 def _shipped_entries():
     for path in sorted((table.TABLE_DIR / "moe_gemm").glob("*.json")):
+        # A GPU only ever reads the tables named for it, so each table traces on its own
+        # vendor's GPUs: an AMD row's HIP options would fail the CUDA launch, and an NVIDIA row
+        # may not fit an AMD GPU's shared memory.
+        own_vendor = pytest.mark.skipif(
+            _tuned_on_amd(path) != current_platform.is_rocm(),
+            reason=f"{path.stem} is tuned for {'AMD' if _tuned_on_amd(path) else 'NVIDIA'} GPUs")
         for i, _ in enumerate(json.loads(path.read_text())["entries"]):
-            yield pytest.param(path, i, id=f"{path.stem}-{i}")
+            yield pytest.param(path, i, id=f"{path.stem}-{i}", marks=own_vendor)
+
+
+@pytest.mark.parametrize("path", sorted((table.TABLE_DIR / "moe_gemm").glob("*.json")), ids=lambda p: p.stem)
+def test_only_amd_tables_carry_hip_launch_options(path):
+    """HIP options appear in AMD tables only, so every NVIDIA table's rows reach a CUDA launch
+    the CUDA backend accepts. A CPU check of what the trace test below would hit on a GPU."""
+    for entry in json.loads(path.read_text())["entries"]:
+        for key, row in entry["rows"].items():
+            config = row.get("config") or {}
+            options = HIP_LAUNCH_OPTIONS & {*config, *config.get("down", {})}
+            assert not options or _tuned_on_amd(path), f"{path.stem} row {key}: {sorted(options)}"
 
 
 @CUDA
 @pytest.mark.parametrize(("path", "index"), list(_shipped_entries()))
 def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(path, index, monkeypatch):
     """An uncaptured step compiles the forward with dynamic=None, so the batch turns symbolic
-    from its second size, and every row of a shipped table must trace that way, its launch
-    options included. The lookup's keys must stay static: under dynamic=True top_k (read off
+    from its second size, and every row of a shipped table must trace that way on the GPUs it is
+    for, its launch options included. The lookup's keys must stay static: under dynamic=True top_k (read off
     topk_ids) is symbolic and the lookup breaks the graph."""
     from mstar.utils.fused_moe import fused_experts
 
