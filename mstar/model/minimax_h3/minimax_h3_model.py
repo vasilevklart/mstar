@@ -187,10 +187,10 @@ DIT_KERNEL_SETTINGS = {
 
 
 def vae_shard_spec(label: str) -> SeqShardSpec:
-    """The VAE decoder's sequence shard, which splits each request's ``label`` units (H3's clips, H3-Image's tiles),
-    which nothing exchanges (``exchanges=False``); every request of a decoder batch is one layout, so one count
-    (``axis`` 1). The decoder has no arrays, so its shard is written by hand, not a `SeqShard`, and only here: the
-    MiniMax-H3 family's models share it."""
+    """A VAE decoder's sequence shard, which splits each request's ``label`` units (H3's clips, H3-Image's tiles).
+    Nothing exchanges them (``exchanges=False``), and every request of a decoder batch is one layout, so one count
+    (``axis`` 1). The decoder has no arrays, so its shard is written by hand, not a `SeqShard`, and only here, for
+    both of the MiniMax-H3 family's models."""
     return SeqShardSpec(resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(label,), axis=1, exchanges=False)
 
 
@@ -272,9 +272,7 @@ class H3Model(Model):
         return {key: dict(settings) for key, settings in DIT_KERNEL_SETTINGS.items()}
 
     def get_node_resources(self) -> list[SeqShardSpec]:
-        """The video decoder's sequence shard, which splits each request's clips, which nothing exchanges
-        (``exchanges=False``); every request of a decoder batch is one layout, so one clip count (``axis`` 1). The
-        decoder has no arrays, so its shard is written by hand, not a `SeqShard` (`vae_shard_spec`)."""
+        """The video decoder's sequence shard over each request's clips, written by hand (`vae_shard_spec`)."""
         return [vae_shard_spec(H3VideoDecoderSubmodule.CLIPS)]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
