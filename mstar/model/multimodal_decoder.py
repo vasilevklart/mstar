@@ -486,14 +486,51 @@ class MultimodalDecoderModel(Model):
         raise NotImplementedError
 
     @staticmethod
-    def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
+    def _build(make, dtype: torch.dtype, device: str, params_on_meta: bool = False) -> torch.nn.Module:
         """Construct under `dtype` so no fp32 copy of the weights is
-        allocated. fp32-only parameters restore themselves in `_apply`."""
+        allocated. fp32-only parameters restore themselves in `_apply`.
+
+        ``params_on_meta`` makes every parameter on meta, so its random init
+        costs nothing, and then gives it uninitialized storage on ``device``:
+        only for a model whose loader fills every parameter and raises on one
+        it misses (Qwen3.5's does), since nothing else writes them. Buffers are
+        built on the CPU as before (a RoPE table computed on the device differs
+        in the last bit) and moved. Tied parameters stay tied, and attributes
+        such as ``weight_loader`` are kept. Building on the CPU and copying over
+        took 13.4 s of a Qwen3.5-9B start on an H200. It patches
+        ``nn.Module.register_parameter`` while ``make`` runs, which is safe
+        because a worker builds its nodes one after another."""
         torch.set_default_dtype(dtype)
+        register = torch.nn.Module.register_parameter
+
+        def on_meta(module, name, param):
+            register(module, name, param)
+            p = module._parameters.get(name)
+            if p is not None and p.device.type != "meta":
+                meta = type(p)(p.to("meta"), requires_grad=p.requires_grad)
+                meta.__dict__.update(p.__dict__)
+                module._parameters[name] = meta
+
+        if params_on_meta:
+            torch.nn.Module.register_parameter = on_meta
         try:
-            return make().to(device)
+            model = make()
         finally:
+            torch.nn.Module.register_parameter = register
             torch.set_default_dtype(torch.float32)
+        if params_on_meta:
+            # by the meta parameter, so ties stay tied; it is held so no id is reused
+            made: dict[int, tuple[torch.nn.Parameter, torch.nn.Parameter]] = {}
+            for module in model.modules():
+                for name, p in list(module._parameters.items()):
+                    if p is None:
+                        continue
+                    if id(p) not in made:
+                        q = type(p)(torch.empty_like(p, device=device), requires_grad=p.requires_grad)
+                        q.__dict__.update(p.__dict__)
+                        made[id(p)] = (p, q)
+                    module._parameters[name] = made[id(p)][1]
+        return model.to(device)
 
 
 class DeclaredDecoderModel(MultimodalDecoderModel):
