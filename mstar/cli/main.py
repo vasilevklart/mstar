@@ -257,7 +257,10 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
 
 
 def _serve(args: argparse.Namespace) -> None:
+    from mstar.api_server.auth import resolve_api_key, resolve_host
+
     config = _resolve_config(args.model, args.config)
+    host = resolve_host(args.host)
     if args.gpus is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     if args.compile_level is not None:
@@ -269,7 +272,7 @@ def _serve(args: argparse.Namespace) -> None:
 
     argv = [
         "--config", config,
-        "--host", args.host,
+        "--host", host,
         "--port", str(args.port),
         "--socket-path-prefix", socket_prefix,
         "--upload-dir", upload_dir,
@@ -300,9 +303,7 @@ def _serve(args: argparse.Namespace) -> None:
     if args.rust_frontend_bin:
         argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
-    from mstar.api_server.auth import resolve_api_key
-
-    print(_next_steps(args.model, args.host, args.port,
+    print(_next_steps(args.model, host, args.port,
                       api_key_set=resolve_api_key(args.api_key) is not None), file=sys.stderr)
 
     from mstar.api_server.entrypoint import main as serve_main
@@ -316,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser("serve", help="launch a server for a model (one command)")
     serve.add_argument("model", help=f"model name ({', '.join(sorted(DEFAULT_CONFIGS))}) or use --config")
-    serve.add_argument("--host", default="0.0.0.0")
+    serve.add_argument("--host", default=None, help="address to listen on (default: MSTAR_SERVER_HOST, else 0.0.0.0)")
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument(
         "--api-key", default=None,

@@ -24,6 +24,8 @@ from collections.abc import Callable
 logger = logging.getLogger(__name__)
 
 API_KEY_ENV = "MSTAR_API_KEY"
+# the address mstar-server binds; the launcher sets it from --host
+SERVER_HOST_ENV = "MSTAR_SERVER_HOST"
 
 #: Served without a key: liveness probes from load balancers and orchestrators,
 #: and the Prometheus scrape endpoint (request counts, latencies and the model
@@ -48,6 +50,12 @@ def resolve_api_key(flag: str | None = None) -> str | None:
     An empty value means no key."""
     key = flag if flag is not None else os.environ.get(API_KEY_ENV)
     return key or None
+
+
+def resolve_host(flag: str | None = None) -> str:
+    """The address to listen on: ``--host`` if given, else ``MSTAR_SERVER_HOST``,
+    else every interface."""
+    return flag or os.environ.get(SERVER_HOST_ENV) or "0.0.0.0"
 
 
 def keep_api_key_from_children(api_key: str | None) -> None:

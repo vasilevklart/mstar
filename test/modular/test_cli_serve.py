@@ -45,3 +45,23 @@ def test_serve_passes_its_flags_to_the_server(launched, flags):
 def test_serve_leaves_the_server_defaults_alone(launched):
     cli._serve(cli.build_parser().parse_args(["serve", "kokoro"]))
     assert not {"--enable-nvtx", "--timeout", "--tcp-transfer-device"} & set(launched[0])
+
+
+def test_an_explicit_host_beats_an_inherited_one(launched, monkeypatch):
+    monkeypatch.setenv("MSTAR_SERVER_HOST", "10.0.0.5")
+    cli._serve(cli.build_parser().parse_args(["serve", "kokoro", "--host", "127.0.0.1"]))
+    cli._serve(cli.build_parser().parse_args(["serve", "kokoro"]))
+    monkeypatch.delenv("MSTAR_SERVER_HOST")
+    cli._serve(cli.build_parser().parse_args(["serve", "kokoro"]))
+    assert [argv[argv.index("--host") + 1] for argv in launched] == ["127.0.0.1", "10.0.0.5", "0.0.0.0"]
+
+
+def test_the_launcher_hands_mstar_server_the_resolved_host():
+    """mstar-server binds MSTAR_SERVER_HOST; a ``setdefault`` there let an inherited value beat ``--host``."""
+    import inspect
+
+    from mstar.api_server import entrypoint
+
+    source = inspect.getsource(entrypoint.main)
+    assert "args.host = resolve_host(args.host)" in source
+    assert "os.environ[SERVER_HOST_ENV] = args.host" in source
