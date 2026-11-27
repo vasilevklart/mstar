@@ -22,7 +22,6 @@ from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec
@@ -35,9 +34,8 @@ from mstar.engine.state.host_fields import HostFields
 from mstar.model.base import enabled_resources
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
-from mstar.model.components.code_predictor_kernels import DepthKV
 from mstar.model.components.norm import RMSNorm
-from mstar.model.qwen3_omni.components.attention import _norm_rotate_add
+from mstar.model.qwen3_omni.components.attention import _norm_rotate_attend
 from mstar.model.qwen3_omni.config import (
     AUDIO_ATTN,
     AUDIO_TOKENS,
@@ -150,8 +148,8 @@ def test_specs_equal_the_hand_written_ones_after_yaml_overrides():
     _assert_specs_equal(specs, reference)
 
 
-def test_the_port_writes_only_lora_by_hand():
-    assert {spec.resource_key for spec in _model().get_node_resources()} == {LORA_RESOURCE_KEY}
+def test_the_port_writes_no_spec_by_hand():
+    assert _model().get_node_resources() == []
 
 
 def test_the_value_of_host_fields_is_on_a_node_with_no_prefix_keys():
@@ -320,7 +318,7 @@ def test_an_audio_encoder_step_equals_the_hand_written_one():
     sub = AudioEncoderSubmodule.__new__(AudioEncoderSubmodule)
     torch.nn.Module.__init__(sub)
     handles = _handles(model, "audio_encoder")
-    sub.__dict__.update(encoder=encoder, attn_key=None, array=AUDIO_TOKENS, state_handles=handles)
+    sub.__dict__.update(encoder=encoder, array=AUDIO_TOKENS, state_handles=handles)
     tokens = 2 * model.config.audio_encoder.window_tokens + 1
     declared = sub.declare_step("prefill_audio", [1], [NodeInputs(input_seq_len=tokens)])
     step = state_steps(declared, sub.state_handles)
@@ -469,8 +467,13 @@ def test_the_reference_equals_the_unfused_norm_and_rotation():
     norm = RMSNorm(8)
     torch.nn.init.normal_(norm.weight)
     cos, sin = torch.randn(5, 8), torch.randn(5, 8)
-    added = {}
-    kv = SimpleNamespace(add=lambda layer, k, v: added.update(layer=layer, k=k, v=v))
+    calls = []
+
+    def read(layer, q):
+        calls.append(("read", layer, q.clone()))
+        return q * 2
+
+    kv = SimpleNamespace(add=lambda layer, k, v: calls.append(("add", layer, k, v)), read=read)
 
     def rotate(x):
         half = x.shape[-1] // 2
@@ -479,27 +482,16 @@ def test_the_reference_equals_the_unfused_norm_and_rotation():
 
     want_q, want_k = rotate(q), rotate(k)
     k_before, v_before = k.clone(), v
-    _norm_rotate_add(kv, 2, q, k, v, norm.weight, norm.weight, cos, sin, norm.variance_epsilon, norm.variance_epsilon)
+    out = _norm_rotate_attend(
+        kv, 2, q, k, v, norm.weight, norm.weight, cos, sin, norm.variance_epsilon, norm.variance_epsilon,
+    )
+    assert [call[0] for call in calls] == ["add", "read"], "the read comes after the add"
+    (_, layer, added_k, added_v), (_, read_layer, read_q) = calls
     assert torch.equal(q, want_q), "the fused op mutates q, so its reference does too"
-    assert torch.equal(added["k"], want_k) and added["v"] is v_before and added["layer"] == 2
+    assert torch.equal(added_k, want_k) and added_v is v_before and layer == 2
     assert torch.equal(k, k_before), "the fused op leaves k as it was"
-
-
-# Scratch at load
-
-
-def test_the_depth_scratch_can_be_made_at_load_and_a_step_reuses_it():
-    depth = DepthKV((2, 4, 2, 8, 2, 16))
-    depth.make(torch.bfloat16, "cpu")
-    cache, partials = depth.kv_cache, depth.partials
-    assert cache.dtype is torch.bfloat16 and cache.shape == (2, 4, 2, 8, 2, 16)
-    assert depth.scratch(torch.zeros(1, dtype=torch.float32)) is partials and depth.kv_cache is cache
-
-
-def test_a_depth_scratch_nothing_made_at_load_still_comes_at_the_first_step():
-    depth = DepthKV((2, 4, 2, 8, 2, 16))
-    depth.scratch(torch.zeros(1, dtype=torch.float16))
-    assert depth.kv_cache.dtype is torch.float16, "Qwen3-TTS still makes its buffers at the first step"
+    assert read_layer == 2 and torch.equal(read_q, want_q), "the read takes the rotated q"
+    assert torch.equal(out, want_q * 2), "the reference returns what the read returns"
 
 
 def test_the_declarations_have_no_problems_on_the_real_walks(monkeypatch):

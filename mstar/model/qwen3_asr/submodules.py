@@ -18,13 +18,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, KVStep
-from mstar.engine.resources.step import ResourceStep
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.qwen3_asr.config import ATTN, AUT_ATTN, KV_CACHE, Qwen3ASRModelConfig
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
+from mstar.model.qwen3_asr.config import AUT_TOKENS, Qwen3ASRModelConfig
 from mstar.model.submodule_base import NodeInputs
 
 logger = logging.getLogger(__name__)
@@ -43,7 +41,7 @@ class Qwen3ASREncoderSubmodule(AuTEncoderSubmodule):
     """
 
     def __init__(self, encoder: AuTEncoder, config: Qwen3ASRModelConfig):
-        super().__init__(encoder, attn_key=AUT_ATTN)
+        super().__init__(encoder, array=AUT_TOKENS)
         self.config = config
         # built here, after the encoder was materialized, so its filter bank
         # and window are real tensors on the encoder's device
@@ -78,11 +76,10 @@ class Qwen3ASREncoderSubmodule(AuTEncoderSubmodule):
 # ===================================================================
 
 
-class Qwen3ASRLLMSubmodule(SampledTokenDecoder):
+class Qwen3ASRLLMSubmodule(DeclaredTokenDecoder):
     """Dense Qwen3 decoder. Prefill is captured on packed token buckets, decode
     on batch size."""
 
-    ATTN_KEY = ATTN
     # the ladders it captured before moving onto the scaffold
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     PREFILL_MEDIA_TOKEN_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
@@ -95,6 +92,3 @@ class Qwen3ASRLLMSubmodule(SampledTokenDecoder):
         # a captured prefill is capped by its largest capture, an eager one not
         # at all, as before the scaffold
         return None
-
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

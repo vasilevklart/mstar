@@ -11,6 +11,7 @@ import torch
 
 from mstar.engine.resources.attn.config import SP_EXCHANGES
 from mstar.engine.resources.kv.config import Span
+from mstar.engine.resources.position.config import LongRoPE
 from mstar.engine.resources.step import Segment
 
 
@@ -53,7 +54,7 @@ def _is_host_type(kind) -> bool:
 
 @dataclass(frozen=True)
 class TensorType:
-    shape: tuple[int, ...]       # global, before sharding
+    shape: tuple[int, ...]       # global, before sharding; () is one scalar per entry
     _: KW_ONLY
     dtype: torch.dtype | None    # math dtype, None is the engine's compute dtype
     shard: int | None = None     # axis split across TP ranks, None is replicated
@@ -79,15 +80,27 @@ def KVEntry(*, heads: int, head_dim: int) -> Entry:
 class Mask:
     """Which entries a read at log position q sees. An entry's index is its log position."""
 
+    # whether what a read sees depends on its query's log position, which another array's queries don't carry here
+    uses_query_position: ClassVar[bool]
+    # whether a read sees a row's adds of each step as a whole, so splitting them across steps changes what it sees
+    sees_step_whole: ClassVar[bool]
+
 
 @dataclass(frozen=True)
 class Causal(Mask):
     """Sees {k : k <= q}."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 @dataclass(frozen=True)
 class Window(Mask):
-    """Sees {k : q - size < k <= q}."""
+    """Sees {k : q - size < k <= q}. A read through `Attend` may pass ``distance_bias``, (rows, q_heads, T, size), whose
+    entry d is added to the score of the key at distance d before the op's scale."""
+
+    uses_query_position = True
+    sees_step_whole = False
 
     size: int
 
@@ -95,6 +108,20 @@ class Window(Mask):
 @dataclass(frozen=True)
 class Block(Mask):
     """Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""
+
+    uses_query_position = False
+    sees_step_whole = True
+
+
+@dataclass(frozen=True)
+class Bidirectional(Mask):
+    """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
+    row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
+    segment, on this array's label. It uses no query position. On an array that keeps entries; ``Block`` is the
+    within-step form."""
+
+    uses_query_position = False
+    sees_step_whole = True
 
 
 class Op:
@@ -156,6 +183,24 @@ class GatedDeltaNet(Op):
 
 
 @dataclass(frozen=True, kw_only=True)
+class Mamba2(Op):
+    """Mamba-2's SSD recurrence over each row's ``ssm`` state, (heads, head_dim, state_size), updated in place. Its
+    conv is a separate `CausalConv` update on the same Value."""
+
+    reads = ("ssm",)
+    writes = ("ssm",)
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))    # dt's clamp after softplus, HF's time_step_limit
+
+    def check(self, where: str, entry: Entry) -> None:
+        if len(entry.tensors["ssm"].shape) != 3:
+            raise ValueError(f"{where}: Mamba2 needs entry field ssm of shape (heads, head_dim, state_size)")
+        limit = self.time_step_limit
+        if not (type(limit) is tuple and len(limit) == 2 and all(type(t) in (int, float) for t in limit)
+                and 0.0 <= limit[0] < limit[1]):
+            raise ValueError(f"{where}.time_step_limit must be a tuple (low, high) with 0 <= low < high, got {limit!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
 class Read:
     """A view of the entries a row has kept. ``mask`` says which entries each query can still reach, so the engine
     can free the rest and tell when two requests can share a prefix. A read leaves the entries as they were."""
@@ -165,12 +210,17 @@ class Read:
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
     queries: str | None = None              # the array whose segments lay out the queries; None: this array
-    packed: bool = True                     # queries may come as (tokens, heads, head_dim); False: only as rows
+    # queries may come as (tokens, heads, head_dim). False: only as (rows, T, heads, head_dim), each row's span first
+    # and the rest of its T padding.
+    packed: bool = True
     segmented: bool = False                 # a request's segments lie end to end in one row
 
     def __post_init__(self):
         if not isinstance(self.mask, Mask):
             raise ValueError(f"Read.mask must be a Mask, got {self.mask!r}")
+        unset = [name for name in Mask.__annotations__ if not hasattr(type(self.mask), name)]
+        if unset:
+            raise ValueError(f"Read.mask: {type(self.mask).__name__} leaves {unset} unset, which every mask declares")
         if not (self.op is None or isinstance(self.op, Op)):
             raise ValueError(f"Read.op must be None or an Op, got {self.op!r}")
         if self.op is not None and (self.op.writes or self.op.adds):
@@ -197,6 +247,21 @@ class Rope:
     old_context_len: int | None = None
     dtype: torch.dtype | None = None           # None: q's
     table_dtype: torch.dtype | None = None     # None: angles in the kernel
+    longrope: LongRoPE | None = None           # None: one table for every request
+
+    def __post_init__(self):
+        llama31 = (self.low_freq_factor, self.high_freq_factor, self.old_context_len)
+        if self.longrope is not None and (self.scale != 1.0 or any(f is not None for f in llama31)):
+            raise ValueError(
+                f"Rope.longrope divides the frequencies by its own factors, so it takes scale 1.0 and no Llama 3.1 "
+                f"factors, and got scale={self.scale}, (low_freq_factor, high_freq_factor, old_context_len)={llama31}"
+            )
+        factors = None if self.longrope is None else len(self.longrope.short_factor)
+        if factors is not None and self.rotary_dim is not None and factors != self.rotary_dim // 2:
+            raise ValueError(
+                f"Rope.longrope needs {self.rotary_dim // 2} factors per set for rotary_dim {self.rotary_dim}, "
+                f"and got {factors}"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -217,6 +282,7 @@ class Array:
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
     With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
+    With ``max_len`` None the log has no bound, and the engine keeps what the reads can still reach.
     """
 
     name: str
@@ -224,7 +290,7 @@ class Array:
     nodes: frozenset[str]
     layers: frozenset[int]
     entry: Entry
-    max_len: int
+    max_len: int | None
     reads: Mapping[str, Read] = EMPTY    # empty: read whole
     updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
@@ -246,8 +312,8 @@ class Array:
             raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
         if not self.labels:
             raise ValueError(f"{where}.labels must be non-empty")
-        if not (type(self.max_len) is int and self.max_len >= 0):
-            raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if not (self.max_len is None or type(self.max_len) is int and self.max_len >= 0):
+            raise ValueError(f"{where}.max_len must be None or an int >= 0, got {self.max_len!r}")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
@@ -259,10 +325,10 @@ class Array:
         least = 1 if self.layers or self.reads else 0
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
-            if not (isinstance(tensor.shape, tuple) and tensor.shape and all(
+            if not (isinstance(tensor.shape, tuple) and all(
                 type(axis) is int and axis >= least for axis in tensor.shape
             )):
-                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {tensor.shape!r}")
+                raise ValueError(f"{where}.shape must be a tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
         if self.entry.host and not is_value(self):
@@ -283,9 +349,14 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
-        if read.queries is not None and not isinstance(read.mask, Block):
+        if read.queries is not None and read.mask.uses_query_position:
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
                              f"position, and {type(read.mask).__name__} does")
+        if read.queries is not None and read.op is None:
+            raise ValueError(f"{where}.queries: a read with no op lays out no queries")
+        if read.queries == self.name:
+            raise ValueError(f"{where}.queries names this array, and a read without queries lays out its own queries; "
+                             "leave it None")
         if read.op is not None:
             self._check_op(f"{where}.op", read.op)
 
@@ -330,7 +401,7 @@ class Sampler:
     penalty: bool = True
     min_p: bool = False
     eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
-    draws: int = 1                   # calls to sample in each step that lists it
+    draws: int = 1                   # draws in each step that lists it
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -443,6 +514,7 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+    max_growth: int | None = None               # most entries the growth reserves; None: the loops' caps
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -467,8 +539,11 @@ class PagedNHDTarget(NamedTuple):
     count: int    # tokens to write
 
 
-class Reached(NamedTuple):
-    """What a read with no op returns: each field's reached entries packed by row, and where each row starts."""
+@dataclass(frozen=True)
+class Reached:
+    """What a read with no op returns, tensors the caller owns: writing them changes no state. Each field's reached
+    entries packed by row, and where each row starts. A Value's row r holds its one entry at index r."""
 
-    fields: Mapping[str, torch.Tensor]
-    row_offsets: torch.Tensor
+    fields: Mapping[str, torch.Tensor]    # field -> (entries, *shape on this rank), in the field's declared dtype
+    _: KW_ONLY
+    row_offsets: torch.Tensor             # (rows + 1,) int32 on the device

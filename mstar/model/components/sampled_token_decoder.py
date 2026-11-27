@@ -9,7 +9,8 @@ the sampler and the position resource, the forward through the sampler, and
 the stop: a `TokenStop` over its prefill and decode walks (a stop id; a
 stop, or a one-token budget, on the step the walk plan marks `FINAL_PREFILL`
 ends the partition, and the model's loop cap is the decode budget). A model subclasses it with its resource steps
-and its attention key, and an MRoPE model adds its own positions.
+and its attention key, or subclasses `DeclaredTokenDecoder` on the state contract, and an MRoPE model adds its own
+positions.
 
 A media walk's row is the whole prompt's ids, each attachment expanded to
 one pad per token at intake (`expand_media_pads`). Its encoders' outputs
@@ -44,8 +45,8 @@ The decoder module (``self.model``, e.g. ``Qwen3DenseLM``) provides:
 
 and ``config`` has ``hidden_size`` and ``stop_token_ids`` (and the model's
 ``max_position_embeddings`` bounds the decode loop, see `media_walks`).
-The node's sampler is declared under ``mstar.model.keys``' ``SAMPLER`` key and
-its positions under ``POS_KEY`` (``ROPE`` by default).
+The node's sampler is declared under ``mstar.model.keys``' ``SAMPLER`` key and,
+on resources, its positions under ``POS_KEY`` (``ROPE`` by default).
 """
 
 import functools
@@ -68,8 +69,9 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
+from mstar.engine.state import ArrayStep, SampleStep, at_last_token, last_sampled, position, sample
 from mstar.model.components.token_step import TokenStepNode
-from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_rows, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -79,6 +81,7 @@ from mstar.model.submodule_base import (
     InputSeqLenInfo,
     ModelInputsFromEngine,
     TokenStop,
+    splice_loopback_ids,
 )
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
@@ -189,8 +192,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         """Decode reads its token off the sampler and its rows' positions off the
         position resource (`preprocess`), so a walk asked to repeat may run on
         resident tables and loop its token back, even where the node's own path
-        doesn't: Canary keeps main's routed token, a measured choice of its own,
-        unless a deployment asks."""
+        doesn't: Canary-Qwen keeps the routed token, a measured choice of its
+        own, unless a deployment asks."""
         super().enable_repeats(walks)
         if self.DECODE_WALK in self._repeat_walks and self.device_loopback is None:
             self.device_loopback = self._decode_loopback()
@@ -499,34 +502,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         loop-back decode row."""
         return any(inp.input_ids is None for inp in inputs)
 
-    @staticmethod
-    def _splice_row_ids(
-        ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool,
-    ) -> torch.Tensor:
-        """``ids`` (one loop-back token per row) with each row that brought
-        its own ids taking them instead, in row order: a mixed step's prompt
-        rows, or a decode row whose last step ran elsewhere. Runs of loop-back
-        rows go in as one slice each, and the splice is device ops only: an
-        index built from a host list would be a synchronous copy behind the
-        step in flight. A decode step keeps the slot's padding rows past
-        ``inputs``, so its length stays the captured one."""
-        pieces: list[torch.Tensor] = []
-        run = None
-        for i, inp in enumerate(inputs):
-            if inp.input_ids is None or (decode and not inp.input_seq_len):
-                if run is None:
-                    run = i
-                continue
-            if run is not None:
-                pieces.append(ids[run:i])
-                run = None
-            pieces.append(inp.input_ids.to(ids.dtype))
-        if run is not None:
-            pieces.append(ids[run:len(inputs)])
-        if decode and ids.shape[0] > len(inputs):
-            pieces.append(ids[len(inputs):])
-        return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
-
     def preprocess(
         self,
         graph_walk: str,
@@ -542,7 +517,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             laps.lap("tokens")
             decode = graph_walk == self.DECODE_WALK
             if not decode or any(inp.input_ids is not None and inp.input_seq_len for inp in inputs):
-                ids = self._splice_row_ids(ids, inputs, decode)
+                ids = splice_loopback_ids(ids, inputs, decode)
             laps.lap("splice")
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
@@ -686,3 +661,33 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # `prefill_tokens` from the inputs
         return graph_walk == self.DECODE_WALK
 
+
+class DeclaredTokenDecoder(SampledTokenDecoder):
+    """A `SampledTokenDecoder` on the state contract, which steps the array under ``KV_CACHE`` and the sampler under
+    ``SAMPLER`` through their handles. It folds into `SampledTokenDecoder` once no subclass is left on resources."""
+
+    KV_CACHE = KV_CACHE
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[self.KV_CACHE]
+        self.sampler = handles[self.SAMPLER]
+
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
+    ) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=segments,
+            state={self.KV_CACHE: ArrayStep(advance=advance), self.SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
+        )
+
+    def next_position(self, rid_handle: int) -> int:
+        return position(self.kv, rid_handle, "main")
+
+    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        return last_sampled(self.sampler)
+
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
+
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)

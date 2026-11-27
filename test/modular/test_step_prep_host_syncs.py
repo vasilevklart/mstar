@@ -425,7 +425,7 @@ def test_cosmos3_windowed_captured_step_prep_reads_no_tensor(monkeypatch):
         assert host.reads == [], f"step {k}: host reads {host.reads}"
         assert got is not None
     ni = prepare(4)
-    assert ni.resource_step_info.capture_key == (1, ch, 3, 4, 4)
+    assert ni.resource_step_info.capture_key == ((1, ch, 3, 4, 4), "cfg")
     assert torch.equal(ni.tensor_inputs["vision_timesteps"],
                        st["scheduler"].timesteps[1].to(torch.float32).expand(12))
 
@@ -624,28 +624,24 @@ class _PageableH2D(TorchFunctionMode):
 
 
 def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
-    """A device loop-back decode step whose rows include one fresh off its prefill overlays
-    that row's token through the sampler's ``overwrite_rows`` (every request's first decode
-    step takes this path), and its prep makes no pageable host-to-device copy of its own. The
-    meta device stands in for the accelerator; on it the row stager takes its host branch, so
-    the pinned upload itself is not exercised here."""
-    from mstar.engine.resources.sampler.resource import SamplerResource
+    """A device loop-back decode step whose rows include one fresh off its prefill splices that
+    row's token in (every request's first decode step takes this path), and its prep makes no
+    pageable host-to-device copy of its own. The meta device stands in for the accelerator."""
+    from mstar.engine.state import Sampler
+    from mstar.engine.state.calls import SamplerHandle
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
     from mstar.model.keys import SAMPLER
     from mstar.model.submodule_base import ARNodeInputs
 
     class _Sampler:
-        # the real overlay, over a stand-in for the slot masters
-        overwrite_rows = SamplerResource.overwrite_rows
-        _row_stager = None
-
         def loopback_tokens(self, rids):
             return torch.zeros(len(rids), dtype=torch.long, device="meta")
 
     sub = HiggsAudioLLMSubmodule(None, HiggsAudioModelConfig())
-    sampler = _Sampler()
-    engine_inputs = SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["fresh", "looped"])
+    sub.sampler = SamplerHandle(Sampler(SAMPLER, nodes={"LLM"}, vocab_size=8), _Sampler())
+    sub.sampler.begin_step(SimpleNamespace(ctx=SimpleNamespace(padded_request_ids=["fresh", "looped"])))
+    engine_inputs = SimpleNamespace(request_ids=["fresh", "looped"])
     inputs = [
         ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long, device="meta"), input_seq_len=1),
         ARNodeInputs(input_seq_len=1),
@@ -654,6 +650,23 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
         out = sub.preprocess("decode", engine_inputs, inputs)
     assert h2d_copies.copies == []
     assert out["input_ids"].shape == (2,)
+
+
+def test_kokoro_chunk_prep_reads_no_tensor():
+    """A request's chunk lengths ride its step metadata, so selecting its chunk reads nothing on the host."""
+    from mstar.model.kokoro.config import CHUNK_LENGTHS, CHUNK_LOOP, PHONEME_IDS, REF_STYLE, SPEED
+    from mstar.model.kokoro.submodules import KokoroSynthSubmodule
+
+    sub = KokoroSynthSubmodule(torch.nn.Linear(1, 1), None)
+    inputs = {
+        PHONEME_IDS: [torch.zeros(2, 5, dtype=torch.long)], REF_STYLE: [torch.zeros(2, 16)], SPEED: [torch.ones(1)],
+    }
+    for k, length in enumerate((5, 3)):
+        with _HostReads() as prep:
+            row = sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, k), inputs)
+        assert prep.reads == [], f"chunk {k}: host reads {prep.reads}"
+        assert row.input_seq_len == length and row.tensor_inputs["input_ids"].shape == (length,)
+    assert sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, 2), inputs) is None
 
 
 def test_higgs_encoder_prep_reads_no_tensor():
@@ -684,12 +697,12 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
 
     from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
-    from mstar.model.qwen3_omni.config import AUDIO_ATTN
+    from mstar.model.qwen3_omni.config import AUDIO_TOKENS
     from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule
 
     config = AuTEncoderConfig(d_model=16, encoder_layers=1, encoder_attention_heads=2, encoder_ffn_dim=32,
                               downsample_hidden_size=4, output_dim=8)
-    sub = AudioEncoderSubmodule(AuTEncoder(config, attn_key=AUDIO_ATTN), config=None)
+    sub = AudioEncoderSubmodule(AuTEncoder(config, array=AUDIO_TOKENS), config=None)
     for frames in (1234, 3000):
         with _HostReads() as reads:
             row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio"), {
