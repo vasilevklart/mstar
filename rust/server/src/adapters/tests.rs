@@ -431,6 +431,29 @@ fn two_images_are_indexed_in_order() {
 }
 
 #[test]
+fn too_many_attachments_are_refused_before_any_is_saved() {
+    let dir = UploadDir::new();
+    let image = format!(r#"{{"type":"image_url","image_url":{{"url":"{IMAGE_A}"}}}}"#);
+    let audio = r#"{"type":"input_audio","input_audio":{"data":"YQ==","format":"wav"}}"#;
+    let chat = |parts: &[&str]| format!(r#"[{{"role":"user","content":[{}]}}]"#, parts.join(","));
+    let mut parts = vec![image.as_str(); 16];
+    parts.push(audio);
+    assert_eq!(
+        flatten(&chat(&parts), &dir.0).unwrap_err(),
+        "the request attaches 17 media files; the limit is 16 (MSTAR_MAX_MEDIA_FILES)"
+    );
+    assert!(
+        std::fs::read_dir(&dir.0).map_or(true, |mut d| d.next().is_none()),
+        "attachments were saved before the request was refused"
+    );
+
+    // at the cap, and an empty URL is not an attachment
+    parts[16] = r#"{"type":"image_url","image_url":{"url":""}}"#;
+    let (_, file_paths, _, _) = flatten(&chat(&parts), &dir.0).unwrap();
+    assert_eq!(file_paths["image"].len(), 16);
+}
+
+#[test]
 fn fish_forwards_a_sent_voice_to_be_logged_as_ignored() {
     let mk = |body: &str| FishS2Pro.speech_args(&speech(body)).unwrap().model_kwargs;
     assert_eq!(mk(r#"{"input":"x","voice":"ryan"}"#)["voice"], serde_json::json!("ryan"));

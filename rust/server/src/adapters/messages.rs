@@ -17,6 +17,14 @@ pub fn flatten_messages(
     upload_dir: &Path,
     allow_remote: bool,
 ) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>), String> {
+    // Before the first save or fetch: the data worker checks the same cap only
+    // once every attachment is on disk, and each remote URL can be 64 MiB.
+    let (count, limit) = (count_media_parts(messages), max_media_files());
+    if count > limit {
+        return Err(format!(
+            "the request attaches {count} media files; the limit is {limit} (MSTAR_MAX_MEDIA_FILES)"
+        ));
+    }
     let mut parts: Vec<Part> = Vec::new();
     // A refused chat is never submitted, so a refusal below drops `saved`
     // unkept, which deletes the attachments saved before it.
@@ -86,6 +94,40 @@ pub fn flatten_messages(
     let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
     let input_modalities = parts.iter().map(|p| p.modality.clone()).collect();
     Ok((text, saved.keep(), input_modalities, parts))
+}
+
+/// The attachments `flatten_messages` saves or fetches, found the way it walks
+/// the messages (`_count_media_parts` in `api_server/openai/adapters.py`).
+fn count_media_parts(messages: &[crate::protocol::ChatMessage]) -> usize {
+    let mut count = 0;
+    for msg in messages {
+        let Some(Content::Parts(content)) = &msg.content else { continue };
+        for obj in content.iter().filter_map(Value::as_object) {
+            let ptype = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            let attached = match ptype {
+                "image_url" | "video_url" | "audio_url" => !nested_url(obj, ptype).is_empty(),
+                "input_audio" => obj
+                    .get("input_audio")
+                    .and_then(Value::as_object)
+                    .and_then(|ia| ia.get("data"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.is_empty()),
+                _ => false,
+            };
+            count += usize::from(attached);
+        }
+    }
+    count
+}
+
+/// `MSTAR_MAX_MEDIA_FILES` (default 16), as `media_limits.max_media_files`
+/// reads it. The data worker refuses a bad value at startup.
+fn max_media_files() -> usize {
+    std::env::var("MSTAR_MAX_MEDIA_FILES")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(16)
 }
 
 pub(super) fn add_file(

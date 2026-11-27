@@ -84,6 +84,13 @@ def max_media_files() -> int:
     return _positive_int_env("MSTAR_MAX_MEDIA_FILES", DEFAULT_MAX_MEDIA_FILES)
 
 
+def check_media_file_count(num_files: int) -> None:
+    """Refuses a request that attaches more than ``max_media_files()`` files."""
+    limit = max_media_files()
+    if num_files > limit:
+        raise ValueError(f"the request attaches {num_files} media files; the limit is {limit} (MSTAR_MAX_MEDIA_FILES)")
+
+
 def max_audio_seconds() -> int:
     """``MSTAR_MAX_AUDIO_SECONDS``: seconds a request's audio clips may decode
     to, summed over them."""
@@ -131,11 +138,7 @@ class RequestMediaBudget:
     }
 
     def __init__(self, num_files: int) -> None:
-        limit = max_media_files()
-        if num_files > limit:
-            raise ValueError(
-                f"the request attaches {num_files} media files; the limit is {limit} (MSTAR_MAX_MEDIA_FILES)"
-            )
+        check_media_file_count(num_files)
         self.limits = {"image": max_image_pixels(), "video": max_video_pixels(), "audio": max_audio_seconds()}
         self.used = dict.fromkeys(self.limits, 0)
         # one entry per file being loaded: files of a request may load at once

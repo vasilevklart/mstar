@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
+from mstar.model.media_limits import check_media_file_count
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
@@ -117,6 +118,9 @@ def flatten_messages(
             return
         parts.append(PromptPart(modality="text", text=text, role=role))
 
+    # Before the first save or fetch: the data worker checks the same cap only
+    # once every attachment is on disk, and each remote URL can be 64 MiB.
+    check_media_file_count(_count_media_parts(messages))
     try:
         for msg in messages or []:
             # Messages may be pydantic ChatMessage objects or plain dicts.
@@ -162,6 +166,24 @@ def flatten_messages(
     text_parts = [p.text for p in parts if p.modality == "text"]
     text = "\n".join(text_parts) if text_parts else None
     return text, file_paths, [p.modality for p in parts], parts
+
+
+def _count_media_parts(messages: list) -> int:
+    """The attachments ``flatten_messages`` saves or fetches, found the way it walks the messages."""
+    count = 0
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if not content or isinstance(content, str):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype in ("image_url", "video_url", "audio_url"):
+                count += bool((part.get(ptype) or {}).get("url", ""))
+            elif ptype == "input_audio":
+                count += bool((part.get("input_audio") or {}).get("data"))
+    return count
 
 
 def _passthrough(req) -> dict:
