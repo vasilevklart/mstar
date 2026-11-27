@@ -7,10 +7,10 @@ Plugins here are real installed distributions: a module and a ``.dist-info`` wit
 import logging
 import sys
 import textwrap
-from types import SimpleNamespace
 
 import pytest
 import torch
+from test_platform_capabilities import needs_compile
 
 from mstar import platforms
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform, _built_for, registry
@@ -52,7 +52,8 @@ def build(monkeypatch):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
         monkeypatch.setattr(torch.version, "hip", hip)
         monkeypatch.setattr(torch.version, "cuda", None if hip else cuda_version)
-        monkeypatch.setattr(torch, "xpu", SimpleNamespace(is_available=lambda: xpu))
+        # the module stays: Dynamo reads more of it than is_available
+        monkeypatch.setattr(torch.xpu, "is_available", lambda: xpu)
 
     set_build()
     return set_build
@@ -157,6 +158,14 @@ def test_naming_an_in_tree_platform_loads_no_plugin(install):
     assert PLUGINS[0] not in sys.modules
 
 
+def test_mstar_platform_refuses_a_platform_this_torch_is_not_built_for(build):
+    """ROCm's choices on an NVIDIA GPU would run, and be wrong."""
+    build(cuda=True)
+    with pytest.raises(ValueError, match=r"MSTAR_PLATFORM='rocm', but this torch \(.+\) is not built for it"):
+        select_platform({"MSTAR_PLATFORM": "rocm"})
+    assert select_platform({"MSTAR_PLATFORM": "cuda"}).name == "cuda"
+
+
 # --- plugins under detection -------------------------------------------------------------------
 
 
@@ -204,6 +213,16 @@ def test_a_broken_plugin_is_skipped_in_a_scan_and_raises_when_named(install, cap
         select_platform({"MSTAR_PLATFORM": "dummy"})
 
 
+def test_a_plugin_whose_entry_has_another_name_than_its_entry_point_is_not_registered(install, caplog):
+    install("dummy", body="""
+        return PlatformEntry("other", Plugin, "privateuseone", built_for=lambda: True, available=lambda: True)
+    """)
+    with caplog.at_level(logging.WARNING, logger=registry.__name__):
+        assert select_platform({}).name == "cpu"
+    assert "expected a PlatformEntry named 'dummy'" in caplog.text
+    assert not {"dummy", "other"} & {e.name for e in registered_platforms()}
+
+
 # --- the contract version ----------------------------------------------------------------------
 
 
@@ -232,9 +251,14 @@ def test_a_name_registers_once_unless_replaced():
     assert [e.name for e in registered_platforms()] == ["cuda", "rocm", "xpu", "cpu"]
 
 
-def test_resolve_registered_builds_the_selected_platform(monkeypatch):
-    monkeypatch.setenv("MSTAR_PLATFORM", "cpu")
-    assert isinstance(resolve_registered(), CpuPlatform)
+def test_resolve_registered_builds_the_selected_platform_and_logs_a_named_one(build, monkeypatch, caplog):
+    build(cuda=True)
+    with caplog.at_level(logging.INFO, logger=registry.__name__):
+        assert isinstance(resolve_registered(), CudaPlatform)
+        assert caplog.messages == []  # a detected in-tree platform is the usual case, and silent
+        monkeypatch.setenv("MSTAR_PLATFORM", "cpu")
+        assert isinstance(resolve_registered(), CpuPlatform)
+    assert caplog.messages == ["platform: cpu (MSTAR_PLATFORM)"]
 
 
 # --- resolve_platform asks the registry ----------------------------------------------------------
@@ -264,3 +288,32 @@ def test_the_installed_plugins_are_listed_once(install, monkeypatch):
         platforms.resolve_platform.cache_clear()
         assert platforms.current_platform.is_cpu()
     assert len(listings) == 1
+
+
+@needs_compile
+@pytest.mark.parametrize(
+    ("selected_by", "name", "logged"),
+    [
+        ("detection", "cpu", []),
+        ("MSTAR_PLATFORM", "cpu", ["platform: cpu (MSTAR_PLATFORM)"]),
+        ("plugin", "dummy", ["platform: dummy (plugin)"]),
+    ],
+)
+def test_a_compiled_forward_asks_the_current_platform_in_one_graph(
+    install, monkeypatch, caplog, dynamo_counts, selected_by, name, logged,
+):
+    """Dynamo traces past ``resolve_platform``'s cache into the registry. Were the selection
+    traced, its entry-point listing or its log line would make the whole forward run eagerly."""
+    install("dummy", available=selected_by == "plugin")
+    if selected_by == "MSTAR_PLATFORM":
+        monkeypatch.setenv("MSTAR_PLATFORM", "cpu")
+    platforms.resolve_platform.cache_clear()
+
+    def forward(x):
+        return x * 2 if platforms.current_platform.name == name else x - 1
+
+    with caplog.at_level(logging.INFO, logger=registry.__name__):
+        assert platforms.current_platform.name == name
+        assert dynamo_counts(forward, torch.ones(2))[:2] == (1, 1)
+    # the one real selection is logged, not Dynamo's
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("platform: ")] == logged

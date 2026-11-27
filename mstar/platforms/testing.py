@@ -12,7 +12,7 @@ from mstar import platforms
 from mstar.platforms.capabilities import Capabilities, clear_capabilities_cache
 from mstar.platforms.interface import Platform
 from mstar.platforms.registry import (
-    ENV_VAR,
+    PLATFORM_ENV,
     PlatformEntry,
     register_platform,
     registered_platforms,
@@ -45,17 +45,17 @@ def use_platform(platform: Platform) -> Iterator[Platform]:
         platform.name, lambda: platform, getattr(platform, "device_type", "cpu"),
         built_for=lambda: True, available=lambda: False,
     ), replace=True)
-    env = os.environ.get(ENV_VAR)
-    os.environ[ENV_VAR] = platform.name
+    env = os.environ.get(PLATFORM_ENV)
+    os.environ[PLATFORM_ENV] = platform.name
     platforms.resolve_platform.cache_clear()
     clear_capabilities_cache()
     try:
         yield platform
     finally:
         if env is None:
-            os.environ.pop(ENV_VAR, None)
+            os.environ.pop(PLATFORM_ENV, None)
         else:
-            os.environ[ENV_VAR] = env
+            os.environ[PLATFORM_ENV] = env
         if displaced is None:
             unregister_platform(platform.name)
         else:

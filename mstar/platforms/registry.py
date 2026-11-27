@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # a plugin built against another version is refused; the contract may change before 1.0
 PLATFORM_API_VERSION = 1
 ENTRY_POINT_GROUP = "mstar.platforms"
-ENV_VAR = "MSTAR_PLATFORM"
+PLATFORM_ENV = "MSTAR_PLATFORM"
 CPU = "cpu"
 
 
@@ -111,16 +111,21 @@ def load_plugins(only: str | None = None) -> None:
             logger.warning("platform plugin %s (%s) not loaded: %s", ep.name, ep.value, e)
 
 
-def select_platform(environ: Mapping[str, str] = os.environ) -> PlatformEntry:
-    """The platform this process runs on; detecting one may initialize its runtime."""
-    name = environ.get(ENV_VAR, "").strip()
+def select_platform(environ: Mapping[str, str] | None = None) -> PlatformEntry:
+    """The platform this process runs on, read from ``environ`` (by default the process's)
+    and then detected; detecting one may initialize its runtime."""
+    name = (os.environ if environ is None else environ).get(PLATFORM_ENV, "").strip()
     if name:
         if name not in _ENTRIES:
             load_plugins(only=name)
         if name not in _ENTRIES:
             known = sorted({*_ENTRIES, *(ep.name for ep in _entry_points())})
-            raise ValueError(f"{ENV_VAR}={name!r} names no platform M* knows; it knows {', '.join(known)}")
-        return _ENTRIES[name]
+            raise ValueError(f"{PLATFORM_ENV}={name!r} names no platform M* knows; it knows {', '.join(known)}")
+        entry = _ENTRIES[name]
+        if not entry.built_for():
+            # ROCm's choices on an NVIDIA GPU, say, would run and be wrong
+            raise ValueError(f"{PLATFORM_ENV}={name!r}, but this torch ({torch.__version__}) is not built for it")
+        return entry
     for entry in _ENTRIES.values():
         if entry.in_tree and entry.name != CPU and entry.available():
             return entry
@@ -128,7 +133,7 @@ def select_platform(environ: Mapping[str, str] = os.environ) -> PlatformEntry:
     available = [entry for entry in _ENTRIES.values() if not entry.in_tree and _plugin_available(entry)]
     if len(available) > 1:
         names = ", ".join(sorted(entry.name for entry in available))
-        raise RuntimeError(f"several platforms can run here ({names}); set {ENV_VAR} to one of them")
+        raise RuntimeError(f"several platforms can run here ({names}); set {PLATFORM_ENV} to one of them")
     return available[0] if available else _ENTRIES[CPU]
 
 
@@ -141,11 +146,29 @@ def _plugin_available(entry: PlatformEntry) -> bool:
 
 
 def resolve_registered() -> Platform:
-    """Select the platform and build it."""
-    entry = select_platform()
-    if not entry.in_tree or os.environ.get(ENV_VAR):
-        logger.info("platform: %s (%s)", entry.name, ENV_VAR if os.environ.get(ENV_VAR) else "plugin")
+    """Select the platform and build it.
+
+    Dynamo traces this for every compiled forward that asks ``current_platform``, since it
+    traces past ``resolve_platform``'s cache. So it stays a lookup and a call: the selection,
+    which lists entry points, and the log line are code Dynamo won't trace, and one of them
+    in here would make the whole forward run eagerly.
+    """
+    entry = _ENTRIES[_selected_name()]
+    if not torch.compiler.is_compiling():
+        _log_selected(entry)
     return entry.factory()
+
+
+# Dynamo calls it and keeps the name, rather than tracing it
+@torch.compiler.assume_constant_result
+def _selected_name() -> str:
+    return select_platform().name
+
+
+def _log_selected(entry: PlatformEntry) -> None:
+    named = os.environ.get(PLATFORM_ENV)
+    if named or not entry.in_tree:
+        logger.info("platform: %s (%s)", entry.name, PLATFORM_ENV if named else "plugin")
 
 
 def _xpu_available() -> bool:

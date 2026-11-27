@@ -923,5 +923,6 @@ Hardware platform
        that one is loaded (read by
        :func:`mstar.platforms.registry.select_platform`). Unset, the first in-tree
        accelerator torch can see, then the one installed plugin whose device is
-       available, then ``cpu``. Two available plugins and no setting is an error. Set it
-       the same way on every node.
+       available, then ``cpu``. Two available plugins and no setting is an error, and so
+       is naming a platform this torch is not built for (``rocm`` on a CUDA build). Set
+       it the same way on every node.
