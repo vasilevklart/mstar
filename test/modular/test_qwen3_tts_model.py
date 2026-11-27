@@ -428,8 +428,9 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     assert result.new_input_tensors["text_in"] == []   # the prefill takes the whole text
     # CustomVoice default: whole text in the prefill (stream_text = 0); no
     # reference transcript or frames. Host values, for the prefill's step metadata.
+    # The frame budget is 8 x (1.38 s + 0.39 s x 1 token) at 12.5 frames/s.
     assert {key: value for key, value in result.metadata.items() if key != "state_layout"} == {
-        PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055,
+        PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055, LENGTH_BUDGET_KEY: 177,
     }
 
 
@@ -567,7 +568,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     assert xvec.metadata[LENGTH_BUDGET_KEY] == 45
 
 
-def test_qwen3_tts_clone_length_budget_caps_the_default_only():
+def test_qwen3_tts_length_budget_caps_the_default_only():
     model = _variant_model("base")
     clip = torch.zeros(24000 + 1)
     clone = model.process_prompt(
@@ -587,11 +588,26 @@ def test_qwen3_tts_clone_length_budget_caps_the_default_only():
         tensors={"audio_inputs": [clip]}, x_vector_only_mode=True, open_streams={"text_in"},
     ).metadata
     assert LENGTH_BUDGET_KEY not in live and model.get_max_output_tokens(**live) == 8192
-    # no reference clip, no budget
-    plain = _variant_model("custom_voice").process_prompt(
+    # A built-in or designed voice gets the budget too, at 8 x (1.38 s + 0.39 s x 3 tokens) at
+    # 12.5 frames/s: its speaker and instructions set its pace.
+    custom = _variant_model("custom_voice")
+    plain = custom.process_prompt(
         "hello big world", input_modalities=["text"], output_modalities=["audio"], voice="vivian",
     ).metadata
-    assert LENGTH_BUDGET_KEY not in plain
+    assert plain[LENGTH_BUDGET_KEY] == 255
+    assert custom.get_max_output_tokens(**plain) == 255
+    assert custom.get_loop_caps(**plain) == {custom.DECODE_LOOP: 254}
+    assert custom.get_max_output_tokens(**plain, max_output_tokens=8000) == 8000
+    designed = _variant_model("voice_design").process_prompt(
+        "hello big world", input_modalities=["text"], output_modalities=["audio"], instruct="a calm, slow voice",
+    ).metadata
+    assert designed[LENGTH_BUDGET_KEY] == 255
+    # live text has none on a built-in voice either
+    live = custom.process_prompt(
+        "hello", input_modalities=["text"], output_modalities=["audio"], voice="vivian",
+        non_streaming_mode=False, open_streams={"text_in"},
+    ).metadata
+    assert LENGTH_BUDGET_KEY not in live and custom.get_max_output_tokens(**live) == 8192
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(
@@ -611,6 +627,40 @@ def test_qwen3_tts_clone_length_budget_caps_the_default_only():
             "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
             tensors={"audio_inputs": [clip]},
         )
+
+
+def test_qwen3_tts_a_sentence_reserves_a_few_pages_where_the_default_took_65():
+    """A streamed request reserves its prompt plus its loop cap at admission (it can't pause), so
+    the 1.7B config's 2048 pages of 128 held about 31 streams at the checkpoint's 8192 frames. A
+    13-token sentence on a built-in voice now holds a few, through the path the conductor and the
+    KV pool take: the layout from ``process_prompt``, the caps from ``get_loop_caps``."""
+    from mstar.engine.resources import KVReqConfig, PagedKVConfig
+    from mstar.engine.state.adapters import kv_layouts
+    from mstar.model.qwen3_tts.config import TALKER_KV
+
+    model = _variant_model("custom_voice")
+    pool = PagedKVConfig(
+        num_layers=28, num_kv_heads=8, head_dim=128, max_seq_len=32768, max_num_pages=2048, page_size=128,
+    )
+
+    def reserved(**kwargs):
+        out = model.process_prompt(
+            " ".join(["word"] * 13), input_modalities=["text"], output_modalities=["audio"], voice="vivian",
+            language="English", **kwargs,
+        )
+        request = {**kwargs, **{key: value for key, value in out.metadata.items() if key != "state_layout"}}
+        # as the conductor opens it (`Conductor._get_resource_configs`)
+        config = KVReqConfig(needed_labels=list(model.kv_labels()[TALKER_KV]))
+        layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], {})
+        config.apply_conductor_config(
+            kv_layout={label: layout.row() for label, layout in layouts[TALKER_KV].items()},
+            loop_caps=model.get_loop_caps(**request),
+        )
+        return pool.pages_of(config.pages(None, config.loop_caps, pool), round_up=True)
+
+    # 8 x (1.38 s + 0.39 s x 13 tokens) x 12.5 frames/s = 645 frames, plus the prompt's rows
+    assert reserved() == 6
+    assert reserved(max_output_tokens=8192) == 65
 
 
 @pytest.mark.parametrize("x_vector_only_mode", [False, True])

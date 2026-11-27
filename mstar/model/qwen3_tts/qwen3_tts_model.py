@@ -82,12 +82,12 @@ from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
     CLONE_BUDGET_MARGIN,
-    CLONE_BUDGET_S,
-    CLONE_BUDGET_S_PER_TOKEN,
     CODE_PRED_SAMPLER,
     CODEC_STATE,
     LANGUAGE_ID_KEY,
     LENGTH_BUDGET_KEY,
+    LENGTH_BUDGET_S,
+    LENGTH_BUDGET_S_PER_TOKEN,
     PROMPT_LAYOUT_KEY,
     REF_CLIP_KEY,
     REF_SAMPLES_KEY,
@@ -97,6 +97,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_MIXED,
     TALKER_SAMPLER,
     TALKER_TEXT,
+    VOICE_BUDGET_MARGIN,
     Qwen3TTSModelConfig,
     mono_samples,
 )
@@ -911,7 +912,7 @@ class Qwen3TTSModel(Model):
         The metadata carries, as host values for the prefill's step metadata,
         ``PROMPT_LAYOUT_KEY`` ``[instruct_len, text_len, stream_text,
         ref_text_len, ref_frames]``, the codec speaker and language tags, and
-        a clone's ``REF_CLIP_KEY`` digest, ``REF_SAMPLES_KEY`` sample count and
+        a clone's ``REF_CLIP_KEY`` digest and ``REF_SAMPLES_KEY`` sample count, and the
         ``LENGTH_BUDGET_KEY`` frame budget (none for live text). ``stream_text`` follows the
         reference default per variant (whole text in the prefill for
         CustomVoice and VoiceDesign, one token per frame for Base) unless the
@@ -991,8 +992,8 @@ class Qwen3TTSModel(Model):
         # a clone's x-vector takes the speaker row
         clone = "audio" in input_modalities
         # live text arrives after the prompt, so its length isn't known here
-        if clone and "text_in" not in kwargs.get("open_streams", ()):
-            metadata[LENGTH_BUDGET_KEY] = self.clone_length_budget(text_len)
+        if "text_in" not in kwargs.get("open_streams", ()):
+            metadata[LENGTH_BUDGET_KEY] = self.length_budget(text_len, clone)
         rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
         metadata["state_layout"] = {TALKER_KV: {"main": Layout(
             spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
@@ -1143,16 +1144,18 @@ class Qwen3TTSModel(Model):
             self._generation_defaults_cache = cached
         return cached
 
-    def clone_length_budget(self, text_tokens: int) -> int:
-        """The frames a clone of ``text_tokens`` target-text tokens may run without an explicit
-        ``max_output_tokens`` (see ``CLONE_BUDGET_S``)."""
+    def length_budget(self, text_tokens: int, clone: bool) -> int:
+        """The frames a request of ``text_tokens`` target-text tokens may run without an explicit
+        ``max_output_tokens``: a clone twice the fit ``LENGTH_BUDGET_S`` describes, a built-in or
+        designed voice eight times it."""
         codec = self.config.codec
         frames_per_s = codec.output_sample_rate / codec.decode_upsample_rate
-        return math.ceil(CLONE_BUDGET_MARGIN * (CLONE_BUDGET_S + CLONE_BUDGET_S_PER_TOKEN * text_tokens) * frames_per_s)
+        margin = CLONE_BUDGET_MARGIN if clone else VOICE_BUDGET_MARGIN
+        return math.ceil(margin * (LENGTH_BUDGET_S + LENGTH_BUDGET_S_PER_TOKEN * text_tokens) * frames_per_s)
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
-        """The request's ``max_output_tokens``, else the checkpoint's default, capped for a clone
-        by its text's budget."""
+        """The request's ``max_output_tokens``, else the checkpoint's default, capped by its
+        text's budget."""
         requested = model_kwargs.get("max_output_tokens")
         if requested is not None:
             return requested

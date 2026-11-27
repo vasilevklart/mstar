@@ -49,17 +49,23 @@ SPEAKER_ID_KEY = "speaker_id"
 LANGUAGE_ID_KEY = "language_id"
 REF_CLIP_KEY = "ref_clip_key"
 REF_SAMPLES_KEY = "ref_samples"
-# A clone's default frame budget, from its target text (Qwen3TTSModel.get_max_output_tokens)
+# A request's default frame budget, from its target text (Qwen3TTSModel.get_max_output_tokens)
 LENGTH_BUDGET_KEY = "length_budget"
 
 # The longest a Base clone of n target-text tokens ran before its natural stop was
 # 1.38 s + 0.39 s per token (sglang-omni's fit over 4460 stops of the 1.7B checkpoint).
-# Twice that cuts a runaway, which would otherwise run to the checkpoint's 8192 frames
-# (11 min), within seconds, and shrinks the KV a streamed clone reserves at admission;
-# 2 of 78k natural stops of M*'s seed-tts clones ran past it and are now cut short.
-CLONE_BUDGET_S = 1.38
-CLONE_BUDGET_S_PER_TOKEN = 0.39
+# A multiple of it cuts a runaway, which would otherwise run to the checkpoint's 8192
+# frames (11 min), and shrinks the KV a streamed request reserves at admission: 8192
+# frames are about 65 pages of 128, so a 2048-page pool ran about 31 streams at once.
+# A clone gets twice it: 2 of 78k natural stops of M*'s seed-tts clones ran past that.
+# A built-in or designed voice sets its own pace and takes instructions that slow it, so
+# it gets eight times it: on the 1.7B CustomVoice (vivian, seed-tts English, H200) stops
+# reached 1.6x the fit with no instruction, runaways aside, and 5.0x when told to speak
+# extremely slowly.
+LENGTH_BUDGET_S = 1.38
+LENGTH_BUDGET_S_PER_TOKEN = 0.39
 CLONE_BUDGET_MARGIN = 2.0
+VOICE_BUDGET_MARGIN = 8.0
 
 
 def _channels_axis(clip: torch.Tensor) -> int | None:
