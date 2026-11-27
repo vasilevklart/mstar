@@ -74,6 +74,29 @@ mstar-serve --config configs/kokoro.yaml --tensor-comm-protocol SHM --port 8001
 |---|---|---|
 | `python -m mstar.cli.main serve <model>` | The same as `mstar serve`. | There is no `python -m mstar`. |
 | `mstar-server` | The Rust HTTP frontend that the launcher starts. | Not meant to be run by hand: it takes positional arguments and reads its settings from environment variables the launcher sets. |
-| `python -m mstar.integrations.dynamo --config <yaml> --model-path <dir>` | Serves a deployment as an NVIDIA Dynamo backend worker. | Needs `mstar-ai[dynamo]`. Its `--tensor-comm-protocol` also defaults to `RDMA`. |
-| `python -m mstar.model.audio_watermark detect <files>` | Scores audio files for the AudioSeal watermark. | Needs `mstar-ai[audioseal]`, and `soundfile` (`mstar-ai[audio]`) even for `--help`. |
+| `python -m mstar.integrations.dynamo --config <yaml> --model-path <dir>` | Serves a deployment as an NVIDIA Dynamo backend worker. | Needs `mstar-ai[dynamo]`. Flags in [Dynamo worker](#dynamo). |
+| `python -m mstar.model.audio_watermark detect <files>` | Scores audio files for the AudioSeal watermark. | Needs `mstar-ai[audioseal]`, and `soundfile` (`mstar-ai[audio]`) even for `--help`. `--message` (`0xBEEF`, `48879` or 16 bits) counts a file as marked only if it decodes to that message; `--threshold` (default `0.5`) is the score above which a file counts as marked; `--device` defaults to `cpu`. |
 | `python -m benchmark.eval <command>` | The evaluation and benchmark runner (`run`, `report`, `compare` and more). | Needs a source checkout, since `benchmark/` is not in the wheel. Install `mstar-ai[eval]` for it. See [Evaluation](/evaluation). |
+
+## Dynamo worker {#dynamo}
+
+```bash
+python -m mstar.integrations.dynamo --config <yaml> --model-path <dir> [options]
+```
+
+The worker loads the deployment as `mstar-serve` does, runs its `warmup_requests`, and registers with the Dynamo runtime instead of serving HTTP. Dynamo's frontend then serves the OpenAI routes.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--config` | required | Path to the deployment YAML. |
+| `--model-path` | required | Local Hugging Face snapshot directory that Dynamo's frontend builds the model card from. |
+| `--served-model-name` | the config's `model` | Name the model registers under, which clients send as `model`. |
+| `--namespace`, `--component`, `--endpoint` | `mstar`, `backend`, `generate` | The Dynamo endpoint, `<namespace>.<component>.<endpoint>`. Video, realtime and tensor surfaces register on the same name with `_videos`, `_realtime` or `_tensor` appended. |
+| `--tensor-comm-protocol` | `RDMA` | As on `mstar-serve`. On one machine pass `SHM`. |
+| `--socket-path-prefix` | a new `/tmp/mstar_<user>_*` directory | ZMQ IPC socket prefix. The default directory is removed at exit. |
+| `--upload-dir` | `/tmp/mstar_uploads` | Temporary directory for uploaded media. |
+| `--cache-dir` | Hugging Face default | Weight cache directory. |
+| `--timeout` | `600` | Per-request timeout in seconds. |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
+
+What registers comes from the model's [OpenAI adapter](/reference/http-api#openai-coverage), or its tensor spec for `pi05` and `vjepa2_ac`. A key with neither, such as `command_a_plus`, has nothing to register, and the worker exits once the model has loaded. An `openpi:` block is not served. The worker checks no API key ([API key](/serving#api-key)).
