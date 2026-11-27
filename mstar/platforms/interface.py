@@ -95,6 +95,7 @@ class Platform:
         platform doesn't report an address."""
         return frozenset(a for i in range(torch.accelerator.device_count())
                          if (a := self.pci_address(i)) is not None)
+
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:
@@ -200,6 +201,7 @@ class RocmPlatform(Platform):
 
     def pci_address(self, device_index: int) -> str | None:
         return _torch_pci_address(device_index)
+
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:
