@@ -24,6 +24,19 @@ until curl -sf http://localhost:8000/health; do sleep 5; done
 
 Before the bind the connection is refused; after it, `/health` answers `{"status": "healthy"}`, or 503 while the backend does not answer. If a worker fails during setup, the server exits without binding, after `conductor process exited with ... before the workers finished setup`.
 
+## First start time {#first-start-time}
+
+Launch to the first healthy `/health` with the default config and `-O1`, measured on 1x H200, 2026-11-27, with weights already downloaded:
+
+| Key | Empty caches | Warm caches |
+|---|---|---|
+| `bagel` | 516 s | 68 s |
+| `qwen3_5_0.8b` | 504 s | |
+| `qwen3_5_9b` | 544 s | |
+| `phi4mm` | 467 s | |
+
+Loading weights is a small part; compilation takes most of it. Of BAGEL's 516 s, 484 s went to compiling one graph per capture bucket (63 for the LLM) and up to 223 s of that to FlashInfer building four JIT modules; the first request then took 0.15 s. Configs that capture many shapes take longer: `z_image_turbo` spent about 6 minutes on 16 DiT captures at 1024x1024 and was ready after 640 s. The log can go quiet for two minutes or more during these builds. `-O0` shortens the compile, and a [warm cache](#compile-cache) skips most of it.
+
 ## Compile levels {#compile-levels}
 
 `-O` sets how much Inductor tunes each captured forward's compile, through `MSTAR_COMPILE_LEVEL`. With `mstar-serve`, export the variable instead.
@@ -102,3 +115,17 @@ Nothing prunes the cache. Deleting it is safe and costs the next start's compile
 | `mstar-server binary not found` or `No mstar-server built from ...` | Frontend binary missing or stale. | Build it ([Installation](/installation#rust)) or run the command the error prints. |
 | `The graph runtime needs the mstar_rust extension` | Checkout without the Rust extension. | `uv pip install maturin`, then `maturin develop --release -m rust/Cargo.toml` |
 | `KeyError` or `OSError` from `getpass.getuser()` | Container user with no passwd entry and no `USER`. | `export USER=mstar` before `mstar serve`. |
+| `IncompleteSnapshotError`, or `FileNotFoundError` for a file in the Hugging Face cache | Offline (`HF_HUB_OFFLINE=1`) with a partial download. | Download the whole repo: `hf download <repo>`. |
+
+## Log lines that are not failures {#harmless-log-lines}
+
+A first start on H200 prints these; the server still comes up:
+
+| Line | Meaning |
+|----|----|
+| `OutOfMemoryError: out of resource: triton_mm Required: 262144 Hardware limit: 232448`, at `E` level during autotuning | Inductor skips a GEMM candidate that needs more shared memory than the GPU has. |
+| `flash_attn is not available; BagelViT will fall back to torch SDPA` | flash-attn is optional for BAGEL ([Manual installs](/installation#manual-installs)). |
+| `Ragged attention backend 'dense' requested, but no varlen kernel is available` | The FA3 kernel did not load, so dense attention uses its fallback. |
+| `capture took N MiB, M predicted` | A graph capture used more memory than planned. |
+| `semantic_vad is unavailable: no Smart Turn weights` | Only `/v1/realtime` with `semantic_vad` needs them ([Realtime](/clients#realtime-transcription)). |
+| `KeyboardInterrupt` tracebacks after Ctrl-C | The conductor and workers print them while they stop; the server still exits and frees the GPUs. |

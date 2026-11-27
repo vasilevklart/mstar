@@ -3,7 +3,12 @@ title: "Quickstart"
 description: "Install M* from source, serve BAGEL on one GPU, and send it a first request."
 ---
 
-You need Linux, one NVIDIA GPU, Python 3.12, [uv](https://docs.astral.sh/uv/), [rustup](https://rustup.rs) and a C/C++ compiler. [Installation](/installation) has the details.
+You need Linux, one NVIDIA GPU, Python 3.12, [uv](https://docs.astral.sh/uv/), [rustup](https://rustup.rs) and a C/C++ compiler. [Installation](/installation) has the details. Without Rust, install rustup first:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+```
 
 ## Install and start a server {#start-a-server}
 
@@ -22,7 +27,7 @@ cargo build --release --manifest-path rust/server/Cargo.toml
 mstar serve bagel
 ```
 
-Leave it running. The first start downloads `ByteDance-Seed/BAGEL-7B-MoT` from Hugging Face and compiles the model before listening on port 8000.
+Leave it running. The first start downloads `ByteDance-Seed/BAGEL-7B-MoT` (about 30 GB, into `$HF_HOME`, default `~/.cache/huggingface`), then compiles the model and builds FlashInfer kernels before it listens on port 8000. Measured on 1x H200, 2026-11-27: the first start took 8.5 to 12 minutes, nearly all of it compilation, and the log can go quiet for two minutes or more at a time. A restart reuses the compile caches and took about 70 seconds. See [Startup time](#startup-time).
 
 ## Check health {#check-health}
 
@@ -58,12 +63,15 @@ for event in client.chat("Tell me a short story.", stream=True):
 print()
 ```
 
-The native `/generate` endpoint takes form fields. `output_modalities` depends on the model: `text` here, `audio` for speech models, `image` for image models.
+The native `/generate` endpoint takes form fields. `output_modalities` depends on the model: `text` here, `audio` for speech models, `image` for image models. The reply is JSON with each output base64-encoded under `outputs`; this decodes the text:
 
 ```bash
 curl -s http://localhost:8000/generate \
-  -F text='What is the capital of France?' -F output_modalities=text -F streaming=false
+  -F text='What is the capital of France?' -F output_modalities=text -F streaming=false |
+  python -c "import base64, json, sys; print(b''.join(base64.b64decode(c['data']) for c in json.load(sys.stdin)['outputs']['text']).decode())"
 ```
+
+Without `streaming=false` the reply is an NDJSON stream with one base64 chunk per token ([Clients](/clients#native-generate)).
 
 For the OpenAI-compatible routes, install the client:
 
@@ -103,7 +111,7 @@ uv pip install --torch-backend=auto -e ".[kokoro]"
 mstar serve kokoro
 ```
 
-[Supported models](/models#matrix) lists all 61 keys. Some weights are gated on Hugging Face, for example the PaliGemma tokenizer that `pi05` loads and the `ltx2_5` checkpoint. Accept the license on the model page, then `export HF_TOKEN=<your token>` before `mstar serve`.
+[Supported models](/models#matrix) lists all 61 keys. Some weights are gated on Hugging Face, for example the PaliGemma tokenizer that `pi05` loads and the `ltx2_5` checkpoint. Accept the license on the model page, then `export HF_TOKEN=<your token>` before `mstar serve`. A token also avoids Hugging Face's lower rate limit for unauthenticated downloads, which the server warns about at startup.
 
 ## GPUs, port and API key {#options}
 
@@ -125,5 +133,5 @@ mstar serve bagel
 ## Startup time {#startup-time}
 
 <Note>
-Before it listens, the server loads the weights, compiles and captures the model, and runs any warmup requests in the config, so a first start can take minutes. Compiled kernels are cached under `~/.cache/mstar` and reused on later starts. `mstar serve bagel -O0` skips compile tuning for the fastest start. See [Cold start](/cold-start).
+Before it listens, the server loads the weights, compiles and captures the model, and runs any warmup requests in the config. On a cold cache this is the long part: in BAGEL's 8.6-minute first start from a source install (1x H200, 2026-11-27, weights already downloaded), 8 minutes went to compiling, up to 3.7 of them to FlashInfer JIT builds, and the first request took 0.15 seconds. Compiled kernels are cached under `~/.cache/mstar` and `~/.cache/flashinfer` and reused on later starts. `mstar serve bagel -O0` skips compile tuning for the fastest start. See [Cold start](/cold-start).
 </Note>

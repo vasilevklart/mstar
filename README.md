@@ -10,7 +10,14 @@
 
 ## Quickstart
 
-You need Linux, an NVIDIA GPU, Python 3.12, [uv](https://docs.astral.sh/uv/), [rustup](https://rustup.rs) and a C/C++ compiler.
+You need Linux, an NVIDIA GPU, Python 3.12, [uv](https://docs.astral.sh/uv/), [rustup](https://rustup.rs) and a C/C++ compiler. Without Rust, install rustup first:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+```
+
+Then:
 
 ```bash
 git clone https://github.com/mstar-project/mstar.git
@@ -27,7 +34,7 @@ cargo build --release --manifest-path rust/server/Cargo.toml
 mstar serve bagel
 ```
 
-The first start downloads the weights and compiles the model before the server listens, which can take minutes. In a second terminal with the same `.venv` active:
+The first start downloads about 30 GB of weights, then compiles the model before the server listens. Measured on 1x H200, 2026-11-27, it took 8.5 to 12 minutes, nearly all of it compilation, and a restart took about 70 seconds ([Cold start](https://m-star-labs.mintlify.site/cold-start)). The `✓ mstar serving` line prints when startup begins; wait for `/health`. In a second terminal with the same `.venv` active:
 
 ```bash
 curl http://localhost:8000/health
