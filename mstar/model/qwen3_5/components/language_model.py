@@ -28,6 +28,7 @@ from mstar.model.components.distributed import (
 from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.linear_attn import GDNProjLayout
+from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
@@ -254,6 +255,17 @@ class Qwen3_5LanguageModel(nn.Module):
         return run_layers(self.layers, query_sequence, self.norm, no_cursor, self.comm_group)
 
 
+# ``quantization:`` (``Qwen3_5DenseModel.get_quantization_roots``): the decoder layers' projections may go low
+# precision, and the LM head (the embedding itself on tied checkpoints) stays bf16, as Qwen3.5-27B-FP8 stores
+# it. The delta net's fused input projection [q|k|v|z|a|pad|b] takes a format on q|k|v|z (128-row multiples per
+# rank) and keeps its a / pad / b gate rows bf16, as that checkpoint stores in_proj_a/b.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=("model.layers.*.self_attn.*", "model.layers.*.mlp.*"),
+    keep_bf16=("lm_head",),
+    bf16_tails={"model.layers.*.self_attn.in_proj_fused": 3},
+)
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     def __init__(
         self, config: Qwen3_5Config, comm_group: CommGroup | None = None,
@@ -280,9 +292,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         """The node's sequence shard, where the model declares one. See ``NodeSubmodule.bind_node_state``."""
         self.shard = handles.get(LLM_SHARD)
 
-    def checkpoint_rules(self):
+    @staticmethod
+    def checkpoint_rules():
         """How the checkpoint's text tower lands here (the MTP head and the vision tower
-        dropped), for its weight loader and for LoRA adapters."""
+        dropped), for its weight loader, for LoRA adapters and for the quantization plan."""
         from mstar.model.loader import CheckpointRules
         from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
 

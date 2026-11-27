@@ -407,6 +407,21 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
+    def get_quantization_roots(self):
+        """The text tower, for a ``quantization:`` block and for an FP8 checkpoint
+        (``QUANTIZABLE_LINEARS``); the vision tower keeps the checkpoint's bf16."""
+        from mstar.model.qwen3_5.components.language_model import QUANTIZABLE_LINEARS
+        from mstar.quantization.resolve import QuantizationRoot
+
+        return [QuantizationRoot(
+            node="LLM", root_type=Qwen3_5ForCausalLM, linears=QUANTIZABLE_LINEARS,
+            rules=Qwen3_5ForCausalLM.checkpoint_rules(),
+            # the shards once a worker has them; before that (the conductor) the metadata
+            # snapshot, whose config.json declares the checkpoint's quantization
+            checkpoint_dir=lambda: getattr(self, "_weights_dir", None) or getattr(self, "local_dir", None),
+            build=lambda comm_group: Qwen3_5ForCausalLM(self.config, comm_group),
+        )]
+
     def _create_submodule(
         self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
@@ -419,6 +434,8 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
             return None
 
         weights_dir = self._resolve_weights()
+        # the full snapshot, for the quantization plan's checkpoint scan (`get_quantization_roots`)
+        self._weights_dir = weights_dir
 
         if node_name == "vision_encoder":
             from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel

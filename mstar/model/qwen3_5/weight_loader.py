@@ -5,9 +5,15 @@ net mixer is ``linear_attn`` (ours: ``self_attn``); vision tensors lose their
 ``model.visual.`` prefix. ``_STACKED_PARAMS`` routes the separate q/k/v, gate/up
 and delta net input projections by shard id into their fused parameters. The two
 towers load separately, as separate nodes. The MTP head (``mtp.*``) is skipped.
+
+An FP8 checkpoint (``quant_method: fp8``, as ``Qwen/Qwen3.5-27B-FP8``) loads its
+text tower under the engine's quantization plan (``mstar.quantization``), which
+is what lets it past the checkpoint guard; its vision tower is stored bf16 and
+loads as it is.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 import torch
@@ -15,6 +21,8 @@ from torch import nn
 
 from mstar.model.loader.base import StackedParamRule, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_shards
+from mstar.quantization import scope
+from mstar.quantization.resolve import QUANT_METHODS
 
 # ints index `MergedColumnParallelLinear.output_sizes`; names key
 # `SPLIT_SHARD_BLOCKS`
@@ -58,24 +66,28 @@ def _load(
     path: str | Path,
     device: torch.device | str,
     selectors: list[dict],
-    expected: set[str],
+    expected: Callable[[], set[str]],
+    quant_methods: Collection[str] = (),
 ) -> set[str]:
-    """Fill ``expected`` from the shards each selector picks out, or raise.
+    """Fill ``expected()`` from the shards each selector picks out, or raise.
 
     A selector (``prefix=`` or ``keys=``) only narrows which shards open; the
     model's ``checkpoint_rules()`` decide what loads. An unfilled parameter is
-    fatal, since a half-loaded tower produces plausible garbage.
+    fatal, since a half-loaded tower produces plausible garbage. ``expected``
+    is asked after the load: a layer loaded as stored by a quantization plan
+    holds its checkpoint's tensors (``weight_scale_inv``) beside its weight.
+    ``quant_methods``: the checkpoint guard's (``iter_safetensors_shards``).
     """
     rules = model.checkpoint_rules()
     loaded: set[str] = set()
     for selector in selectors:
         loaded |= load_weights_into(
             model,
-            iter_safetensors_shards(Path(path), device=device, **selector),
+            iter_safetensors_shards(Path(path), device=device, quant_methods=quant_methods, **selector),
             name_remapper=rules.remap,
             stacked_params=list(rules.stacked_params),
         )
-    missing = sorted(expected - loaded)
+    missing = sorted(expected() - loaded)
     if missing:
         raise ValueError(
             f"{len(missing)} parameter(s) got no weight, e.g. {missing[:5]}"
@@ -96,11 +108,13 @@ def load_qwen3_5_weights(
         selectors.append({"keys": {_LM_HEAD}})
     return _load(
         model, path, device, selectors,
-        expected={
+        expected=lambda: {
             n for n, _ in model.named_parameters()
             # tied: the checkpoint carries no tensor for it
             if not (tied and n == _LM_HEAD)
         },
+        # a quantized checkpoint only under the engine's plan, which loads it (`load_submodule`)
+        quant_methods=scope.quant_methods(),
     )
 
 
@@ -109,8 +123,14 @@ def load_qwen3_5_vision_weights(
     path: str | Path,
     device: torch.device | str = "cpu",
 ) -> set[str]:
-    """Load the ViT. Returns the parameter paths that were filled."""
+    """Load the ViT. Returns the parameter paths that were filled.
+
+    An FP8 checkpoint stores the tower bf16 (Qwen's ``modules_to_not_convert``),
+    so it loads as one; were a tower tensor stored quantized, ``load_weights_into``
+    would refuse its scale, which no parameter here takes.
+    """
     return _load(
         model, path, device, [{"prefix": _VISION_PREFIX}],
-        expected={n for n, _ in model.named_parameters()},
+        expected=lambda: {n for n, _ in model.named_parameters()},
+        quant_methods=QUANT_METHODS,
     )
