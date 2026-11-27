@@ -1,8 +1,10 @@
-"""DeepSeek-OCR on the state contract builds the specs, steps and layouts it wrote by hand, field for field.
+"""DeepSeek-OCR on the state contract builds the specs, steps and layouts it wrote by hand, field for field, and its
+forward makes the same calls on them.
 
 The engine sees the same objects whether a model declares its state or writes its specs, so the port changes nothing
-it runs. The hand-written specs and steps below are the reference, copied from the model as it stood before the port
-(``get_node_resources`` and ``layer_steps`` at b1266bfe9), so the adapter can't pass by agreeing with itself.
+it runs. The hand-written specs, steps and calls below are the reference, copied from the model as it stood before the
+port (``get_node_resources``, ``layer_steps`` and the decoder's forward at b1266bfe9), so the adapter can't pass by
+agreeing with itself.
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig  # no
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep  # noqa: E402
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
-from mstar.engine.resources.step import Segment, SubmoduleStep  # noqa: E402
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep  # noqa: E402
 from mstar.engine.state import SampleSettings  # noqa: E402
 from mstar.engine.state.adapters import (  # noqa: E402
     StateSetup,
@@ -33,15 +35,22 @@ from mstar.engine.state.adapters import (  # noqa: E402
 )
 from mstar.engine.state.analysis import state_declaration_problems  # noqa: E402
 from mstar.model.base import enabled_resources, serving_resources  # noqa: E402
+from mstar.model.components.sampled_token_decoder import MEDIA_EMBEDS, MEDIA_MASK  # noqa: E402
 from mstar.model.deepseek_ocr.config import ATTN  # noqa: E402
 from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, SAMPLER  # noqa: E402
 from mstar.model.multimodal_decoder import MIXED_SPLIT, MultimodalDecoderModel  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, engine_step  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, engine_step  # noqa: E402
 
 # DeepSeek-OCR's config.json, as the package's other tests read it
 FIXTURE = Path(__file__).parent / "fixtures" / "config.json"
 PUBLISHED = Path(__file__).parents[4] / "configs" / "deepseek_ocr.yaml"
 PREFILL_VISION = "prefill_vision"
+# A decoder a CPU can run: the checkpoint's 12 layers at a small width, each one dense, since the MoE's kernels need a
+# GPU.
+SMALL = {
+    "hidden_size": 16, "intermediate_size": 24, "num_attention_heads": 2, "num_key_value_heads": 2,
+    "first_k_dense_replace": 12,
+}
 # What a deployment with no `resources:` block of its own could set.
 OVERRIDES = {"resources": {
     KV_CACHE: {"max_num_pages": 512, "cpu_offload_pages": 64}, ATTN: {"flashinfer_backend": "fa2"},
@@ -72,10 +81,12 @@ def _no_tokenizer_files(monkeypatch):
                         classmethod(lambda cls, path: _CharTokenizer()))
 
 
-def _model(tmp_path, generation: dict | None = None, **kwargs):
+def _model(tmp_path, generation: dict | None = None, language: dict | None = None, **kwargs):
     from mstar.model.deepseek_ocr.deepseek_ocr_model import DeepseekOCRModel
 
-    (tmp_path / "config.json").write_text(FIXTURE.read_text())
+    config = json.loads(FIXTURE.read_text())
+    config["language_config"].update(language or {})
+    (tmp_path / "config.json").write_text(json.dumps(config))
     if generation is not None:
         (tmp_path / "generation_config.json").write_text(json.dumps(generation))
     return DeepseekOCRModel(str(tmp_path), **kwargs)
@@ -157,21 +168,53 @@ def test_a_request_samples_through_the_contracts_settings(tmp_path):
 
 
 class _StubResource:
-    """Stands in for any built resource a handle reads at bind."""
+    """Stands in for the built resource under ``key``, and logs each call a forward makes on it."""
+
+    # as the paged attention's kernels, which read the pages an add wrote
+    requires_kv_write = True
+
+    def __init__(self, key: str, calls: list[tuple]):
+        self.key, self.calls = key, calls
 
     def layer_view(self, i):
         return torch.empty(0)
 
-    def run(self, q, k=None, v=None, label=None):
+    def opens_label(self, rid, label):
+        return True
+
+    def apply_qk(self, q, k, label=None, rope_dtype=None):
+        self.calls.append((self.key, "apply_qk", label))
+        return q, k
+
+    def write_kv(self, k, v, layer_idx=None, label=None):
+        self.calls.append((self.key, "write_kv", layer_idx, label))
+
+    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
+        self.calls.append((self.key, "run", layer_idx, label))
         return q
 
+    def select_last_hidden(self, x, label=None):
+        self.calls.append((self.key, "select_last_hidden", label))
+        return x[-1:]
 
-def _node(model, language_model=None):
+    def loopback_tokens(self, rids):
+        self.calls.append((self.key, "loopback_tokens", tuple(rids)))
+        return torch.zeros(len(rids), dtype=torch.long)
+
+    def sample(self, rids, logits=None):
+        self.calls.append((self.key, "sample", tuple(rids)))
+        return logits.argmax(-1)
+
+
+def _node(model, language_model=None, calls: list[tuple] | None = None):
+    """The LLM node bound as the engine binds it, over stand-ins that log to ``calls``."""
     from mstar.model.deepseek_ocr.submodules import DeepseekOCRLLMSubmodule
 
     node = DeepseekOCRLLMSubmodule(language_model, model.config, model.encoders,
                                    max_prompt_tokens=model.max_prompt_tokens())
-    resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
+    calls = [] if calls is None else calls
+    resources = {spec.resource_key: _StubResource(spec.resource_key, calls) for spec in node_resources(model)}
+    node.bind_node_resources(resources)
     node.bind_node_state(node_handles(model, "LLM", resources))
     return node
 
@@ -219,18 +262,49 @@ def test_steps_equal_the_hand_written_ones(tmp_path, walk):
         assert actual == expected, f"{key} differs from the hand-written step"
 
 
-def test_every_layer_attends_through_the_array_at_its_own_layer(tmp_path):
-    """The CPU tests never run the decoder's forward, so a layer with no id, or none bound, would first fail on a
-    GPU: it would add and read another layer's KV, or reach for the resource cursors the port removed."""
+def _reference_calls(walk: str, layers: int) -> list[tuple]:
+    """The calls the hand-written node made on its resources in a step of one row: decode's loop-back read; per layer,
+    `DeepseekOCRAttention`'s rotation, then the KV write and the attention under the layer cursor; a prefill's
+    last-token select; the draw."""
+    calls = [(SAMPLER, "loopback_tokens", (1,))] if walk == "decode" else []
+    for layer in range(layers):
+        calls += [(ROPE, "apply_qk", "main"), (KV_CACHE, "write_kv", layer, "main"), (ATTN, "run", layer, "main")]
+    if walk != "decode":
+        calls.append((ATTN, "select_last_hidden", "main"))
+    return [*calls, (SAMPLER, "sample", (1,))]
+
+
+@pytest.mark.parametrize("walk", [PREFILL_TEXT, PREFILL_VISION, "decode"])
+def test_the_forward_makes_the_hand_written_ones_calls(tmp_path, walk):
+    """The node's step as the engine runs it, through the handles of the model's own declaration: every layer rotates,
+    adds and reads at its own layer of the array, in the order the hand-written forward did under its cursors. The
+    layers pass no rotation parameter, where `DeepseekOCRAttention` passed them by hand: they are the spec's, which
+    the tests above compare."""
     from mstar.model.deepseek_ocr.components.language_model import DeepseekOCRLanguageModel
 
-    model = _model(tmp_path)
-    with torch.device("meta"):
-        language_model = DeepseekOCRLanguageModel(model.config)
-    node = _node(model, language_model)
-    attentions = [layer.self_attn for layer in language_model.layers]
-    assert [int(attn.layer) for attn in attentions] == list(range(model.config.num_hidden_layers))
-    assert all(attn.state is node.state_handles[KV_CACHE] for attn in attentions), "a layer has no handle"
+    model = _model(tmp_path, language=SMALL)
+    calls: list[tuple] = []
+    node = _node(model, DeepseekOCRLanguageModel(model.config), calls)
+    # an image prompt: the BOS, three pads that its encoder rows replace, and two text tokens
+    ids = torch.tensor([0, *[model.image_token_id] * 3, 40, 41])
+    media = {MEDIA_EMBEDS: torch.zeros(3, model.config.hidden_size), MEDIA_MASK: ids == model.image_token_id}
+    row = {
+        PREFILL_TEXT: ARNodeInputs(input_ids=torch.arange(6), input_seq_len=6),
+        PREFILL_VISION: ARNodeInputs(input_ids=ids, input_seq_len=6, tensor_inputs=media),
+        # its token loops back off the sampler
+        "decode": ARNodeInputs(input_seq_len=1),
+    }[walk]
+    step = engine_step(node, graph_walk=walk, request_ids=[1], inputs=[row])
+    step.set_ctx(StepContext(request_ids=(1,), graph_walk=walk, slot=0, capture=False))
+    step.begin_calls()
+    try:
+        engine_inputs = ModelInputsFromEngine(request_ids=[1], per_request_info={}, step=step)
+        node.forward(walk, engine_inputs, **node.preprocess(walk, engine_inputs, [row]))
+        # the handles' own check: every declared layer added, and the sampler drew once
+        step.check_calls()
+    finally:
+        step.end_calls()
+    assert calls == _reference_calls(walk, model.config.num_hidden_layers)
 
 
 @pytest.mark.parametrize("modalities, images", [
