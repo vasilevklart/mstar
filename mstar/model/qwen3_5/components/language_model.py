@@ -42,7 +42,6 @@ from mstar.model.qwen3_5.config import (
     LLM_SHARD,
     Qwen3_5Config,
 )
-from mstar.platforms import current_platform
 
 
 class RopeCache:
@@ -236,12 +235,11 @@ class Qwen3_5LanguageModel(nn.Module):
         # The cast to the model's dtype rounds this buffer too. In bf16 a
         # frequency is off by up to 0.3 %, and the angle error grows with the
         # distance between two tokens, so long-range attention reads the wrong
-        # keys.
-        if current_platform.is_rocm():
-            self.inv_freq = compute_inv_freq(
-                self.config.rotary_dim, self.config.rope_theta,
-                device=self.inv_freq.device,
-            )
+        # keys. Upstream keeps it in fp32.
+        self.inv_freq = compute_inv_freq(
+            self.config.rotary_dim, self.config.rope_theta,
+            device=self.inv_freq.device,
+        )
         return result
 
     def build_cos_sin(

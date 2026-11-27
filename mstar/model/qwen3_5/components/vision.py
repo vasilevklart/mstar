@@ -43,7 +43,8 @@ class Qwen3_5VisionModel(nn.Module):
         self.pos_embed = nn.Embedding(
             config.num_position_embeddings, config.hidden_size,
         )
-        self.rotary_pos_emb = VisionRotaryEmbedding(config)
+        # fp32 frequencies through the engine's cast, as upstream keeps them
+        self.rotary_pos_emb = VisionRotaryEmbedding(config, keep_fp32=True)
         self.blocks = nn.ModuleList(
             VisionBlock(config, VISION_ATTN, array=VISION_TOKENS, layer=layer) for layer in range(config.depth)
         )
