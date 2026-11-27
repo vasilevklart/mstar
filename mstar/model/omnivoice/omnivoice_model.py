@@ -19,6 +19,7 @@ resolved once per request, so two callers can ask for 16 and 32 steps in the
 same batch.  A fixed-pipeline port has to pick one value for the whole server.
 """
 
+import importlib.util
 import logging
 import math
 import os
@@ -71,6 +72,34 @@ REQUEST_KWARGS = frozenset({
     "class_temperature", "postprocess_output", "pad_duration", "fade_duration",
     "speed", "duration", "language", "instruct", "ref_text", "denoise",
 })
+
+#: The runtime is the reference package, from git: PyPI's release has no
+#: ``omnivoice.models.omnivoice_flashinfer``, the packed forward the backbone
+#: drives, and a package on PyPI can't require a git URL, so no extra installs it.
+OMNIVOICE_INSTALL = 'uv pip install "git+https://github.com/k2-fsa/OmniVoice.git"'
+
+
+def omnivoice_problem() -> str | None:
+    """Why this environment's ``omnivoice`` can't serve, with the line that
+    installs one that can; None when it can."""
+    if importlib.util.find_spec("omnivoice") is None:
+        return f"OmniVoice needs the omnivoice package, which no extra installs: {OMNIVOICE_INSTALL}"
+    try:
+        packed = importlib.util.find_spec("omnivoice.models.omnivoice_flashinfer")
+    except ImportError:  # no omnivoice.models at all
+        packed = None
+    if packed is None:
+        return (
+            "the installed omnivoice has no omnivoice.models.omnivoice_flashinfer (PyPI's "
+            f"release lacks it), which OmniVoice's backbone runs; install it from git: {OMNIVOICE_INSTALL}"
+        )
+    return None
+
+
+def require_omnivoice() -> None:
+    """Raise ImportError naming the install line unless ``omnivoice`` can serve."""
+    if (problem := omnivoice_problem()) is not None:
+        raise ImportError(problem)
 
 
 def _number(kwargs: dict, key: str, default: float, rule: str = "", ok=None) -> float:
@@ -189,6 +218,12 @@ class OmniVoiceModel(Model):
         self._codec: torch.nn.Module | None = None
         self._codec_hop: int | None = None
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse to start without an ``omnivoice`` that can serve, before any
+        worker starts loading weights through it. Dummy mode needs none."""
+        if not self.skip_weight_loading and (problem := omnivoice_problem()) is not None:
+            raise ValueError(problem)
+
     # ------------------------------------------------------------------
     # Model ABC: structure
     # ------------------------------------------------------------------
@@ -301,6 +336,7 @@ class OmniVoiceModel(Model):
             return
         from transformers import AutoTokenizer
 
+        require_omnivoice()
         from omnivoice.utils.duration import RuleDurationEstimator
 
         self._duration_estimator = RuleDurationEstimator()
@@ -660,6 +696,7 @@ class OmniVoiceModel(Model):
         """
         if self.skip_weight_loading:
             return None
+        require_omnivoice()
 
         if node_name in ("ref_encoder", "code2wav"):
             codec = self._get_codec(device)
