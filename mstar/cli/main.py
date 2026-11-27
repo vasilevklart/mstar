@@ -119,12 +119,39 @@ def _squash(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
+def _repo_id(model: str) -> str:
+    """``owner/name`` of a Hugging Face repo id or huggingface.co URL, lower-cased;
+    a name without an owner stays a name."""
+    return "/".join([part for part in model.lower().split("/") if part][-2:])
+
+
+def _checkpoint(key: str) -> str | None:
+    """The Hugging Face repo the model key ``key`` serves, when the registry names one."""
+    from mstar.model.registry import HF_MODELS  # imports no torch, so the refusal stays instant
+
+    repo = HF_MODELS.get(key, {}).get("model_path_hf")
+    return repo if isinstance(repo, str) and "/" in repo else None
+
+
+def _serving(model: str) -> list[str]:
+    """The model keys whose checkpoint is the repo ``model`` names: by its id or
+    URL, or by its name when no owner is given."""
+    given = _repo_id(model)
+
+    def named(repo: str) -> str:
+        return repo if "/" in given else repo.rsplit("/", 1)[-1]
+
+    return [key for key in DEFAULT_CONFIGS if given and (repo := _checkpoint(key)) and named(repo.lower()) == given]
+
+
 def _likely_models(model: str) -> list[str]:
-    """The model keys ``model`` most likely meant: the key with the same
-    letters and digits (``qwen3_5_9b`` for the Hugging Face id
-    ``Qwen/Qwen3.5-9B``), else the longest key the name starts with (``bagel``
-    for ``ByteDance-Seed/BAGEL-7B-MoT``), else, for a name that isn't a repo
-    id, the closest spellings."""
+    """The model keys ``model`` most likely meant: the keys that serve that
+    Hugging Face repo (``qwen3_5_9b`` for ``Qwen/Qwen3.5-9B``, ``bagel`` for
+    ``ByteDance-Seed/BAGEL-7B-MoT``), else the key with the same letters and
+    digits, else the longest key the name starts with, else, for a name that
+    isn't a repo id, the closest spellings (``kokoro`` for ``kokro``)."""
+    if served := _serving(model):
+        return served
     name = model.rstrip("/").rsplit("/", 1)[-1]
     squashed = _squash(name)
     if not squashed:
@@ -141,6 +168,15 @@ def _likely_models(model: str) -> list[str]:
     return difflib.get_close_matches(re.sub(r"[^a-z0-9.]+", "_", name.lower()), list(DEFAULT_CONFIGS), n=3)
 
 
+def _suggested(key: str, model: str) -> str:
+    """``key`` as a guess for the repo id ``model``, naming the checkpoint ``key``
+    serves when it is another one (``glm52`` serves ``zai-org/GLM-5.2-FP8``)."""
+    repo = _checkpoint(key)
+    if "/" in model and repo is not None and repo.lower() != _repo_id(model):
+        return f"{key} (serves {repo})"
+    return key
+
+
 def _resolve_config(model: str, override: str | None) -> str:
     if override:
         p = Path(override)
@@ -149,9 +185,12 @@ def _resolve_config(model: str, override: str | None) -> str:
         return str(p)
     if model not in DEFAULT_CONFIGS:
         avail = ", ".join(sorted(DEFAULT_CONFIGS))
-        hint = " mstar serve takes a model key, not a Hugging Face repo id." if "/" in model else ""
-        if likely := _likely_models(model):
-            hint += f" Did you mean {' or '.join(likely)}?"
+        if model.endswith((".yaml", ".yml")):
+            hint = f" A config file goes in --config: mstar serve <model key> --config {model}."
+        else:
+            hint = " mstar serve takes a model key, not a Hugging Face repo id." if "/" in model else ""
+            if likely := _likely_models(model):
+                hint += f" Did you mean {' or '.join(_suggested(key, model) for key in likely)}?"
         sys.exit(f"error: unknown model {model!r}.{hint} Known models: {avail}\n"
                  f"       (or pass --config <path.yaml> for a custom deployment)")
     name = DEFAULT_CONFIGS[model]

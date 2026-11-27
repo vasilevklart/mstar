@@ -1,6 +1,11 @@
-from importlib import import_module
+from __future__ import annotations
 
-from mstar.model.base import Model
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # for the annotation only: `mstar serve` reads HF_MODELS without importing torch
+    from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
