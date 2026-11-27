@@ -225,6 +225,27 @@ def test_wan22_worker_graphs_from_yaml():
     }
 
 
+def test_wan22_yaml_warms_up_the_compiled_default_shape():
+    """The default config's warmup is a text-to-video request at the default shape, which
+    is the one shape the DiT compiles for by default, so its compile runs before ready."""
+    import yaml
+
+    from mstar.api_server.entrypoint import WarmupRequest
+
+    deployment = yaml.safe_load(Path(CONFIG_PATH).read_text())
+    (warmup,) = [WarmupRequest.from_config(spec) for spec in deployment["warmup_requests"]]
+    assert warmup.output_modalities == ["video"] and not warmup.files
+    kwargs = warmup.model_kwargs
+    assert set(kwargs) == {"num_inference_steps"} and kwargs["num_inference_steps"] >= 2
+    model = _make_model()
+    assert model.process_prompt(warmup.text, ["text"], ["video"], **kwargs)["text_inputs"]
+    config = model.config
+    default_grid = Wan22Config(
+        compile_dit_sizes=[f"{config.default_width}x{config.default_height}x{config.default_num_frames}"]
+    ).compile_dit_grids()
+    assert default_grid == config.compile_dit_grids()
+
+
 # ----------------------------------------------------------------------
 # Walk plan
 # ----------------------------------------------------------------------
