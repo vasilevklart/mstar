@@ -193,6 +193,7 @@ Issues and pull requests are welcome. Found a bug, or want a model or feature su
 **[Open an issue](https://github.com/mstar-project/mstar/issues).** To add a model yourself,
 follow the [Adding a New Model](https://m-star.org/mstar/adding_models.html) guide.
 PRs to `main` go through review and CI (`ruff`).
+To report a security problem, please don't open an issue; see [SECURITY.md](SECURITY.md).
 
 ## Citation
 
