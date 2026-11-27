@@ -254,7 +254,8 @@ The GPU model families depend on:
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
   Pinned to the version the attention wrappers' direct planner calls were checked against
   (``DIRECT_PLAN_FLASHINFER_VERSIONS`` in ``mstar/engine/resources/attn/wrappers.py``); on any
-  other version they fall back to FlashInfer's own ``plan()``.
+  other version they fall back to FlashInfer's own ``plan()``. Its kernels compile on first use
+  unless you install them prebuilt (see `Prebuilt FlashInfer kernels`_).
 - **flash-attn** — used by LingBot-World's ``reference_numerics`` mode. **Not installed by any extra**; install it separately
   (see `flash-attn (LingBot-World)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
@@ -274,7 +275,48 @@ The GPU model families depend on:
 
 Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
-that for you (next section).
+that for you (see `Matching your CUDA toolkit`_).
+
+Prebuilt FlashInfer kernels
+---------------------------
+
+FlashInfer compiles each kernel the first time a server uses it, which takes 2 to 4 minutes of a
+first start on an H200 (Qwen3.5-0.8B was ready in 487 s with empty caches and in 281 s with the
+prebuilt kernels installed). FlashInfer publishes those kernels prebuilt, per CUDA build and GPU
+architecture, on its own wheel index rather than on PyPI, so no extra installs them. After
+installing ``mstar-ai`` and its extras, run one of these in the same environment:
+
+.. code-block:: bash
+
+   # the kernels for this machine's GPUs only (H100/H200: about 300 MB to download)
+   flashinfer install-jit-cache-wheel --mode minimal
+
+   # or every GPU architecture plus the cubins (about 2.9 GB to download; the cubins take
+   # 6.3 GB installed): for an image that runs on several GPU types, and for Blackwell, whose
+   # decode kernels are cubins that FlashInfer otherwise downloads on first use
+   flashinfer download-kernels
+
+Both pick the wheels that match the installed ``flashinfer-python`` and torch's CUDA build, and
+install them with ``uv`` when ``uv`` made the environment. ``--mode minimal`` looks at the visible
+GPUs; on a machine without one, such as a Docker build, name the architectures instead
+(``--sm sm90a --sm sm100a``). Check the result with ``flashinfer show-config``, which lists the
+installed ``flashinfer-jit-cache`` and ``flashinfer-cubin``.
+
+- They need a torch built for CUDA 12.9 or newer (``+cu129``, ``+cu130``). FlashInfer publishes
+  no ``+cu128`` kernels for the pinned version, so next to a cu128 torch the commands stop with
+  "No compatible flashinfer-jit-cache wheel found" and FlashInfer keeps compiling on first use.
+- Run them again after ``flashinfer-python`` changes version. FlashInfer ignores kernel wheels of
+  another version (it logs "Ignoring incompatible flashinfer-jit-cache package") and compiles
+  instead.
+- Install the kernels with these commands rather than by hand: each per-architecture wheel
+  (``flashinfer-jit-cache-sm90a`` and so on) expects the ``flashinfer-jit-cache`` package beside
+  it.
+- Tensor-parallel deployments on Hopper still compile one module on their first start,
+  ``trtllm_mnnvl_comm`` (about 50 s on an H200): FlashInfer prebuilds it for Blackwell only.
+  It is cached like any other build (see :ref:`serving:Restarts and the compile cache`).
+
+A worker that finds no prebuilt kernel for its GPU logs a warning at startup that names the
+first command.
 
 omnivoice (OmniVoice)
 ---------------------

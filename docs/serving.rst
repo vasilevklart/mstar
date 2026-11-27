@@ -1000,7 +1000,8 @@ Restarts and the compile cache
 ------------------------------
 
 On a first start Inductor compiles every capture bucket (tuning it at ``-O1`` and
-``-O2``), and FlashInfer JIT-builds its kernels. Both cache the results, and a
+``-O2``), and FlashInfer JIT-builds its kernels (install them prebuilt to skip most of
+that, see :ref:`installation:Prebuilt FlashInfer kernels`). Both cache the results, and a
 start that finds them skips that work. Qwen3.5-0.8B on an H200 took 320 s to start with an
 empty cache at the default ``-O1`` (1,294 s at ``-O2``); a warm start skips Inductor's
 compile and tuning. torch's default cache in ``/tmp`` already survives a process restart on

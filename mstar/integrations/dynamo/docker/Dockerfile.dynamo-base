@@ -8,9 +8,9 @@
 # The base contributes the Dynamo runtime artifacts (etcd/nats binaries,
 # UCX/NIXL libraries) and the CUDA stack; M* installs into its own venv and
 # never touches the engine environment the base ships with. The base must
-# provide nvcc — the vendored MoE align kernel and FlashInfer JIT-compile
-# CUDA kernels on first use. If it doesn't, use the sibling Dockerfile,
-# which builds on a CUDA -devel image.
+# provide nvcc — the vendored MoE align kernel and any FlashInfer kernel the
+# prebuilt wheels lack JIT-compile on first use. If it doesn't, use the
+# sibling Dockerfile, which builds on a CUDA -devel image.
 ARG DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.0
 
 FROM ${DYNAMO_IMAGE}
@@ -106,6 +106,13 @@ RUN if [ "${MOONCAKE_PACKAGE}" != mooncake-transfer-engine ]; then \
         v=$(/opt/mstar/venv/bin/python -c "import importlib.metadata as m; print(m.version('mooncake-transfer-engine'))") \
         && uv pip uninstall --python /opt/mstar/venv/bin/python mooncake-transfer-engine \
         && uv pip install --python /opt/mstar/venv/bin/python --reinstall --no-deps "${MOONCAKE_PACKAGE}==${v}"; \
+    fi
+
+# FlashInfer's prebuilt kernels for every architecture, as in the sibling
+# Dockerfile (which says how to make the step leaner or skip it).
+ARG FLASHINFER_KERNELS=download-kernels
+RUN if [ "${FLASHINFER_KERNELS}" != none ]; then \
+        /opt/mstar/venv/bin/python -m flashinfer ${FLASHINFER_KERNELS}; \
     fi
 
 # The venv must lead PATH: FlashInfer's JIT invokes ninja (installed in the

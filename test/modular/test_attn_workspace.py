@@ -278,6 +278,61 @@ def test_other_planner_errors_are_not_retried(message):
     assert workspace.tensor.numel() == MIB
 
 
+@pytest.fixture
+def kernel_lookup(monkeypatch):
+    """A FlashInfer whose prebuilt-kernel lookup answers from ``artifacts`` on a GPU of ``major``."""
+    state = SimpleNamespace(artifacts=(), major=9, asked=[])
+
+    def get_aot_artifacts(name):
+        state.asked.append(name)
+        return state.artifacts
+
+    jit = SimpleNamespace(env=SimpleNamespace(get_aot_artifacts=get_aot_artifacts))
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(__version__="0.7.2", jit=jit))
+    monkeypatch.setitem(sys.modules, "flashinfer.jit", jit)
+    monkeypatch.setitem(sys.modules, "flashinfer.jit.env", jit.env)
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (state.major, 0))
+    workspace_mod.warn_if_flashinfer_kernels_missing.cache_clear()
+    yield state
+    workspace_mod.warn_if_flashinfer_kernels_missing.cache_clear()
+
+
+def test_a_gpu_without_prebuilt_flashinfer_kernels_warns_once_with_the_command(kernel_lookup, caplog):
+    gpu = torch.device("cuda", 0)
+    with caplog.at_level("WARNING", logger=workspace_mod.__name__):
+        workspace_mod.warn_if_flashinfer_kernels_missing(gpu)
+        workspace_mod.warn_if_flashinfer_kernels_missing(gpu)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "flashinfer-python 0.7.2" in warnings[0]
+    assert "flashinfer install-jit-cache-wheel --mode minimal" in warnings[0]
+    assert kernel_lookup.asked == ["sampling"]
+
+
+@pytest.mark.parametrize("case", ["installed", "pre-sm80", "rocm", "cpu", "no lookup"])
+def test_prebuilt_flashinfer_kernels_or_a_gpu_they_dont_cover_stay_quiet(kernel_lookup, monkeypatch, caplog, case):
+    device = torch.device("cuda", 0)
+    if case == "installed":
+        kernel_lookup.artifacts = (SimpleNamespace(provider_id="sm90a"),)
+    elif case == "pre-sm80":
+        kernel_lookup.major = 7
+    elif case == "rocm":
+        monkeypatch.setattr(torch.version, "hip", "6.4")
+    elif case == "cpu":
+        device = CPU
+    else:  # a FlashInfer older than the provider lookup
+        del sys.modules["flashinfer.jit.env"].get_aot_artifacts
+    with caplog.at_level("WARNING", logger=workspace_mod.__name__):
+        workspace_mod.warn_if_flashinfer_kernels_missing(device)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_a_cpu_pool_never_looks_for_flashinfer_kernels(kernel_lookup):
+    WorkspacePool(CPU, size_mb=1).get("main", 0)
+    assert kernel_lookup.asked == []
+
+
 class _NativeWrapper:
     """A FlashInfer wrapper as far as a plan goes, asking for ``asks`` of its workspace."""
 

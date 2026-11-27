@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKER_DIR = REPO_ROOT / "mstar/integrations/dynamo/docker"
 DOCKERFILES = [DOCKER_DIR / "Dockerfile", DOCKER_DIR / "Dockerfile.dynamo-base"]
 PIN_ARGS = ("TORCH_INDEX", "TORCH_VERSION", "TORCHVISION_VERSION", "TORCHAUDIO_VERSION",
-            "TORCHCODEC_VERSION", "FLASH_ATTN_WHEEL", "MOONCAKE_PACKAGE")
+            "TORCHCODEC_VERSION", "FLASH_ATTN_WHEEL", "MOONCAKE_PACKAGE", "FLASHINFER_KERNELS")
 # Mooncake's wheel per CUDA major; the extras name the CUDA 12 one (#480)
 MOONCAKE_WHEELS = {"12": "mooncake-transfer-engine", "13": "mooncake-transfer-engine-cuda13"}
 
@@ -119,6 +119,19 @@ class DockerPinTests(unittest.TestCase):
             self.assertIn('--reinstall --no-deps "${MOONCAKE_PACKAGE}', step)
             self.assertIn("m.version('mooncake-transfer-engine')", step)
 
+    def test_images_install_flashinfers_prebuilt_kernels_after_flashinfer(self):
+        # the CLI matches the kernel wheels to the installed flashinfer-python and torch's CUDA,
+        # so it runs once both are final: after the .[all] install and the Mooncake swap
+        for path in DOCKERFILES:
+            text = path.read_text().replace("\\\n", " ")
+            step = re.search(r'^RUN if \[ "\$\{FLASHINFER_KERNELS\}" != none \][^\n]*$', text, re.MULTILINE)
+            self.assertIsNotNone(step, f"{path.name}: no FlashInfer kernels step")
+            self.assertIn("/opt/mstar/venv/bin/python -m flashinfer ${FLASHINFER_KERNELS}", step.group(0))
+            swap = text.index('RUN if [ "${MOONCAKE_PACKAGE}"')
+            self.assertGreater(step.start(), text.index(mstar_install(path)), path.name)
+            self.assertGreater(step.start(), swap, path.name)
+            self.assertEqual(build_args(path)["FLASHINFER_KERNELS"], "download-kernels", path.name)
+
     def test_the_cuda_base_image_gets_mooncakes_system_libraries(self):
         # Mooncake's engine links libibverbs, libmlx5 and libcurl; the CUDA -devel base has none
         # of them (the Dynamo runtime base ships them)
@@ -134,6 +147,8 @@ class DockerPinTests(unittest.TestCase):
         self.assertEqual(overrides["MOONCAKE_PACKAGE"], MOONCAKE_WHEELS["12"])
         self.assertIn("CUDA_IMAGE", overrides)
         self.assertIn("FLASH_ATTN_WHEEL", overrides)
+        # FlashInfer publishes no CUDA 12.8 kernel wheels: its CLI fails the build there
+        self.assertEqual(overrides["FLASHINFER_KERNELS"], "none")
 
 
 if __name__ == "__main__":

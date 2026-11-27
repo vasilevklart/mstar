@@ -17,10 +17,11 @@
 #   --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu128
 #   --build-arg FLASH_ATTN_WHEEL=<your cu12 torch2.10 wheel>
 #   --build-arg MOONCAKE_PACKAGE=mooncake-transfer-engine
+#   --build-arg FLASHINFER_KERNELS=none
 
 # A -devel base is required at runtime, not just at build time: the vendored
-# MoE align kernel and FlashInfer both JIT-compile CUDA kernels on first use
-# and need nvcc. Fully qualified so rootless podman/buildah builds don't trip
+# MoE align kernel and any FlashInfer kernel the prebuilt wheels lack
+# JIT-compile on first use and need nvcc. Fully qualified so rootless podman/buildah builds don't trip
 # on short-name resolution.
 ARG CUDA_IMAGE=docker.io/nvidia/cuda:13.0.2-devel-ubuntu24.04
 
@@ -118,6 +119,20 @@ RUN if [ "${MOONCAKE_PACKAGE}" != mooncake-transfer-engine ]; then \
         v=$(/opt/mstar/venv/bin/python -c "import importlib.metadata as m; print(m.version('mooncake-transfer-engine'))") \
         && uv pip uninstall --python /opt/mstar/venv/bin/python mooncake-transfer-engine \
         && uv pip install --python /opt/mstar/venv/bin/python --reinstall --no-deps "${MOONCAKE_PACKAGE}==${v}"; \
+    fi
+
+# FlashInfer's prebuilt kernels, matched to the installed flashinfer-python and
+# torch's CUDA build, so a container's first start loads them instead of
+# compiling them (2 to 4 minutes on an H200; docs/installation.rst, "Prebuilt
+# FlashInfer kernels"). download-kernels takes every architecture's jit-cache
+# and the cubins Blackwell decodes with (about 2.9 GB to download) and needs no
+# GPU. For a leaner image, name the architectures and skip the cubins by
+# setting FLASHINFER_KERNELS to
+#   "install-jit-cache-wheel --mode minimal --sm sm90a --sm sm100a"
+# FlashInfer publishes no CUDA 12.8 kernels, so a cu128 build passes none.
+ARG FLASHINFER_KERNELS=download-kernels
+RUN if [ "${FLASHINFER_KERNELS}" != none ]; then \
+        /opt/mstar/venv/bin/python -m flashinfer ${FLASHINFER_KERNELS}; \
     fi
 
 # The venv must lead PATH: FlashInfer's JIT invokes ninja (installed in the

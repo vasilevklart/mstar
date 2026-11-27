@@ -1,5 +1,6 @@
 """FlashInfer's workspaces: the scratch a plan reserves its split-KV partials in."""
 
+import functools
 import logging
 import os
 import re
@@ -10,6 +11,36 @@ import torch
 logger = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
+
+
+@functools.cache
+def warn_if_flashinfer_kernels_missing(device: torch.device) -> None:
+    """Warn once when no prebuilt FlashInfer kernel (``flashinfer-jit-cache``) matches this GPU and
+    the installed ``flashinfer-python``. FlashInfer then compiles each kernel on its first use,
+    2 to 4 minutes of a first start on an H200 (docs/installation.rst, "Prebuilt FlashInfer
+    kernels"). The sampling module stands in for the rest: every LLM sampler loads it."""
+    if device.type != "cuda" or torch.version.hip is not None:
+        return
+    # FlashInfer's prebuilt kernels start at sm80
+    if torch.cuda.get_device_capability(device)[0] < 8:
+        return
+    try:
+        from flashinfer.jit import env
+
+        if env.get_aot_artifacts("sampling"):
+            return
+        import flashinfer
+
+        version = flashinfer.__version__
+    except Exception:  # noqa: BLE001 - a FlashInfer without the lookup (or a stand-in): say nothing
+        return
+    logger.warning(
+        "No prebuilt FlashInfer kernels (flashinfer-jit-cache) match this GPU and flashinfer-python "
+        "%s, so FlashInfer compiles each kernel on its first use, which adds minutes to a first "
+        "start. Install them with `flashinfer install-jit-cache-wheel --mode minimal` (it needs a "
+        "torch built for CUDA 12.9 or newer; see Prebuilt FlashInfer kernels in docs/installation.rst).",
+        version,
+    )
 
 # How a plan reports a short workspace. The paged wrappers can also be asked ahead of a plan
 # (`workspace_size`) but the ragged one can't, so this is the report every wrapper shares. A
@@ -134,6 +165,8 @@ class WorkspacePool:
     """
 
     def __init__(self, device: torch.device, size_mb: int | None = None, owner: str = "attention"):
+        # the first FlashInfer resource a worker builds, ahead of any kernel it loads
+        warn_if_flashinfer_kernels_missing(torch.device(device))
         self._device = device
         self._owner = owner
         self._size = workspace_bytes(size_mb)
