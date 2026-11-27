@@ -1010,7 +1010,12 @@ The spec types are:
        captured one-token decode rows on FlashInfer's trtllm-gen fmha kernel on Blackwell,
        with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
        the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
-       kernels. Qwen3.5 declares ``True``. ``sm_scale`` (default
+       kernels. Qwen3.5 declares ``True``. ``prefill_backend`` (default ``"flashinfer"``)
+       set to ``"fa3"`` runs a captured step's prompt rows (a split walk's prompt half, a
+       multi-token bucket's rows) on FlashAttention-3's paged kernel from the
+       ``flash_attn_3`` wheel, on Hopper; where it can't run (no wheel, another GPU, a
+       sliding window, ``sm_scale``, a context-parallel pool) they stay on FlashInfer with a
+       warning, as do decode rows and eager steps. ``sm_scale`` (default
        ``1/sqrt(head_dim)``) sets the softmax scale; FlashInfer and ``FLASHINFER_MLA``
        read it, and the other backends refuse it. ``FLASHINFER_MLA`` is
        Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
@@ -3185,7 +3190,8 @@ that a misspelled setting is never silently ignored:
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
-       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
+       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``), ``prefill_backend``
+       (``flashinfer`` / ``fa3``)
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)

@@ -538,7 +538,8 @@ them by that name:
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp,
                                 # context_parallel
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha,
+                                # prefill_backend (flashinfer / fa3)
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
