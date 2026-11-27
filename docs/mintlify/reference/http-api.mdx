@@ -1,0 +1,82 @@
+---
+title: "HTTP API"
+description: "Every route the server answers, which OpenAI routes each model serves, and what the health check returns."
+---
+
+`mstar serve` answers HTTP from the `mstar-server` frontend; the deprecated `--python-frontend` serves the same routes. Request and reply formats are in [Clients](/clients).
+
+## Routes {#routes}
+
+| Method | Path | Serves | Guide |
+|---|---|---|---|
+| `POST` | `/generate` | A native request from form fields; JSON or NDJSON reply. Every model. | [Native /generate](/clients#native-generate) |
+| `WS` | `/generate/ws` | `/generate` requests over one socket, JSON or msgpack frames, with live input. Every model. | [WebSocket](/clients#websocket-generatews) |
+| `WS` | `/` | openpi's policy protocol, on a deployment whose config has an `openpi:` block. | [openpi](/clients#openpi-websocket) |
+| `GET` | `/healthz` | openpi's health probe, plain `OK`; 404 without an `openpi:` block. | [Health](#health) |
+| `GET` | `/health` | Health check. | [Health](#health) |
+| `GET` | `/metrics` | Prometheus metrics with `--enable-metrics`; 404 without it. | [Metrics](/metrics) |
+| `GET` | `/v1/models` | The served model and its LoRA adapters. Every model. | [LoRA adapters](/models/lora) |
+| `POST` | `/v1/load_lora_adapter` | Load a LoRA adapter while serving, when the config allows it. | [LoRA adapters](/clients#lora-adapters) |
+| `POST` | `/v1/unload_lora_adapter` | Unload a LoRA adapter. | [LoRA adapters](/clients#lora-adapters) |
+| `POST` | `/v1/chat/completions` | OpenAI chat. | [Chat](/clients#chat) |
+| `POST` | `/v1/audio/speech` | OpenAI text-to-speech. | [Speech](/clients#speech) |
+| `GET` | `/v1/audio/voices` | The `voice` ids a speech model accepts, and its default. | [Speech](/clients#speech) |
+| `POST` | `/v1/audio/transcriptions` | OpenAI speech-to-text, multipart upload. | [Transcription](/clients#transcription) |
+| `WS` | `/v1/realtime` | OpenAI Realtime: a conversation, or `?intent=transcription`. | [Realtime](/clients#realtime) |
+| `POST` | `/v1/images/generations` | Text-to-image. | [Images](/clients#images) |
+| `POST` | `/v1/images/edits` | Image editing, multipart upload. | [Images](/clients#images) |
+| `POST` | `/v1/videos/generations` | Text-, image- and video-to-video. | [Videos](/clients#videos) |
+
+- With `--api-key` (or `MSTAR_API_KEY`) set, every route except `/health`, `/metrics` and openpi's `/healthz` needs `Authorization: Bearer <key>` ([API key](/serving#api-key)). Without a key, every route is open.
+- A request body is limited to `MSTAR_MAX_BODY_MB` MiB (default 128), and a larger one gets a 413. `/v1/audio/transcriptions` takes uploads up to 512 MiB.
+- On `mstar-server`, the seven `POST` routes that generate (`/generate` and the `/v1` chat, speech, transcription, image and video routes) share a cap of `MSTAR_MAX_CONCURRENT_REQUESTS` requests in flight (default 512). Past it a request gets a 503 at once.
+- With `MSTAR_ROOT_PATH` set (a reverse proxy's prefix), a route answers both under the prefix and without it.
+
+## OpenAI coverage {#openai-coverage}
+
+A key's OpenAI routes come from its adapter in `ADAPTER_REGISTRY` (`mstar/api_server/openai/adapters.py`). A route the model does not serve answers 404, and `/v1/realtime` closes with code 1008. The model can still refuse an input or output it does not take, with a 400.
+
+| Keys | Chat | Speech | Transcriptions | Realtime | Images | Edits | Videos |
+|---|---|---|---|---|---|---|---|
+| `bagel`, `bagel_cfg_parallel` | text and image parts in, text out | | | | yes | yes | |
+| `qwen3_omni` | media parts in; text, or text and audio, out | yes, the audio of its reply | | | | | |
+| `qwen3_5_0.8b`, `qwen3_5_2b`, `qwen3_5_4b`, `qwen3_5_9b`, `qwen3_5_27b`, `qwen3_8_27b`, `muse_glimmer`, `phi4mm` | text, image, video and audio parts in, as the model takes them; text out | | | | | | |
+| `glm52`, `glm5_next`, `ripple_65b` | text in, text out | | | | | | |
+| `cosmos3_edge`, `cosmos3_edge_droid` | text, image and video parts in, text out | | | | yes | | yes |
+| `cosmos3`, `cosmos3_droid`, `cosmos3_super`, `cosmos3_super_i2v_4step`, `cosmos3_super_t2i_4step` | | | | | yes | | yes |
+| `flux2_klein`, `flux2_klein_9b` | | | | | yes | yes | |
+| `z_image_turbo` | | | | | yes | | |
+| `wan22`, `ltx2_5`, `minimax_h3` | | | | | | | yes |
+| `kokoro`, `orpheus`, `cosyvoice3` | | yes, with `/v1/audio/voices` | | | | | |
+| `chatterbox`, `chatterbox_multilingual`, `chatterbox_turbo`, `fish_s2_pro`, `omnivoice`, `qwen3_tts`, `qwen3_tts_1p7b`, `qwen3_tts_voicedesign`, `qwen3_tts_base`, `voxcpm2` | | yes | | | | | |
+| `whisper_large`, `whisper_large_v3_turbo`, `canary`, `canary_qwen`, `parakeet`, `nemotron_asr`, `higgs_audio`, `omnilingual_asr_ctc_300m`, `omnilingual_asr_ctc_1b`, `omnilingual_asr_ctc_3b`, `omnilingual_asr_ctc_7b` | | | yes | | | | |
+| `qwen3_asr`, `qwen3_asr_realtime` | | | yes | transcription | | | |
+| `nemotron_duplex` | | | | conversation | | | |
+
+`bagel_cfg_parallel` is a `mstar serve` key for `configs/bagel_cfg_parallel.yaml`, whose model is `bagel`. `cosyvoice3` lists voices only when its voices directory exists.
+
+These keys have no OpenAI adapter, so the chat, audio, image and video routes answer 404. Every model serves `/generate` (which the Python SDK uses) and `/generate/ws`.
+
+| Key | Serve it on |
+|---|---|
+| `command_a_plus` | `/generate` |
+| `minicpm_o` | `/generate` |
+| `nemotron_duplex` | `/generate`, `/generate/ws` with live input, and `/v1/realtime` (above) |
+| `pi05` | `/generate`; with `configs/pi05_droid.yaml`, also openpi's WebSocket at `/` |
+| `vjepa2`, `vjepa2_ac` | `/generate` |
+| `waypoint` | `/generate` and `/generate/ws`, streaming `video_frame` chunks, with live input |
+| `lingbot_world_1_3b` | `/generate` and `/generate/ws`, streaming `video_frame` chunks |
+
+## Health {#health}
+
+`GET /health` needs no API key. On `mstar-server` it pings the Python API server behind the HTTP process; on the Python frontend it reports a fatal error.
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{"status": "healthy"}` | The server is serving. |
+| 503 | `{"status": "unhealthy", "reason": "backend bridge unreachable"}` | `mstar-server` pinged the Python API server behind it and got no answer within 2 s. |
+| 503 | `{"detail": "<error>"}` | Python frontend only: the server hit a fatal error and is shutting down. |
+
+The port opens only after the workers are set up and any `warmup_requests` have run, so connections are refused until then. Poll `/health` until it returns 200 before sending requests. The SDK's `client.health()` returns `True` only for that 200.
+
+On a deployment with an `openpi:` block, `GET /healthz` answers `OK` as plain text when `/health` would answer 200, and passes on the failure otherwise.

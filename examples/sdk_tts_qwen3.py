@@ -37,4 +37,4 @@ else:
     sys.exit(f"unknown variant {variant!r}: custom_voice | voice_design | voice_clone")
 
 audio.to_wav("out.wav")
-print(f"wrote out.wav — {len(audio)} samples @ {audio.sample_rate} Hz")
+print(f"wrote out.wav - {len(audio)} samples @ {audio.sample_rate} Hz")

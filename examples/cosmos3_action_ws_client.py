@@ -17,6 +17,7 @@ and the DROID domain from the checkpoint, and the deployment's config maps the
 gripper to the policy's ``1 - gripper`` and back, so the state and the reply are
 in the robot's own values, as a pi0.5 DROID policy takes them.
 
+    mstar serve cosmos3_droid          # or: mstar serve cosmos3_edge_droid
     python examples/cosmos3_action_ws_client.py --host localhost --port 8000 \\
         --wrist wrist.png --exterior-1 ext1.png --exterior-2 ext2.png \\
         --joints=-0.07,0.26,0.02,-2.21,0.02,2.48,0.79 --gripper 0.0 \\

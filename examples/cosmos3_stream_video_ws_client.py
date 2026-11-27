@@ -7,6 +7,10 @@ same request over ``POST /generate`` yields the chunks as NDJSON lines; the
 WebSocket keeps the connection for follow-up requests (e.g. the next prompt of
 a session) without a new handshake.
 
+The server needs windowed video on, which the default ``cosmos3`` config leaves
+off; ``configs/cosmos3_nano_ar.yaml`` turns it on (run from the repo root):
+
+    mstar serve cosmos3 --config configs/cosmos3_nano_ar.yaml
     python examples/cosmos3_stream_video_ws_client.py --port 8000 \\
         --prompt "a drone flies over a coastal town at dawn" \\
         --frames 241 --mode chained --out /tmp/rollout

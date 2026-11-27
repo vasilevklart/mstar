@@ -1,10 +1,10 @@
-"""mstar Python SDK — a thin HTTP client over a running mstar server.
+"""mstar Python SDK: a thin HTTP client over a running mstar server.
 
 The client wraps the native ``POST /generate`` endpoint: it builds the
 multipart form, parses the NDJSON stream (or grouped JSON), base64-decodes
 payloads, and returns typed results. It works for every model the server can
-host (text, image, audio, video) and pulls in only ``requests`` (+ ``numpy``
-for audio helpers) — no torch / CUDA.
+host (text, image, audio, video) and pulls in only ``requests`` (and ``numpy``
+for the audio helpers), not torch, unless ``enable_nvtx`` is set.
 
     from mstar import MStarClient
     client = MStarClient("http://localhost:8000")
@@ -114,10 +114,10 @@ class MStarClient:
         self._auth = _BearerAuth(api_key) if api_key else None
         # Ask for length-framed binary payloads. ``video_frame`` requests ask
         # by default (base64 NDJSON is not realtime at 720p); other modalities
-        # opt in here. How to parse is decided from the response's
-        # Content-Type: a server that does not implement the framing — an
-        # older build, or the Rust frontend, neither of which reads
-        # ``Accept`` — answers NDJSON and the historical path handles it.
+        # opt in here. Both frontends read ``Accept`` on ``/generate``. How to
+        # parse is decided from the response's Content-Type, so a server
+        # without the framing (an older build) answers NDJSON and the NDJSON
+        # path handles it.
         self._prefer_binary = prefer_binary
         # Splits the client's share of the streaming gap into the blocking
         # socket read and the decode of the line it returns. Without this the
@@ -303,7 +303,7 @@ class MStarClient:
         try:
             r = self._session.get(f"{self.base_url}/health", timeout=10)
             return r.ok and r.json().get("status") == "healthy"
-        except Exception:  # noqa: BLE001 — health is best-effort
+        except Exception:  # noqa: BLE001 - health is best-effort
             return False
 
     # ------------------------------------------------------------------

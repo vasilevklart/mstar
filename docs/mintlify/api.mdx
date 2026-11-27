@@ -1,23 +1,77 @@
 ---
-title: "Python API reference"
-description: "Browse the Python module, class, and function reference generated from M* docstrings."
+title: "Python SDK"
+description: "MStarClient's constructor, methods and result types, and where the generated Python API reference lives."
 ---
 
-The Python API reference is generated from module docstrings by Sphinx. It follows
-the package layout under `mstar/`, with subpackages, modules, classes, and functions.
+`mstar.client` is the Python client for a running server. It ships with M\* ([Installation](/installation)) and imports only `requests`, and `numpy` for the audio helpers. [Clients](/clients#python-sdk) shows it in use.
 
-<Card title="Open the Python API reference" icon="code" href="https://mstar.stanford.edu/mstar/api.html">
-  Browse the generated reference on the existing documentation site.
-</Card>
+```python
+from mstar import MStarClient
+from mstar.client import AudioChunk, ImageChunk, TextChunk, VideoFrameChunk
 
-The generated reference remains on the Sphinx site while the narrative guides move
-to Mintlify. Python symbol links in these guides open their source module on GitHub.
+client = MStarClient("http://localhost:8000")
+```
 
-## Building the reference
+## Constructor {#constructor}
 
-Sphinx imports the modules to read their docstrings, so the reference build needs
-the project's runtime environment (`pip install -e ".[dev]"` plus
-`docs/requirements.txt`), including PyTorch and the other core dependencies.
-See [the Sphinx configuration](https://github.com/mstar-project/mstar/blob/main/docs/conf.py)
-and [documentation workflow](https://github.com/mstar-project/mstar/blob/main/.github/workflows/docs.yml)
-for the build configuration.
+`MStarClient(base_url="http://localhost:8000", timeout=600.0, session=None, enable_nvtx=False, prefer_binary=False, api_key=None)`
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `base_url` | `"http://localhost:8000"` | The server's address; a trailing `/` is dropped. |
+| `timeout` | `600.0` | Seconds `requests` waits on each call (`health()` waits 10). |
+| `session` | a new `requests.Session` | Your own session, for proxies, retries or pooling. The client does not modify it. |
+| `enable_nvtx` | `False` | Add NVTX ranges around stream reads and decodes, for a CUDA profile. Imports torch; stays off on XPU and CPU. |
+| `prefer_binary` | `False` | Ask streams for length-framed binary chunks (`Accept: application/vnd.mstar.frames`). `video_frame` streams ask for them anyway. |
+| `api_key` | `MSTAR_API_KEY`, else none | Sent as `Authorization: Bearer <key>` on every call except `health()`. |
+
+## Methods {#methods}
+
+| Method | Route | Returns |
+|---|---|---|
+| `generate(*, text=None, images=None, audio=None, video=None, output_modalities=("text",), input_modalities=None, stream=False, request_id=None, **model_kwargs)` | `POST /generate` | A `GenerateResult`, or with `stream=True` an iterator of stream events. |
+| `stream(**kwargs)` | `POST /generate` | `generate(stream=True, **kwargs)`. |
+| `chat(prompt, *, images=None, audio=None, output_modalities=("text",), stream=False, **model_kwargs)` | `POST /generate` | As `generate`. `output_modalities=("text", "audio")` asks an omni model to speak. |
+| `generate_image(prompt, **model_kwargs)` | `POST /generate` | The first image's bytes. |
+| `edit_image(prompt, image, **model_kwargs)` | `POST /generate` | The edited image's bytes. `image` may be a list for multi-reference models. |
+| `tts(text, *, voice=None, reference_audio=None, **model_kwargs)` | `POST /generate` | An `AudioBuffer`. `reference_audio` (one clip) clones a voice on models that take one. |
+| `transcribe(audio, *, language=None, text="", **model_kwargs)` | `POST /generate` | The transcript as a `str`. `language=None` lets a model that detects the language do so. |
+| `voices()` | `GET /v1/audio/voices` | The served speech model's voice ids, `list[str]`. |
+| `health()` | `GET /health` | `True` for a 200 `{"status": "healthy"}`, else `False`. It never raises. |
+
+- Media arguments take a path, raw `bytes` or a `(filename, bytes)` tuple; `images`, `audio`, `video` and `edit_image`'s `image` also take a list. The server infers each file's modality from its extension, and raw bytes are named `.png`, `.wav` or `.mp4` after their argument.
+- Keyword arguments other than the named ones become the request's `model_kwargs` (see [Generation parameters](/clients#generation-parameters)). `None` values are dropped, so the server's defaults apply.
+- A single modality may be a bare string (`output_modalities="audio"`). `video_frame` output needs `stream=True`.
+- A request the server refuses raises `requests.HTTPError` with its status and message; with `stream=True` it raises when the iterator is first advanced. A failure after a stream has opened raises `RuntimeError` from the iterator.
+- `generate_image`, `edit_image`, `tts` and `transcribe` raise `RuntimeError` when the reply holds no image, audio or text. `voices()` raises `requests.HTTPError` for a model that publishes no list.
+
+## Result types {#result-types}
+
+`GenerateResult` is what a non-streaming call returns.
+
+| Field | Type | Holds |
+|---|---|---|
+| `request_id` | `str` or `None` | The request's id. |
+| `text` | `str` or `None` | Every text chunk, joined and decoded. |
+| `images` | `list[bytes]` | Images in arrival order (PNG unless the request set `output_format`). `save_image(path, index=0)` writes one. |
+| `audio` | `AudioBuffer` or `None` | Every audio chunk, joined. `save_audio(path)` writes a WAV. |
+| `raw` | `list[dict]` | Every chunk as `{"modality", "bytes", "metadata"}`. Video (mp4) and action (float32) outputs are only here. |
+
+`AudioBuffer` holds `pcm` (little-endian 16-bit), `sample_rate` and `num_channels`. `to_wav(path)` writes a WAV file and `wav_bytes()` returns one, `to_numpy()` returns int16 samples (`[samples, channels]` for multichannel audio), and `len()` counts 16-bit samples across channels.
+
+With `stream=True` the iterator yields one event per chunk (`StreamEvent` is their union):
+
+| Event | Fields |
+|---|---|
+| `TextChunk` | `text`, `metadata`. Text is decoded incrementally, so a chunk never ends mid-character. |
+| `ImageChunk` | `data` (image bytes), `metadata`; `save(path)`. |
+| `AudioChunk` | `pcm` (16-bit), `sample_rate`, `metadata`; `to_numpy()`. |
+| `VideoFrameChunk` | `data` (raw RGB24), `metadata`, `width`, `height`, `fps`, `pixel_format`, `frame_index`, `frame_count`; `to_numpy()` returns a read-only `[frame_count, height, width, 3]` uint8 view without copying. |
+
+Any other modality (video, action) also arrives as a `TextChunk`, decoded with `errors="replace"`, which corrupts binary data. Request those with `stream=False` and read `.raw`.
+
+`mstar` exports `MStarClient`, `GenerateResult`, `AudioBuffer` and `VideoFrameChunk`; `mstar.client` exports every type above.
+
+## Generated API reference {#generated-reference}
+
+Sphinx builds a reference of the `mstar` package's modules from their docstrings, published on a separate site: [m-star.org/mstar/api.html](https://m-star.org/mstar/api.html).
