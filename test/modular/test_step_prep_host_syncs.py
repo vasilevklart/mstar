@@ -208,6 +208,8 @@ def test_wan22_forward_takes_no_host_sync(walk):
     image_latent = torch.randn(shape, generator=gen) if walk == sub._I2V_WALK else None
     want = _wan22_steps(sub, walk, 4, latents, image_latent)
 
+    # a fresh submodule: the first memoized its staged schedule tables on the CPU
+    sub = _wan22_sub(_WanStubTransformer(), in_channels=4, compile_dit=False)
     latents = latents.cuda()
     image_latent = None if image_latent is None else image_latent.cuda()
     torch.cuda.synchronize()
