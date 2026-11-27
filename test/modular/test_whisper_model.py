@@ -312,6 +312,30 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
     assert torch.allclose(out["a"]["encoder_states"][0], single["encoder_states"][0], atol=1e-5)
 
 
+def test_the_encoders_audio_goes_to_the_device_through_pinned_memory(monkeypatch):
+    # a pageable .to(device) on the GPU thread would wait out the step in flight
+    from mstar.model.whisper import submodules as whisper_submodules
+    from mstar.utils.h2d import to_device_nonblocking
+
+    staged = []
+
+    def record(data, device, dtype=None):
+        staged.append((data.dtype, torch.device(device)))
+        return to_device_nonblocking(data, device, dtype)
+
+    monkeypatch.setattr(whisper_submodules, "to_device_nonblocking", record)
+    cfg = _tiny_config()
+    encoder = WhisperEncoderModel(cfg)
+    encoder.load_weights(list(_hf_encoder(cfg).state_dict().items()))
+    sub = WhisperEncoderSubmodule(encoder, cfg).eval()
+    samples = torch.randn(cfg.n_samples // 2).to(torch.float16)
+    row = sub.prepare_inputs(PREFILL_WALK, None, {"audio": [samples]})
+    assert staged == [(torch.float16, torch.device("cpu"))]
+    audio = row.tensor_inputs["audio"]
+    assert audio.dtype is torch.float32 and audio.shape == (cfg.n_samples,)
+    assert torch.equal(audio[: samples.numel()], samples.float())
+
+
 # --------------------------------------------------------------------------
 # decoder submodule: step declaration
 # --------------------------------------------------------------------------
