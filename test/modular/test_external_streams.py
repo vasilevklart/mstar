@@ -8,104 +8,18 @@ the first output, cancellation (the connection closes and nothing more lands,
 also while the endpoint is still silent), and the in-flight budget."""
 from __future__ import annotations
 
-import asyncio
-import json
-import threading
 import time
 
 import pytest
 
 pytest.importorskip("aiohttp")
-from aiohttp import web  # noqa: E402
+from external_endpoint import DONE, USAGE_EVENT, FakeEndpoint, _event, _slow  # noqa: E402
 
 from mstar.integrations.external.config import ExternalEndpoint  # noqa: E402
 from mstar.integrations.external.openai_stream import SamplingSettings, unsupported  # noqa: E402
 from mstar.integrations.external.streams import ExternalStreams  # noqa: E402
 
 pytestmark = pytest.mark.timeout(60)
-
-
-def _event(text="", ids=None, finish=None, usage=None, chat=False):
-    choice = {"index": 0, "finish_reason": finish}
-    if chat:
-        choice["delta"] = {"content": text}
-    else:
-        choice["text"] = text
-    if ids is not None:
-        choice["token_ids"] = ids
-    event = {"id": "cmpl-1", "object": "text_completion", "choices": [choice]}
-    if usage is not None:
-        event["usage"] = usage
-    return event
-
-
-USAGE = {"prompt_tokens": 5, "completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": 2}}
-USAGE_EVENT = {"id": "cmpl-1", "choices": [], "usage": USAGE}
-DONE = "[DONE]"
-
-
-class FakeEndpoint:
-    """An OpenAI-compatible streaming server on 127.0.0.1, on a thread of its own. ``script(attempt, body)`` returns
-    what to answer: an int status (with optional headers) or a list of steps, each an event dict, ``DONE``, or a
-    float to sleep. A list that doesn't end in ``DONE`` closes the stream short."""
-
-    def __init__(self, script):
-        self.script = script
-        self.requests: list[tuple[str, dict, dict]] = []
-        self.disconnected = threading.Event()
-        self._loop = asyncio.new_event_loop()
-        started = threading.Event()
-        self._thread = threading.Thread(target=self._serve, args=(started,), daemon=True)
-        self._thread.start()
-        assert started.wait(10)
-
-    def _serve(self, started):
-        asyncio.set_event_loop(self._loop)
-        app = web.Application()
-        app.router.add_post("/v1/completions", self._handle)
-        app.router.add_post("/v1/chat/completions", self._handle)
-        self._runner = web.AppRunner(app)
-        self._loop.run_until_complete(self._runner.setup())
-        site = web.TCPSite(self._runner, "127.0.0.1", 0)
-        self._loop.run_until_complete(site.start())
-        self.port = site._server.sockets[0].getsockname()[1]
-        started.set()
-        self._loop.run_forever()
-
-    @property
-    def base_url(self) -> str:
-        return f"http://127.0.0.1:{self.port}/v1"
-
-    async def _handle(self, request):
-        body = await request.json()
-        self.requests.append((request.path, body, dict(request.headers)))
-        answer = self.script(len(self.requests), body)
-        if isinstance(answer, tuple):
-            status, headers = answer
-            return web.json_response({"error": {"message": "slow down"}}, status=status, headers=headers)
-        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
-        await response.prepare(request)
-        try:
-            for step in answer:
-                if isinstance(step, float):
-                    # a silent endpoint (a long prefill) still notices the client leaving
-                    deadline = time.monotonic() + step
-                    while time.monotonic() < deadline:
-                        if request.transport is None or request.transport.is_closing():
-                            raise ConnectionResetError("client went away")
-                        await asyncio.sleep(0.005)
-                    continue
-                payload = step if step == DONE else json.dumps(step)
-                await response.write(f"data: {payload}\n\n".encode())
-        except (ConnectionResetError, asyncio.CancelledError):
-            self.disconnected.set()
-            raise
-        return response
-
-    def close(self):
-        asyncio.run_coroutine_threadsafe(self._runner.cleanup(), self._loop).result(10)
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(10)
 
 
 @pytest.fixture
@@ -169,6 +83,21 @@ def test_streams_tokens_usage_and_finish(serve, monkeypatch):
     assert (body["model"], body["max_tokens"], body["temperature"], body["seed"]) == ("m", 8, 0.0, 7)
     assert "top_p" not in body, "an unset setting is left to the endpoint, not sent as null"
     assert headers["Authorization"] == "Bearer sekrit"
+
+
+def test_output_and_the_end_call_on_change(serve):
+    """The worker sleeps when nothing is ready, so the loop thread has to wake it when a request has news."""
+    script = lambda attempt, body: [_event("a", ids=[1]), 0.2, _event("", finish="stop"), DONE]  # noqa: E731
+    server, streams = serve(script)
+    calls = []
+    streams.on_change = lambda: calls.append(streams.poll("r1"))
+    streams.start("r1", [1], SETTINGS)
+    deadline = time.monotonic() + 10
+    while not (calls and calls[-1] is not None and calls[-1].done) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    landed = [c for c in calls if c is not None]
+    assert landed[0].token_ids == (1,), "output landing calls on_change"
+    assert landed[-1].done, "the request ending calls on_change"
 
 
 def test_chat_adapter_sends_messages_and_reads_deltas(serve):
@@ -241,13 +170,6 @@ def test_client_error_is_not_retried(serve):
 
 
 # --- cancellation and budget -------------------------------------------------------------------------------------
-
-
-def _slow(attempt, body):
-    steps = []
-    for i in range(200):
-        steps += [_event("x", ids=[i]), 0.02]
-    return steps + [_event("", finish="stop"), DONE]
 
 
 def test_cancel_closes_the_connection_and_drops_later_output(serve):

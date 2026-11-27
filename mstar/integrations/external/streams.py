@@ -22,7 +22,7 @@ import asyncio
 import logging
 import random
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -73,10 +73,14 @@ class _Stream:
 
 class ExternalStreams:
     """In-flight requests to one endpoint. ``start``, ``poll``, ``cancel`` and ``has_room`` are called from the
-    worker's thread; the requests themselves run on this object's loop thread."""
+    worker's thread; the requests themselves run on this object's loop thread.
 
-    def __init__(self, endpoint: ExternalEndpoint):
+    ``on_change`` is called from the loop thread whenever a request has something new to poll (output, or its end),
+    so a worker sleeping until there is work wakes up for it. It must not block."""
+
+    def __init__(self, endpoint: ExternalEndpoint, on_change: Callable[[], None] | None = None):
         self.endpoint = endpoint
+        self.on_change = on_change
         self._streams: dict[str, _Stream] = {}
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)
@@ -168,7 +172,9 @@ class ExternalStreams:
                 else:
                     setattr(stream, key, value)
             self._changed.notify_all()
-            return True
+        if self.on_change is not None:
+            self.on_change()
+        return True
 
     async def _run(self, rid: str, stream: _Stream, prompt, settings: SamplingSettings) -> None:
         if self._session is None:
