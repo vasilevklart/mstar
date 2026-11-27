@@ -1,19 +1,22 @@
-"""Linears in a low-precision dtype, opt-in per deployment (``linear_dtype``).
+"""Linears in a low-precision dtype, opt-in per deployment (``linear_dtype``, or a ``quantization:`` block).
 
 Three pieces, each declared once:
 
 - a format (``LinearFormat``) owns its weight quantization, its activation quantization and its GEMM, as one
   ``mstar::<format>_linear`` op with a fake implementation, so a compiled forward sees one opaque node per linear;
-  ``block_scaled.py`` declares ``mxfp8`` and ``nvfp4``;
+  ``block_scaled.py`` declares ``mxfp8`` and ``nvfp4``, ``fp8_formats.py`` ``fp8_tensor``, ``fp8_channel`` and
+  ``fp8_block``, which also load a checkpoint stored in them (``storage``);
 - a linear kind says whether it takes a format (``quant_capability``), as ``lora_capability`` does for LoRA:
-  ``nn.Linear`` and ``FusedColumnLinear`` do, and a kind that can't says why, so a declared linear is never skipped
-  silently;
+  ``nn.Linear`` and ``FusedColumnLinear`` do, and so do the tensor-parallel linears, which keep their own
+  communication around the format's GEMM (``InPlaceQuant``); a kind that can't says why, so a declared linear is
+  never skipped silently;
 - a model declares which of its linears may go low precision and which stay bf16 (``QuantizableLinears``), and a
   deployment can keep more of them bf16 (``linear_keep_bf16``).
 
 ``apply_linear_dtype`` swaps the selected linears for ``QuantLinear``s once, at load, after any LoRA merge and
-before compile. The output moves from the bf16 model's by the format's rounding, so it is a per-model quality call
-and off by default.
+before compile (the DiTs' ``linear_dtype``: ``mxfp8`` or ``nvfp4``). ``mstar.quantization`` serves a checkpoint's
+own fp8 linears, or quantizes a bf16 one's, on the layers a model declares (its ``quantization:`` block). The
+output moves from the bf16 model's by the format's rounding, so it is a per-model quality call and off by default.
 """
 
 from __future__ import annotations
@@ -24,9 +27,11 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from typing import ClassVar, NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.lora.config import LoraTarget
@@ -39,9 +44,27 @@ BF16 = "bf16"
 _FORMAT_MODULES = {
     "mxfp8": "mstar.model.components.block_scaled",
     "nvfp4": "mstar.model.components.block_scaled",
+    "fp8_tensor": "mstar.model.components.fp8_formats",
+    "fp8_channel": "mstar.model.components.fp8_formats",
+    "fp8_block": "mstar.model.components.fp8_formats",
 }
-LINEAR_DTYPES = (BF16, *_FORMAT_MODULES)
+# what a DiT's `linear_dtype` takes; the fp8 formats are served through `mstar.quantization` only
+LINEAR_DTYPES = (BF16, "mxfp8", "nvfp4")
 _FORMATS: dict[str, LinearFormat] = {}
+
+
+class Storage(NamedTuple):
+    """One tensor a format keeps for an ``[n, k]`` weight shard, as the module holds it. ``dtype`` is an integer
+    container (the engine casts a loaded node's floating tensors to its dtype, which would round e4m3 data and
+    fp32 scales), ``stands_for`` what its bytes are. ``units`` is how many weight rows / columns one index of
+    this tensor covers along each dim, so a tensor-parallel loader shards it with the weight (None: the tensor
+    doesn't run along that dim, e.g. a per-channel scale's columns)."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    stands_for: torch.dtype
+    units: tuple[int | None, int | None]
 
 
 class LinearFormat:
@@ -69,8 +92,34 @@ class LinearFormat:
         raise NotImplementedError
 
     def linear(self, x: torch.Tensor, *buffers: torch.Tensor | None) -> torch.Tensor:
-        """``x [M, K]`` (contiguous) times the stored weight, ``[M, N]`` in ``x``'s dtype."""
+        """``x [M, K]`` (contiguous) times the stored weight, ``[M, N]`` in ``x``'s dtype. ``buffers`` (in
+        ``self.buffers``' order) come viewed as what their bytes stand for (``Storage.stands_for``: e4m3, fp32),
+        whether the layer loaded them from a checkpoint or quantized at load."""
         raise NotImplementedError
+
+    def storage(self, n: int, k: int) -> tuple[Storage, ...]:
+        """The tensors a checkpoint stored in this format loads into, for an ``[n, k]`` shard; empty for a
+        format that only quantizes at load. Their names are the checkpoint's own suffixes and ``buffers``."""
+        return ()
+
+    def from_checkpoint(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """A checkpoint tensor (suffix ``name``) in the shape and container ``storage`` keeps it in."""
+        return tensor
+
+    def dequantize(self, buffers: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """The fp32 ``[n, k]`` weight ``buffers`` (a checkpoint's tensors by suffix) stand for."""
+        raise NotImplementedError
+
+    # whether ``glu_linear`` runs a [gate; up] weight's SwiGLU in the same call
+    has_glu: ClassVar[bool] = False
+
+    def glu_linear(self, x: torch.Tensor, *buffers: torch.Tensor | None) -> torch.Tensor:
+        """``silu(x @ gate.T) * (x @ up.T)`` for a stored ``[gate; up]`` weight (halves of its rows), ``[M, N / 2]``;
+        only where ``has_glu``."""
+        raise NotImplementedError
+
+    def prepare_device(self, device: torch.device) -> None:
+        """Load the format's kernels on ``device`` before any capture (once per process is enough)."""
 
     def __repr__(self) -> str:
         return self.name
@@ -84,9 +133,9 @@ def register_format(fmt: LinearFormat) -> LinearFormat:
 
 
 def linear_format(name: str) -> LinearFormat:
-    """The format ``linear_dtype: <name>`` runs."""
+    """The format ``linear_dtype: <name>`` (or a ``quantization:`` block's ``<name>``) runs."""
     if name not in _FORMAT_MODULES:
-        raise ValueError(f"linear_dtype must be one of {LINEAR_DTYPES}, got {name!r}")
+        raise ValueError(f"a linear format must be one of {sorted(_FORMAT_MODULES)}, got {name!r}")
     if name not in _FORMATS:
         importlib.import_module(_FORMAT_MODULES[name])
     return _FORMATS[name]
@@ -198,6 +247,18 @@ class QuantLinear(nn.Module, LoraCapable):
         return f"in_features={self.in_features}, out_features={self.out_features}, format={self.fmt.name}"
 
 
+class QuantGeometry(NamedTuple):
+    """One rank's weight ``[n, k]`` and the sub-blocks its loader places along each dim: ``rows`` the
+    per-rank q/k/v or gate/up widths, ``cols`` one span unless the layer fuses along K; ``sharded``
+    when those are slices of a bigger checkpoint tensor (tensor parallelism)."""
+
+    n: int
+    k: int
+    rows: tuple[int, ...]
+    cols: tuple[int, ...]
+    sharded: bool = False
+
+
 class QuantCapability(NamedTuple):
     """Whether a linear kind can be replaced by a ``QuantLinear``; else ``reason`` says why not."""
 
@@ -249,11 +310,16 @@ class QuantizableLinears:
     new layer can't change dtype silently; ``keep_bf16`` wins where both match.
 
     ``input_amax`` maps patterns to the largest input magnitude measured on those linears, for a format whose
-    activation scale has a range to place (NVFP4's). The first matching pattern counts."""
+    activation scale has a range to place (NVFP4's). The first matching pattern counts.
+
+    ``bf16_tails`` maps patterns of merged (fused) candidates to how many of their trailing sub-blocks stay in the
+    checkpoint's bf16 when the rest takes a format: a fused projection whose last rows are small, sensitive or
+    misaligned (Qwen3.5's delta-net gates). The first matching pattern counts."""
 
     candidates: tuple[str, ...]
     keep_bf16: tuple[str, ...]
     input_amax: Mapping[str, float] = field(default_factory=dict)
+    bf16_tails: Mapping[str, int] = field(default_factory=dict)
 
     def selected(self, name: str, keep: tuple[str, ...] = ()) -> bool:
         if any(matches(name, pattern) for pattern in (*self.keep_bf16, *keep)):
@@ -264,6 +330,9 @@ class QuantizableLinears:
 
     def amax_of(self, name: str) -> float | None:
         return next((amax for pattern, amax in self.input_amax.items() if matches(name, pattern)), None)
+
+    def tail_of(self, name: str) -> int:
+        return next((blocks for pattern, blocks in self.bf16_tails.items() if matches(name, pattern)), 0)
 
 
 class LinearSelection(NamedTuple):
@@ -323,7 +392,12 @@ def quantize_linears(module: nn.Module, selection: LinearSelection) -> list[str]
     for name, amax in zip(selection.names, selection.input_amax, strict=True):
         parent_name, _, leaf = name.rpartition(".")
         parent = module.get_submodule(parent_name)
-        setattr(parent, leaf, QuantLinear.from_linear(getattr(parent, leaf), selection.fmt, amax))
+        linear = getattr(parent, leaf)
+        if isinstance(linear, InPlaceQuant):
+            # a tensor-parallel linear keeps its own gather / all-reduce around the format's GEMM
+            linear.quant_quantize(selection.fmt, amax)
+        else:
+            setattr(parent, leaf, QuantLinear.from_linear(linear, selection.fmt, amax))
     if selection.names:
         logger.info("linear_dtype %s: %d linears", selection.fmt.name, len(selection.names))
     return list(selection.names)
@@ -336,3 +410,150 @@ def apply_linear_dtype(
     """``select_linears`` then ``quantize_linears``: serve ``module``'s declared linears in ``linear_dtype``.
     Returns the names replaced, empty when nothing was."""
     return quantize_linears(module, select_linears(module, linear_dtype, declaration, keep, what))
+
+
+_INT_OF_SIZE = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def as_container(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` viewed as the integer dtype of its element size, so ``module.to(dtype)`` leaves its bytes."""
+    if not tensor.dtype.is_floating_point:
+        return tensor
+    return tensor.contiguous().view(_INT_OF_SIZE[tensor.element_size()])
+
+
+def span(start: int, length: int, unit: int | None, extent: int) -> tuple[int, int]:
+    """``[start, start + length)`` weight rows (or columns) as ``(first, count)`` indices of a stored tensor
+    whose one index covers ``unit`` of them (``extent`` indices long); ``unit`` None: the tensor doesn't run
+    along that dim, so all of it. Only the tensor's last index may cover a partial block."""
+    if unit is None:
+        return 0, extent
+    if unit == 1:
+        return start, length
+    if start % unit:
+        raise ValueError(f"a shard starting at {start} splits a {unit}-wide scale block")
+    first, count = start // unit, -(-length // unit)
+    if length % unit and first + count != extent:
+        raise ValueError(f"a shard of {length} at {start} ends inside a {unit}-wide scale block")
+    return first, count
+
+
+class InPlaceQuant:
+    """For a linear that keeps its own ``weight`` and its own (sharding) ``weight_loader``, as the tensor-parallel
+    linears do: a format in place of the bf16 weight, keeping the layer's communication around the GEMM.
+
+    ``quant_prepare`` swaps the weight for the format's empty ``storage`` before a checkpoint stored in that
+    format loads (each tensor sharded by the layer's own loader, in the tensor's units); ``quant_quantize``
+    quantizes this rank's loaded bf16 shard. Either way the layer then holds the same tensors, under the
+    checkpoint's names, in integer containers, and ``_quant_local`` runs the format's GEMM.
+
+    The host class calls ``_attach_quant_loaders`` from its ``_attach_weight_loaders`` and routes ``_local``
+    through ``_quant_local`` when ``quant_format`` is set; its ``weight_loader`` takes ``units=(rows, cols)``."""
+
+    quant_format: LinearFormat | None = None
+
+    def quant_geometry(self):
+        raise NotImplementedError
+
+    # the trailing weight rows kept bf16 beside the format's (``quant_quantize``'s ``tail_blocks``)
+    quant_tail_rows: int = 0
+
+    def _quant_nk(self) -> tuple[int, int]:
+        """The ``[n, k]`` the format holds: this rank's weight less a bf16 tail."""
+        geometry = self.quant_geometry()
+        return geometry.n - self.quant_tail_rows, geometry.k
+
+    def quant_prepare(self, fmt: LinearFormat) -> None:
+        n, k = self._quant_nk()
+        device = self.weight.device
+        storage = fmt.storage(n, k)
+        if not storage:
+            raise ValueError(f"{fmt.name} has no checkpoint layout to load into")
+        shards = len(self.quant_geometry().rows)
+        if shards > 1 and any(st.units == (None, None) for st in storage):
+            # (the resolver re-quantizes such a layer instead)
+            raise ValueError(f"{fmt.name}: one per-tensor scale can't hold the scales of this layer's {shards} "
+                             "checkpoint shards")
+        del self.weight
+        self._quant_views = {}
+        for st in storage:
+            self.register_parameter(st.name, nn.Parameter(torch.empty(st.shape, dtype=st.dtype, device=device),
+                                                          requires_grad=False))
+            self._quant_views[st.name] = st.stands_for
+        self.quant_format = fmt
+        self._attach_weight_loaders()
+
+    def quant_quantize(self, fmt: LinearFormat, input_amax: float | None = None, tail_blocks: int = 0) -> None:
+        """Quantize the loaded weight in place; ``tail_blocks``: the last sub-blocks of ``quant_geometry().rows``
+        stay as they are, in ``weight_tail``, and the forward appends their output."""
+        if tail_blocks:
+            rows = self.quant_geometry().rows
+            assert 0 < tail_blocks < len(rows), (tail_blocks, rows)
+            self.quant_tail_rows = sum(rows[-tail_blocks:])
+        n, k = self._quant_nk()
+        weight = self.weight.data
+        if self.quant_tail_rows:
+            tail = weight[n:].clone()
+            weight = weight[:n]
+        fmt.check(n, k, weight.dtype)
+        buffers = fmt.quantize_weight(weight.contiguous(), input_amax)
+        del self.weight
+        if self.quant_tail_rows:
+            self.register_parameter("weight_tail", nn.Parameter(tail, requires_grad=False))
+        # the format's linear() sees what the bytes stand for, as a layer loaded from a stored checkpoint does
+        stands_for = {st.name: st.stands_for for st in fmt.storage(n, k)}
+        self._quant_views = {}
+        for name, tensor in buffers.items():
+            self._quant_views[name] = stands_for.get(name, tensor.dtype if tensor.dtype.is_floating_point else None)
+            self.register_parameter(name, nn.Parameter(as_container(tensor), requires_grad=False))
+        self.quant_format = fmt
+
+    def _attach_quant_loaders(self) -> bool:
+        if self.quant_format is None:
+            return False
+        n, k = self._quant_nk()
+        for st in self.quant_format.storage(n, k):
+            param = getattr(self, st.name, None)
+            if param is not None:
+                param.weight_loader = partial(self._quant_storage_loader, st)
+        return True
+
+    def _quant_storage_loader(self, st: Storage, param, loaded: torch.Tensor, shard_id=None) -> None:
+        loaded = self.quant_format.from_checkpoint(st.name, loaded)
+        if loaded.dtype != st.dtype:
+            raise TypeError(f"{type(self).__name__}.{st.name}: the checkpoint tensor is {loaded.dtype}, "
+                            f"{self.quant_format.name} keeps {st.dtype}")
+        if st.units == (None, None):
+            # a per-tensor scalar, whole on every rank (a checkpoint may store it as [] or [1])
+            loaded = loaded.reshape(param.shape)
+        if shard_id is None:
+            self.weight_loader(param, loaded, units=st.units)
+        else:
+            self.weight_loader(param, loaded, shard_id, units=st.units)
+
+    def _quant_buffers(self) -> list[torch.Tensor]:
+        views = self._quant_views
+        buffers = []
+        for name in self.quant_format.buffers:
+            tensor = getattr(self, name)
+            dtype = views.get(name)
+            buffers.append(tensor if dtype is None or tensor.dtype == dtype else tensor.view(dtype))
+        return buffers
+
+    def quant_glu(self, x: torch.Tensor) -> torch.Tensor:
+        """The SwiGLU of this rank's ``[gate; up]`` output in one call of the format (``has_glu``); the caller
+        checks there is no bias and nothing (LoRA) bound around the GEMM."""
+        assert not self.quant_tail_rows, "a layer with a bf16 tail has no fused SwiGLU"
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = self.quant_format.glu_linear(rows, *self._quant_buffers())
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    def _quant_local(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        fmt = self.quant_format
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = fmt.linear(rows, *self._quant_buffers())
+        if self.quant_tail_rows:
+            out = torch.cat([out, F.linear(rows, self.weight_tail)], dim=-1)
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*x.shape[:-1], out.shape[-1])
