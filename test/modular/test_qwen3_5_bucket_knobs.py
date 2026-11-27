@@ -65,6 +65,26 @@ def _captured_ladders(submodule, ladders) -> dict[str, PackedAcceleratorGraphCon
     return {c.capture_graph_walk: c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)}
 
 
+def test_every_shipped_qwen3_5_config_stops_its_ladders_at_the_step_budget(monkeypatch):
+    """A rung above the LLM's 2048-token step budget is captured and compiled at every start
+    and never replayed: on 0.8B the default ladder's 2176, 4096 and 8192 cost 12 s of a warm
+    start (H200). Each shipped Qwen3.5 config sets ladders that stop at the budget (Qwen3.8,
+    on the same LLM, is not measured yet and keeps the default)."""
+    import yaml
+
+    budget = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", None).LLMSubmodule.MAX_BATCH_TOKENS
+    checked = []
+    for path in sorted((Path(__file__).resolve().parents[2] / "configs").rglob("*.yaml")):
+        config = yaml.safe_load(path.read_text())
+        if not str(config.get("model", "")).startswith("qwen3_5_"):
+            continue
+        llm = (config.get("prefill_token_buckets") or {}).get("LLM")
+        assert llm is not None, f"{path.name} captures the default ladder past the step budget"
+        assert max(llm["prefill_text"]) == max(llm["mixed"]) == budget, path.name
+        checked.append(path.name)
+    assert {"qwen3_5_0.8b.yaml", "qwen3_5_2b.yaml", "qwen3_5_4b.yaml", "qwen3_5_27b_tp4.yaml"} <= set(checked)
+
+
 @pytest.mark.parametrize("ladders", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
 def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, ladders):
     monkeypatch.delenv("MSTAR_QWEN35_DECODE_BUCKETS", raising=False)
