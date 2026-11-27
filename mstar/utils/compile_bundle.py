@@ -56,6 +56,11 @@ class BundleMismatchError(RuntimeError):
     """No bundle under the given path was built for this host's stack."""
 
 
+class DamagedBundleError(RuntimeError):
+    """A bundle's manifest or a tar can't be read, or a tar holds fewer files
+    than its manifest records."""
+
+
 @dataclass(frozen=True)
 class StackKey:
     """The stack a bundle's entries were compiled on.
@@ -359,6 +364,8 @@ def read_manifest(bundle: Path) -> dict | None:
         return json.loads((bundle / MANIFEST).read_text())
     except FileNotFoundError:
         return None
+    except ValueError as exc:  # cut or garbled JSON
+        raise DamagedBundleError(f"{bundle / MANIFEST}: {exc}") from exc
 
 
 def bundle_key(bundle: Path) -> StackKey | None:
@@ -407,14 +414,16 @@ class Extracted:
     kept: int  # files the cache dir already had
 
 
-def _extract(tar: Path, dest: Path, merge_dbs: bool) -> Extracted:
+def _extract(tar: Path, dest: Path, merge_dbs: bool, members: int | None = None) -> Extracted:
     """Extract the last copy of each file in ``tar`` that ``dest`` lacks. A file
     ``dest`` has is kept, since Inductor and Triton entries never change once
     written; with ``merge_dbs`` (MIOpen, one file per database) it is merged
     with the bundle's copy instead, the bundle's record winning. Each file is
     written beside its name and renamed into place, so a server reading
     ``dest`` never sees part of one. tarfile rather than ``tar``, whose GNU and
-    BSD builds disagree on skipping existing files."""
+    BSD builds disagree on skipping existing files. A tar holding fewer than
+    ``members`` files (its manifest's count) is refused before anything is
+    written."""
     last: dict[str, tarfile.TarInfo] = {}
     added = merged = kept = 0
     with tarfile.open(tar, "r:") as tf:
@@ -422,6 +431,12 @@ def _extract(tar: Path, dest: Path, merge_dbs: bool) -> Extracted:
             tf.members.clear()
             if m.isfile() or m.issym():
                 last[m.name if m.name.startswith("./") else f"./{m.name}"] = m
+        # tarfile reads an unreadable header after the first as the end of the
+        # archive, so a tar cut at a header, or with a damaged one, ends early
+        # without an error. More is fine: pack renames a tar before it rewrites
+        # the manifest.
+        if members is not None and len(last) < members:
+            raise DamagedBundleError(f"{tar} holds {len(last)} files, its manifest records {members}")
         for m in last.values():
             m = tarfile.data_filter(m, str(dest))  # refuses a path or link outside dest
             path = dest / m.name
@@ -461,13 +476,16 @@ def unpack(src: Path, key: StackKey, dirs: dict[str, Path], force: bool = False,
     :func:`_extract`) and leave a marker for the startup line. Each cache dir
     is locked while it is written, so servers starting together on one host
     can unpack into the same caches. A bundle for another stack is refused
-    unless ``force``."""
+    unless ``force``; a damaged one raises DamagedBundleError, and leaves no
+    marker."""
     bundle = select_bundle(src, key)
     bkey = bundle_key(bundle)
     diff = key.differences(bkey) if bkey is not None else []
     if diff and not force:
         raise BundleMismatchError(
             f"{bundle} was built for {bkey.path}: {', '.join(diff)}; its entries would not be read")
+    # read before any tar is opened, so each tar holds at least what it records
+    recorded = (read_manifest(bundle) or {}).get("kinds", {})
     done: dict[str, str] = {}
     for kind in KINDS:
         tar = bundle / f"{kind}.tar"
@@ -480,7 +498,11 @@ def unpack(src: Path, key: StackKey, dirs: dict[str, Path], force: bool = False,
             continue
         dest.mkdir(parents=True, exist_ok=True)
         with _locked(dest / DEST_LOCK):
-            n = _extract(tar, dest, merge_dbs=kind.startswith("miopen"))
+            try:
+                n = _extract(tar, dest, merge_dbs=kind.startswith("miopen"),
+                             members=recorded.get(kind, {}).get("members"))
+            except tarfile.ReadError as exc:
+                raise DamagedBundleError(f"{tar}: {exc}") from exc
         log(f"{kind}: {n.added} files added to {dest}, {n.merged} merged, {n.kept} already there")
         done[kind] = str(dest)
     dirs["inductor"].mkdir(parents=True, exist_ok=True)

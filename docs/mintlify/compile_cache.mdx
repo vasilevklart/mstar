@@ -71,7 +71,7 @@ A bundle is code. Inductor's entries are pickled graphs and Triton's are compile
 - A MIOpen database the directory already has is merged with the bundle's copy, the bundle's record winning where both have one, so the records only this host has stay.
 - Each file is written beside its name and renamed into place, and each directory is locked while it is written (`.mstar-unpack.lock` in it, which `pack` leaves out), so servers starting together on one host can unpack into the same caches.
 
-It exits with status 3 when `SRC` has no bundle for this stack, and `mstar serve --compile-bundle` then starts cold with a warning. `unpack` leaves `mstar-bundle.json` in the Inductor directory, naming the bundle and its key.
+It exits with status 3 when `SRC` has no bundle for this stack, and `mstar serve --compile-bundle` then starts cold with a warning. A damaged bundle (a manifest or tar it can't read, or a tar holding fewer files than the manifest records) exits with status 1 and a `damaged bundle:` line, and `serve` stops. Nothing checks the files' contents, so a damaged byte inside one goes unnoticed. `unpack` leaves `mstar-bundle.json` in the Inductor directory, naming the bundle and its key.
 
 At startup each worker logs its stack key and what it found:
 

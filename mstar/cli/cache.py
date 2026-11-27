@@ -57,6 +57,9 @@ def _unpack(args: argparse.Namespace) -> None:
     except compile_bundle.BundleMismatchError as exc:
         print(f"not unpacked: {exc}", file=sys.stderr)
         sys.exit(EXIT_NO_MATCH)
+    except compile_bundle.DamagedBundleError as exc:
+        print(f"damaged bundle: {exc}", file=sys.stderr)
+        sys.exit(1)
     kinds = ", ".join(f"{k} -> {d}" for k, d in done.kinds.items())
     print(f"unpacked {done.bundle} in {time.monotonic() - t0:.1f} s: {kinds}")
 

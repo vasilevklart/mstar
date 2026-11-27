@@ -1,7 +1,7 @@
 """Compile-cache bundles (mstar/utils/compile_bundle.py, ``mstar cache``): packing
 appends only what is new, unpacking restores the caches and marks them (keeping
 what a cache has, merging MIOpen's databases, one unpack per cache dir at a
-time), a bundle for another stack is refused, and a bundle root laid out like the
+time), a bundle for another stack or a damaged one is refused, and a bundle root laid out like the
 golden copies the AMD benchmark scripts seed from (uncompressed per-kind tars
 of ``./`` members, no manifest) reads as a bundle."""
 
@@ -312,6 +312,85 @@ def test_unpack_refuses_a_member_outside_the_cache_dir(tmp_path):
     with pytest.raises(tarfile.OutsideDestinationError):
         cb.unpack(bundle, KEY, out, log=lambda _: None)
     assert not (tmp_path / "o" / "escaped").exists()
+
+
+def _six_triton_files(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
+    built = {"inductor": tmp_path / "built" / "i", "triton": tmp_path / "built" / "t"}
+    _write(built["inductor"] / "fxgraph" / "entry", "graph")
+    for i in range(6):
+        _write(built["triton"] / f"HASH{i}" / "k.cubin", f"binary {i}")
+    bundle, _ = cb.pack(tmp_path / "b", KEY, built, log=lambda _: None)
+    return bundle, built
+
+
+def _cli_unpack(monkeypatch, src: Path, dirs: dict[str, Path]) -> None:
+    monkeypatch.setattr(cb, "stack_key", lambda device=None: KEY)
+    monkeypatch.setattr(cb, "cache_dirs", lambda: dirs)
+    args = build_parser().parse_args(["cache", "unpack", str(src)])
+    args.func(args)
+
+
+def test_cli_unpacks_a_whole_bundle_and_one_that_grew_since_its_manifest(monkeypatch, tmp_path, capsys):
+    bundle, built = _six_triton_files(tmp_path)
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    _cli_unpack(monkeypatch, bundle, out)
+    assert f"unpacked {bundle}" in capsys.readouterr().out
+    assert len(list(out["triton"].rglob("k.cubin"))) == 6 and (out["inductor"] / cb.MARKER).is_file()
+    # a pack renames the tar into place before it rewrites the manifest, so an unpack beside it can see more
+    _write(built["triton"] / "NEW" / "k.cubin", "binary 6")
+    cb._add(bundle / "triton.tar", built["triton"], ["./NEW/k.cubin"])
+    out = {"inductor": tmp_path / "o2" / "i", "triton": tmp_path / "o2" / "t"}
+    _cli_unpack(monkeypatch, bundle, out)
+    assert f"unpacked {bundle}" in capsys.readouterr().out
+    assert len(list(out["triton"].rglob("k.cubin"))) == 7
+
+
+@pytest.mark.parametrize("damage", ["cut at a header", "a header byte flipped"])
+def test_unpack_refuses_a_tar_that_ends_early_at_a_header(monkeypatch, tmp_path, capsys, damage):
+    """tarfile reads an unreadable header after the first as the end of the
+    archive, so either tar yields 3 of its 6 files without an error."""
+    bundle, _ = _six_triton_files(tmp_path)
+    tar = bundle / "triton.tar"
+    with tarfile.open(tar) as tf:
+        at = tf.getmembers()[3].offset
+    data = bytearray(tar.read_bytes())
+    if damage == "cut at a header":
+        del data[at:]
+    else:
+        data[at] ^= 0xFF
+    tar.write_bytes(data)
+    with tarfile.open(tar) as tf:
+        assert len(tf.getmembers()) == 3
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    with pytest.raises(SystemExit) as exc:
+        _cli_unpack(monkeypatch, bundle, out)
+    assert exc.value.code == 1
+    printed = capsys.readouterr()
+    assert printed.err == f"damaged bundle: {tar} holds 3 files, its manifest records 6\n"
+    assert "unpacked" not in printed.out
+    assert not (out["inductor"] / cb.MARKER).exists() and not list(out["triton"].rglob("k.cubin"))
+
+
+@pytest.mark.parametrize("damage", ["tar", "manifest"])
+def test_unpack_names_an_unreadable_tar_or_manifest_in_one_line(monkeypatch, tmp_path, capsys, damage):
+    bundle, _ = _six_triton_files(tmp_path)
+    if damage == "tar":
+        tar = bundle / "triton.tar"
+        with tarfile.open(tar) as tf:
+            cut = tf.getmembers()[3].offset_data + 1
+        os.truncate(tar, cut)
+        reason = f"{tar}: unexpected end of data"
+    else:
+        manifest = bundle / cb.MANIFEST
+        manifest.write_text(manifest.read_text()[:60])
+        reason = f"{manifest}: "
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    with pytest.raises(SystemExit) as exc:
+        _cli_unpack(monkeypatch, bundle, out)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith(f"damaged bundle: {reason}") and err.count("\n") == 1
+    assert not (out["inductor"] / cb.MARKER).exists()
 
 
 def test_cli_wires_cache_subcommands(monkeypatch, tmp_path, capsys):
