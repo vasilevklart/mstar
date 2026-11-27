@@ -15,11 +15,17 @@ def require_rust_extension(rust_dir: Path = CHECKOUT_RUST) -> None:
     try:
         import mstar_rust
     except ImportError as e:
+        build = "uv pip install maturin && maturin develop --release -m"
+        if is_mstar_rust_crate(rust_dir):
+            how = f"Build it from this checkout, in its virtualenv: `{build} {rust_dir / 'Cargo.toml'}`."
+        else:
+            how = ("Install M* from a source checkout (https://github.com/mstar-project/mstar) "
+                   f"and build it there: `{build} rust/Cargo.toml`.")
         raise ImportError(
             "The graph runtime needs the mstar_rust extension, which this environment "
-            "does not have. The Linux wheels of mstar-ai on PyPI carry it; from a "
-            "checkout, build it with `maturin develop --release -m rust/Cargo.toml` "
-            "(see docs/installation.rst)."
+            "does not have. A pure-Python mstar-ai wheel (py3-none-any) does not include it. "
+            f"{how} maturin needs a Rust toolchain from https://rustup.rs; see "
+            "https://m-star-labs.mintlify.site/installation#rust."
         ) from e
     if not is_mstar_rust_crate(rust_dir):
         return

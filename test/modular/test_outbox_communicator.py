@@ -293,5 +293,5 @@ def test_a_missing_extension_says_how_to_build_it(monkeypatch):
     from mstar.communication.communicator import make_communicator
 
     monkeypatch.setitem(sys.modules, "mstar_rust", None)
-    with pytest.raises(ImportError, match="maturin develop --release -m rust/Cargo.toml"):
+    with pytest.raises(ImportError, match=r"maturin develop --release -m \S*rust/Cargo\.toml"):
         make_communicator("conductor", [])
