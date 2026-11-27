@@ -16,6 +16,8 @@ from pathlib import Path
 
 # unpack's exit status when SRC has no bundle for this stack, so callers can serve cold
 EXIT_NO_MATCH = 3
+# and when SRC isn't a directory (a typo, say), which serve --compile-bundle stops on
+EXIT_NO_SRC = 2
 
 
 def _key(args: argparse.Namespace) -> None:
@@ -50,9 +52,13 @@ def _pack(args: argparse.Namespace) -> None:
 def _unpack(args: argparse.Namespace) -> None:
     from mstar.utils import compile_bundle
 
+    src = Path(args.src)
+    if not src.is_dir():
+        print(f"error: {src} {'is not a directory' if src.exists() else 'does not exist'}", file=sys.stderr)
+        sys.exit(EXIT_NO_SRC)
     t0 = time.monotonic()
     try:
-        done = compile_bundle.unpack(Path(args.src), compile_bundle.stack_key(), compile_bundle.cache_dirs(),
+        done = compile_bundle.unpack(src, compile_bundle.stack_key(), compile_bundle.cache_dirs(),
                                      force=args.force)
     except compile_bundle.BundleMismatchError as exc:
         print(f"not unpacked: {exc}", file=sys.stderr)

@@ -504,6 +504,78 @@ def test_unpack_names_an_unreadable_tar_or_manifest_in_one_line(monkeypatch, tmp
     assert not (out["inductor"] / cb.MARKER).exists()
 
 
+class _ServerStartError(Exception):
+    """Raised where serve would go on to start the server."""
+
+
+def _serve_with_bundle(monkeypatch, src: Path, dirs: dict[str, Path]) -> None:
+    """``mstar serve qwen3_5_9b --compile-bundle SRC`` up to where it would start
+    the server, its unpack child run in this process (the child names the stack
+    from the GPU)."""
+    import types
+
+    from mstar.cli import main as cli_main
+
+    monkeypatch.setattr(cb, "stack_key", lambda device=None: KEY)
+    monkeypatch.setattr(cb, "cache_dirs", lambda: dirs)
+
+    def child(cmd, check):
+        assert cmd[1:5] == ["-m", "mstar.cli.main", "cache", "unpack"]
+        args = build_parser().parse_args(cmd[3:])
+        try:
+            args.func(args)
+        except SystemExit as exc:
+            return subprocess.CompletedProcess(cmd, exc.code)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    def started():
+        raise _ServerStartError
+
+    monkeypatch.setattr(cli_main, "subprocess", types.SimpleNamespace(run=child))
+    monkeypatch.setattr(cli_main, "getpass", types.SimpleNamespace(getuser=started))
+    args = build_parser().parse_args(["serve", "qwen3_5_9b", "--compile-bundle", str(src)])
+    args.func(args)
+
+
+def test_a_compile_bundle_that_does_not_exist_is_an_error(monkeypatch, tmp_path, capsys):
+    """A typo in SRC used to start cold with only the warning."""
+    typo = tmp_path / "bundels"
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    with pytest.raises(SystemExit) as exc:
+        _serve_with_bundle(monkeypatch, typo, out)
+    assert exc.value.code == f"error: unpacking {typo} failed (exit 2)"
+    assert capsys.readouterr().err == f"error: {typo} does not exist\n"
+    # mstar cache unpack alone, and a file where a directory belongs
+    (tmp_path / "manifest.json").write_text("{}")
+    for src, why in ((typo, "does not exist"), (tmp_path / "manifest.json", "is not a directory")):
+        with pytest.raises(SystemExit) as exc:
+            _cli_unpack(monkeypatch, src, out)
+        assert exc.value.code == cache_cli.EXIT_NO_SRC
+        assert capsys.readouterr().err == f"error: {src} {why}\n"
+    assert not (tmp_path / "o").exists()
+
+
+def test_serve_starts_cold_from_a_root_with_no_bundle_for_this_stack(monkeypatch, tmp_path, capsys):
+    root = tmp_path / "bundles"
+    other = cb.StackKey(KEY.product, KEY.arch, "2.11.0+rocm7.1", KEY.runtime, KEY.triton)
+    cb.pack(root, other, _caches(tmp_path / "built"), log=lambda _: None)
+    out = {"inductor": tmp_path / "o" / "i", "triton": tmp_path / "o" / "t"}
+    with pytest.raises(_ServerStartError):
+        _serve_with_bundle(monkeypatch, root, out)
+    assert capsys.readouterr().err == (f"not unpacked: {root} has no bundle for {KEY.path}; it has: {other.path}\n"
+                                       "warning: no compile-cache bundle for this stack; starting cold\n")
+    # an empty root too: the first host to serve, before anything was packed
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(_ServerStartError):
+        _serve_with_bundle(monkeypatch, tmp_path / "empty", out)
+    assert capsys.readouterr().err.endswith("starting cold\n")
+    # and once the root has this stack's bundle, serve unpacks it and starts
+    cb.pack(root, KEY, _caches(tmp_path / "built"), log=lambda _: None)
+    with pytest.raises(_ServerStartError):
+        _serve_with_bundle(monkeypatch, root, out)
+    assert capsys.readouterr().err == "" and (out["inductor"] / cb.MARKER).is_file()
+
+
 def test_cli_wires_cache_subcommands(monkeypatch, tmp_path, capsys):
     calls = {}
     monkeypatch.setattr(cb, "stack_key", lambda device=None: KEY)
