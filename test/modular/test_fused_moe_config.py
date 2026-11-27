@@ -194,7 +194,7 @@ def test_compiled_fused_experts_is_one_graph():
     assert explain.graph_count == 1
 
 
-# Launch options only Triton's HIP backend takes: a CUDA launch raises on them
+# Launch options only Triton's HIP backend takes. An eager CUDA launch raises on them
 # ("Keyword argument ... was specified but unrecognised").
 HIP_LAUNCH_OPTIONS = frozenset({"waves_per_eu", "matrix_instr_nonkdim", "kpack"})
 
@@ -208,8 +208,8 @@ def _tuned_on_amd(path) -> bool:
 def _shipped_entries():
     for path in sorted((table.TABLE_DIR / "moe_gemm").glob("*.json")):
         # A GPU only ever reads the tables named for it, so each table traces on its own
-        # vendor's GPUs: an AMD row's HIP options would fail the CUDA launch, and an NVIDIA row
-        # may not fit an AMD GPU's shared memory.
+        # vendor's GPUs: an AMD row's HIP options mean nothing to a CUDA launch (an eager one
+        # raises on them), and an NVIDIA row may not fit an AMD GPU's shared memory.
         own_vendor = pytest.mark.skipif(
             _tuned_on_amd(path) != current_platform.is_rocm(),
             reason=f"{path.stem} is tuned for {'AMD' if _tuned_on_amd(path) else 'NVIDIA'} GPUs")
