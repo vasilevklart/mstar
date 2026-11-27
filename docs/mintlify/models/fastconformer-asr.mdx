@@ -19,6 +19,8 @@ uv pip install --torch-backend=auto -e ".[asr]"
 mstar serve parakeet
 ```
 
+`canary_qwen` also downloads the tokenizer and config of the LLM its checkpoint names (`Qwen/Qwen3-1.7B`), so an offline host needs that repo too. On 1x H200 on 2026-11-27, `canary`, `parakeet` and `nemotron_asr` each transcribed a LibriSpeech clip correctly; `canary_qwen` was not run ([Verified on H200](/models#verified-on-h200)).
+
 ## Send a request {#request}
 
 ```python

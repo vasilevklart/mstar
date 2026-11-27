@@ -18,6 +18,8 @@ uv pip install --torch-backend=auto -e ".[qwen3_omni]"
 mstar serve qwen3_omni --gpus 0,1
 ```
 
+On 2x H200 on 2026-11-27, `configs/qwen3omni_2gpu.yaml` answered a chat request with text and a WAV of the same words ([Verified on H200](/models#verified-on-h200)).
+
 Whether every capture of the default config fits on an 80 GB GPU is unmeasured. On GPUs such as the H100, serve the H100 layout:
 
 ```bash

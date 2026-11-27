@@ -16,6 +16,8 @@ uv pip install --torch-backend=auto -e ".[voxcpm2]"
 mstar serve voxcpm2
 ```
 
+The first start downloads the whole `openbmb/VoxCPM2` repo, including `audiovae.pth`. An offline host needs it in its cache: on 1x H200 on 2026-11-27, a cache without that file stopped startup with `FileNotFoundError: .../audiovae.pth`.
+
 The Talker's decode step is compiled with `torch.compile` and captured at startup, so the first start with a cold compile cache is slow; see [Cold start](/cold-start#compile-cache). `model_kwargs: {compile_talker: false}` starts in seconds at lower throughput.
 
 ## Send a request {#request}

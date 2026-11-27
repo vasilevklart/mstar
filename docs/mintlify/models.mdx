@@ -13,6 +13,8 @@ mstar serve qwen3_omni --config configs/qwen3omni_2gpu_h100.yaml --gpus 0,1
 
 GPUs counts the devices the default config uses. Extra is the install extra, as in `uv pip install --torch-backend=auto -e ".[bagel]"`; `all` marks a model with no extra of its own. `omnivoice`, the four Qwen3-TTS keys and `waypoint` also need a package no extra can carry ([Manual installs](/installation#manual-installs)). In the speech generation table, audio input is a reference clip for voice cloning, except on `nemotron_duplex`, where it is the user's speech.
 
+[Verified on H200](#verified-on-h200) lists the keys that served a real request on 2026-11-27.
+
 Every key serves `POST /generate` and `/generate/ws` ([Clients](/clients#native-generate)). Endpoints lists the OpenAI routes on top:
 
 - chat: `POST /v1/chat/completions`
@@ -110,6 +112,38 @@ These keys have no OpenAI adapter, so their `/v1/*` generation routes answer 404
 - `command_a_plus`, `minicpm_o`, `waypoint`, `lingbot_world_1_3b`, `vjepa2`, `vjepa2_ac`.
 - `nemotron_duplex` also serves `/v1/realtime` conversations.
 - `pi05` with `configs/pi05_droid.yaml` also serves openpi's policy WebSocket ([Clients](/clients#openpi-websocket)).
+
+## Verified on H200 {#verified-on-h200}
+
+On 2026-11-27, each of these default configs started on H200 GPUs and answered one request with a correct output (text checked, audio transcribed, images and video decoded):
+
+| Config | Key | GPUs | Request |
+|---|---|---|---|
+| `qwen3_5_0.8b.yaml` | `qwen3_5_0.8b` | 1 | chat |
+| `qwen3_5_9b.yaml` | `qwen3_5_9b` | 1 | chat |
+| `phi4mm.yaml` | `phi4mm` | 1 | chat |
+| `qwen3omni_2gpu.yaml` | `qwen3_omni` | 2 | chat, text and speech out |
+| `bagel_single_gpu.yaml` | `bagel` | 1 | chat (SDK and OpenAI client), SDK stream, images |
+| `kokoro.yaml` | `kokoro` | 1 | speech, with spaCy's `en_core_web_sm` installed ([Kokoro](/models/kokoro#serve)) |
+| `whisper_large_v3_turbo.yaml` | `whisper_large_v3_turbo` | 1 | transcriptions |
+| `qwen3_asr.yaml` | `qwen3_asr` | 1 | transcriptions |
+| `qwen3_asr_realtime.yaml` | `qwen3_asr_realtime` | 1 | transcriptions |
+| `canary.yaml` | `canary` | 1 | transcriptions |
+| `parakeet.yaml` | `parakeet` | 1 | transcriptions |
+| `nemotron_asr.yaml` | `nemotron_asr` | 1 | transcriptions |
+| `flux2_klein.yaml` | `flux2_klein` | 1 | images, 256x256 |
+| `z_image_turbo.yaml` | `z_image_turbo` | 1 | images, 256x256 |
+| `wan22.yaml` | `wan22` | 1 | videos, 256x256, 5 frames |
+| `cosmos3_edge.yaml` | `cosmos3_edge` | 1 | videos, 192x320, 9 frames |
+| `lingbot_world_1_3b.yaml` | `lingbot_world_1_3b` | 1 | `/generate`, 29 streamed `video_frame`s |
+
+Five more stopped at startup, each on the environment and none on the code:
+
+- `qwen3_tts_1p7b`: `qwen-tts` was not installed, and the error names the command that installs it ([Qwen3-TTS](/models/qwen3-tts#serve)).
+- `omnivoice`: `No module named 'omnivoice'`; the package is a [manual install](/models/omnivoice#serve).
+- `minicpm_o`, `voxcpm2` and `vjepa2` ran offline (`HF_HUB_OFFLINE=1`) from caches that held the safetensors but not `assets/token2wav/flow.pt` and `hift.pt`, `audiovae.pth`, or `original/model.pth`. An online first start downloads these. For an offline host, download the whole repo with `hf download <repo>`.
+
+The other keys were not run that day. Some of them also read other repositories at startup, so an offline host needs those in its cache too: `higgs_audio` (the `openai/whisper-large-v3` feature extractor), `canary_qwen` (the `Qwen/Qwen3-1.7B` tokenizer), `orpheus` (the `canopylabs/orpheus-3b-0.1-pretrained` tokenizer) and `pi05` (the gated `google/paligemma-3b-pt-224` tokenizer), as does `lingbot_world_1_3b` (`Wan-AI/Wan2.2-TI2V-5B-Diffusers` and `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`).
 
 ## GPU memory {#gpu-memory}
 

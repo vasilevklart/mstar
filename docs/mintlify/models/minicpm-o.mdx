@@ -18,6 +18,8 @@ uv pip install --torch-backend=auto -e ".[minicpm_o]"
 mstar serve minicpm_o --gpus 0
 ```
 
+Besides the safetensors, the first start downloads the vocoder files in `assets/token2wav/` (`*.pt` and `*.onnx`). An offline host needs them in its cache: on 1x H200 on 2026-11-27, a cache without `flow.pt` and `hift.pt` stopped startup with `IncompleteSnapshotError`.
+
 ## Send a request {#request}
 
 Use `/generate` or the Python SDK; the `/v1/*` generation routes answer 404 for this model. Ask for speech with `output_modalities`:

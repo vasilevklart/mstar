@@ -22,6 +22,8 @@ uv pip install --torch-backend=auto -e ".[cosmos3]"
 mstar serve cosmos3
 ```
 
+On 1x H200 on 2026-11-27, `configs/cosmos3_edge.yaml` served a 9-frame 192x320 video request ([Verified on H200](/models#verified-on-h200)). The other keys were not run.
+
 Runtime requirements:
 
 - The extra installs `fa3-fwd`, which runs the eager denoise attention of the default `attention_backend: dense_gen`. Its wheel is tied to the torch and CUDA build and has kernels for sm_80 and sm_90a only. Where it cannot load or has no kernel for the GPU, as on Blackwell, the same pass runs on FlashInfer's ragged prefill; `resources: attn_gen: flashinfer_backend:` picks that kernel (`cudnn`, `cutlass`, `fa2`), and a backend the GPU cannot run stops the server at startup.

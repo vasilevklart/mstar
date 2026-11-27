@@ -19,6 +19,8 @@ uv pip install --torch-backend=auto -e ".[asr]"
 mstar serve whisper_large_v3_turbo
 ```
 
+On 1x H200 on 2026-11-27, `whisper_large_v3_turbo`, `qwen3_asr` and `qwen3_asr_realtime` each transcribed a LibriSpeech clip correctly ([Verified on H200](/models#verified-on-h200)).
+
 ## Send a request {#request}
 
 ```python

@@ -22,6 +22,8 @@ uv pip install --no-deps "qwen-tts==0.1.1"
 mstar serve qwen3_tts_1p7b
 ```
 
+Without the package, the worker stops at startup with `Qwen3-TTS Codec requires the 'qwen-tts' package`, as `qwen3_tts_1p7b` did on 1x H200 on 2026-11-27 ([Verified on H200](/models#verified-on-h200)).
+
 `qwen-tts` pins `transformers==4.57.3` and `accelerate==1.12.0`. Installed with them, it cannot share an environment with `diffusers>=0.40` (Wan2.2, Cosmos3, FLUX.2 klein), OmniVoice (`transformers>=5.3`) or Qwen3-Omni (`transformers>=5.18`), and installing it after them downgrades their dependencies. M\* reads only its speech-tokenizer source files, which run under transformers 4.57.3 or 5.x. `pip check` still lists the package's own requirements as unmet; that is expected.
 
 ## Send a request {#request}

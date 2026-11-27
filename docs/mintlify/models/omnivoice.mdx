@@ -19,7 +19,7 @@ python -c "from omnivoice.models import omnivoice_flashinfer; print('ok')"
 mstar serve omnivoice
 ```
 
-It has to come from git: the PyPI release has no `omnivoice.models.omnivoice_flashinfer`, the packed-attention forward M\* calls, so a PyPI install fails at model load with `ImportError: cannot import name 'omnivoice_flashinfer'`. PyPI also rejects a direct git URL in a package's dependencies, which is why this is an install step and not part of the extra.
+Without the package, the worker stops at startup with `No module named 'omnivoice'` (seen on 1x H200, 2026-11-27). It has to come from git: the PyPI release has no `omnivoice.models.omnivoice_flashinfer`, the packed-attention forward M\* calls, so a PyPI install fails at model load with `ImportError: cannot import name 'omnivoice_flashinfer'`. PyPI also rejects a direct git URL in a package's dependencies, which is why this is an install step and not part of the extra.
 
 ## Send a request {#request}
 

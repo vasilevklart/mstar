@@ -22,6 +22,8 @@ mstar serve bagel_cfg_parallel --gpus 0,1,2
 
 The ViT encoder uses `flash-attn` when it is installed and falls back to torch SDPA with a warning; see [manual installs](/installation#manual-installs).
 
+On 1x H200 on 2026-11-27, `configs/bagel_single_gpu.yaml` served chat, streamed chat and image generation, without flash-attn ([Verified on H200](/models#verified-on-h200)). Its first start took 8.5 to 12 minutes on empty caches and about 70 seconds after that ([First start time](/cold-start#first-start-time)).
+
 ## Send a request {#request}
 
 ```python

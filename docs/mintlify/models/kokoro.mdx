@@ -17,7 +17,7 @@ python -m spacy download en_core_web_sm
 mstar serve kokoro
 ```
 
-misaki downloads the spaCy tagger itself on first use when it has network access. `pip install 'misaki[en]'` adds espeak-ng (GPL), which Kokoro uses for out-of-dictionary English words and as the G2P for the Spanish, French, Hindi, Italian and Portuguese voices; without it those words are skipped and those voices are refused. Japanese and Mandarin voices need `misaki[ja]` and `misaki[zh]`.
+misaki downloads the spaCy tagger itself on first use when it has network access; offline, install it with the command above. With it installed, `configs/kokoro.yaml` served a `/v1/audio/speech` request on 1x H200 on 2026-11-27 ([Verified on H200](/models#verified-on-h200)). `pip install 'misaki[en]'` adds espeak-ng (GPL), which Kokoro uses for out-of-dictionary English words and as the G2P for the Spanish, French, Hindi, Italian and Portuguese voices; without it those words are skipped and those voices are refused. Japanese and Mandarin voices need `misaki[ja]` and `misaki[zh]`.
 
 ## Send a request {#request}
 

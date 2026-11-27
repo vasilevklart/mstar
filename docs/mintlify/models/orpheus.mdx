@@ -16,6 +16,8 @@ uv pip install --torch-backend=auto -e ".[orpheus]"
 mstar serve orpheus
 ```
 
+The tokenizer always comes from `canopylabs/orpheus-3b-0.1-pretrained`, which the first start also downloads, even when `model_kwargs: {model_path_hf: ...}` names another checkpoint.
+
 ## Send a request {#request}
 
 ```python

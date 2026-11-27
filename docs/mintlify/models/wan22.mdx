@@ -16,6 +16,8 @@ uv pip install --torch-backend=auto -e ".[wan22]"
 mstar serve wan22
 ```
 
+On 1x H200 on 2026-11-27, `configs/wan22.yaml` served a 5-frame 256x256 video request ([Verified on H200](/models#verified-on-h200)).
+
 ## Send a request {#request}
 
 `POST /v1/videos/generations` takes a JSON body and returns the mp4 in `data[0].b64_json`. `size` is `WxH`, width first. Add `image` (a URL or data URI) for image-to-video.

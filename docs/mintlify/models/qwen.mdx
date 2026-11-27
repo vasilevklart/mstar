@@ -24,7 +24,7 @@ mstar serve qwen3_5_4b
 mstar serve qwen3_8_27b --gpus 0,1,2,3
 ```
 
-The shipped configs compile the vision path with two warmup requests before the server binds, so wait for `/health` before the first request.
+The shipped configs compile the vision path with two warmup requests before the server binds, so wait for `/health` before the first request. On 1x H200 on 2026-11-27, `qwen3_5_0.8b` and `qwen3_5_9b` each served a chat request; their first starts on empty caches took 504 s and 544 s ([Verified on H200](/models#verified-on-h200)).
 
 ## Send a request {#request}
 
