@@ -309,6 +309,7 @@ def load_weights(
 
 # ---------------------------------------------------------------------------
 # Index cross-check: a name-level dry run of the exact load pipeline.
+# test/glm5_next/cross_check_index.py runs it over a checkpoint's index and prints the report.
 
 _SCALE_SUFFIX = ".weight_scale_inv"
 
