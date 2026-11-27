@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -108,13 +108,20 @@ class DeviceLoopback(NamedTuple):
     tokens on the host would pay for nothing.
     """
 
-    walk: str
+    # the walk, or walks, whose token loops back (a combined walk's rows
+    # follow their own walk's)
+    walk: str | frozenset[str]
     # the input signal the walk's token loops back to
     signal: str
     # resource key of the sampler keeping the slot masters
     sampler: str
     # the row-addressed output (``check_stop_buffers`` entry) holding the token
     buffer: str
+
+    def covers(self, graph_walk: str) -> bool:
+        """Whether ``graph_walk``'s token loops back on the device."""
+        walk = self.walk
+        return graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
 
 
 class StopCheck(NamedTuple):
@@ -250,6 +257,24 @@ class StopPolicy:
         )
 
 
+def _clone_stop_buffer(value, clones: dict[int, torch.Tensor]):
+    """``value`` with each tensor cloned once, by identity, into ``clones``."""
+    # A module function: nested in its caller it would close over itself, and that cycle keeps the clones alive
+    # until a collection.
+    if isinstance(value, torch.Tensor):
+        if id(value) not in clones:
+            clones[id(value)] = value.clone()
+        return clones[id(value)]
+    if isinstance(value, list):
+        return [
+            x.clone() if isinstance(x, torch.Tensor) else x for x in value
+        ]
+    if isinstance(value, dict):
+        return {k: _clone_stop_buffer(v, clones) for k, v in value.items()}
+    # pass anything else through: dropping it could lose a stop signal
+    return value
+
+
 @dataclass
 class BatchedModelOutput:
     """A step's outputs, split by how they are addressed.
@@ -353,22 +378,7 @@ class BatchedModelOutput:
             id(rows[name]): clone for name, clone in (reuse or {}).items()
             if name in rows and isinstance(clone, torch.Tensor)
         }
-
-        def _clone(value):
-            if isinstance(value, torch.Tensor):
-                if id(value) not in clones:
-                    clones[id(value)] = value.clone()
-                return clones[id(value)]
-            if isinstance(value, list):
-                return [
-                    x.clone() if isinstance(x, torch.Tensor) else x for x in value
-                ]
-            if isinstance(value, dict):
-                return {k: _clone(v) for k, v in value.items()}
-            # pass anything else through: dropping it could lose a stop signal
-            return value
-
-        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone_stop_buffer(v, clones) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows
@@ -887,7 +897,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     capture_cudnn_benchmark: bool = False
 
     # The keys of this node's resources whose step is its segments
-    # (``Resource.steps_from_segments``: the LoRA pools); set by `bind_node_resources`. The
+    # (``Resource.steps_from_segments``: the LoRA pools, the sequence shard); set by `bind_node_resources`. The
     # engine adds a step of the segments under each to the node's step (``engine_step``),
     # and to each piecewise region's from the region's own: in order, the rows the node's
     # computation sees, each a request's span of tokens (a request may have several, as
@@ -907,6 +917,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
         self.node_resources: dict[str, Any] = {}
+        # This node's sequence shard (`SeqShardSpec`; a node takes one), whose `scatter` / `gather` bracket the layer
+        # stack under sequence parallelism; None on a node that declares none. Set by `bind_node_resources`.
+        self.sequence_shard: Any = None
         # This node's handles on its declared state (`mstar.engine.state`), bound once at load.
         self.state_handles: Mapping[str, Any] = {}
 
@@ -921,10 +934,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``get_node_resources``; a layer that names a label this node doesn't
         have fails at bind rather than in the middle of a forward.
         """
+        from mstar.engine.resources.sequence_shard import SequenceShard
+
         self.segment_keys = tuple(
             key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)
         )
         self.node_resources = resources
+        self.sequence_shard = next((r for r in resources.values() if isinstance(r, SequenceShard)), None)
         for module in self.modules():
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
@@ -1163,6 +1179,27 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
+    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, str] | None:
+        """How each loop-back signal of this walk (``signals``, from the graph)
+        moves from one replay of its capture to the next, as {output buffer:
+        static input}; None when the walk's step can't repeat."""
+        del graph_walk, signals
+        return None
+
+    def enable_repeats(self, walks: Collection[str]) -> None:
+        """Before capture: the deployment asks these walks of this node to repeat
+        (``step_repeats:``)."""
+        del walks
+
+    def record_tokens(
+        self, graph_walk: str, host_rows: "HostRows", info_of: Callable[[int], CurrentForwardPassInfo],
+    ) -> None:
+        """A landed step's host tokens, every iteration, for a node that keeps
+        them on the host: when the runtime checks the stop, ``check_stop`` has
+        nothing to read them from. Called on every step of a worker with
+        ``step_repeats:``; a node reads only the walks it asked to repeat."""
+        del graph_walk, host_rows, info_of
+
     def resident_walks(self) -> frozenset[str]:
         """Walks whose captured steps may read their rows off the resident
         tables (`mstar.engine.resources.resident`). A walk here runs, for each
@@ -1175,9 +1212,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
         but their spans, and every real row has the span of the template row.
-        Then the step a pre-plan declared over the bucket's template rows is
-        the step the forward would declare, and the engine runs it instead of
-        declaring and admitting a second time."""
+        Then the step a pre-plan declared over the bucket's template rows is the
+        step the forward would declare, and the engine runs it instead of
+        declaring and admitting a second time, as it does for a pre-plan over the
+        prepared rows. A node holding host fields can't return True here, which
+        `Engine._check_host_fields` checks at load."""
         del graph_walk
         return False
 
@@ -1236,11 +1275,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         row-addressed stop buffer holding it. The worker then sends those values
         inline, one frame per step, instead of one tensor per request: to the
         client on an emit edge that is not persisted, and down a stream whose
-        ``Connection`` goes ``by_value``. A step carries one inline signal, the
-        first of these it outputs. Its rows stay on the device only if every
-        output is a ``device_loopback_signals`` one, so a stream's signal sent
-        inline lets the step run rows-only when it is also the loop-back
-        signal."""
+        ``Connection`` goes ``by_value``. A step carries one column of these:
+        the first it outputs, and every other it outputs that reads the same
+        buffer. A row whose stop check withheld one of them sends nothing for
+        it. The step keeps its rows on the device (rows-only) when every
+        output is a ``device_loopback_signals`` one or rides the column on
+        every edge: a client emit, or a ``by_value`` stream. A rows-only step
+        builds no per-request outputs and skips ``postprocess``, so anything
+        ``postprocess`` does must be about outputs the step stores."""
         del graph_walk
         return {}
 
@@ -1543,12 +1585,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
 def with_segment_steps(step: SubmoduleStep | None, keys: Sequence[str]) -> SubmoduleStep | None:
     """``step`` with a ``ResourceStep`` of its segments under each of ``keys`` (the
     resources whose step is the segments, ``Resource.steps_from_segments``) that it does
-    not declare itself, as a new step (a declaration reused across calls keeps its own). A
-    step without segments gets none: a resource that needs one refuses for want of a plan
-    (``LoraLayerDelta``)."""
+    not declare itself, as a new step carrying its ``combined_labels`` (a declaration reused
+    across calls keeps its own). A step without segments gets none: a resource that needs one
+    refuses for want of a plan (``LoraLayerDelta``, the sequence shard's dependents)."""
     if keys and step is not None and step.segments is not None:
         segments = tuple(step.segments)
-        added = {key: ResourceStep(segments=segments) for key in keys if key not in step.steps}
+        added = {
+            key: ResourceStep(segments=segments, combined_labels=step.combined_labels)
+            for key in keys if key not in step.steps
+        }
         if added:
             step = replace(step, steps={**step.steps, **added})
     return step
@@ -1564,7 +1609,33 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     # Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.
     from mstar.engine.state.adapters import state_steps
 
-    return state_steps(step, getattr(submodule, "state_handles", {}))
+    return state_steps(step, getattr(submodule, "state_handles", {}), graph_walk=kwargs.get("graph_walk"))
+
+
+def splice_loopback_ids(ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool) -> torch.Tensor:
+    """``ids`` (one loop-back token per row) with each row that brought
+    its own ids taking them instead, in row order: a mixed step's prompt
+    rows, or a decode row whose last step ran elsewhere. Runs of loop-back
+    rows go in as one slice each, and the splice is device ops only: an
+    index built from a host list would be a synchronous copy behind the
+    step in flight. A decode step keeps the slot's padding rows past
+    ``inputs``, so its length stays the captured one."""
+    pieces: list[torch.Tensor] = []
+    run = None
+    for i, inp in enumerate(inputs):
+        if inp.input_ids is None or (decode and not inp.input_seq_len):
+            if run is None:
+                run = i
+            continue
+        if run is not None:
+            pieces.append(ids[run:i])
+            run = None
+        pieces.append(inp.input_ids.to(ids.dtype))
+    if run is not None:
+        pieces.append(ids[run:len(inputs)])
+    if decode and ids.shape[0] > len(inputs):
+        pieces.append(ids[len(inputs):])
+    return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
 
 
 class ARNodeSubmodule(NodeSubmodule):
@@ -1579,6 +1650,14 @@ class ARNodeSubmodule(NodeSubmodule):
     # Set by a submodule whose decode walk reads its last sampled token back on
     # the device; the loop-back hooks below follow from it.
     device_loopback: DeviceLoopback | None = None
+    # The walks a deployment asks to repeat (``step_repeats:``): their stop is
+    # the runtime's. Empty otherwise, so a deployment that doesn't ask runs the
+    # node as declared. Whether they also run on resident tables and loop their
+    # token back is the node's to say (``resident_walks``, ``device_loopback``).
+    _repeat_walks: frozenset[str] = frozenset()
+
+    def enable_repeats(self, walks: Collection[str]) -> None:
+        self._repeat_walks = frozenset(walks)
 
     def bind_node_state(self, handles: Mapping[str, Any]) -> None:
         super().bind_node_state(handles)
@@ -1591,7 +1670,7 @@ class ARNodeSubmodule(NodeSubmodule):
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""
         loopback = self.device_loopback
-        return loopback is not None and graph_walk == loopback.walk
+        return loopback is not None and loopback.covers(graph_walk)
 
     def _reads_loopback(self, graph_walk: str) -> bool:
         """Whether this walk's rows read their token off the slot masters: a
@@ -1613,6 +1692,12 @@ class ARNodeSubmodule(NodeSubmodule):
         if self._reads_loopback(graph_walk):
             return frozenset({self.device_loopback.signal})
         return super().device_loopback_signals(graph_walk)
+
+    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, str] | None:
+        if not self._loops_back(graph_walk) or self.device_loopback.signal not in signals:
+            return None
+        carried = {signal: signal for signal in signals if signal != self.device_loopback.signal}
+        return {self.device_loopback.buffer: "input_ids", **carried}
 
     def inline_signals(self, graph_walk: str) -> dict[str, str]:
         # the loop-back token, which the stop check already has on the host
@@ -1645,7 +1730,16 @@ class ARNodeSubmodule(NodeSubmodule):
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         stop = self.token_stop
-        if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
+        # A walk asked to repeat that can (it runs resident and loops its token
+        # back) reads its stop in the runtime, unless the stop withholds a frame,
+        # which only check_stop does. Any other walk keeps the node's own stop.
+        runtime = stop is not None and (
+            stop.runtime_check or (
+                graph_walk in self._repeat_walks and graph_walk in self.resident_walks()
+                and self._loops_back(graph_walk) and not stop.withhold
+            )
+        )
+        if not runtime or graph_walk in stop.prefill_walks:
             return super().get_stop_policies(graph_walk)
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop

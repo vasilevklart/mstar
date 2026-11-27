@@ -18,8 +18,11 @@ import pytest
 import torch
 import yaml
 from test_startup_graph_validation import _prefill_decode, _ToyModel, _validate
+from test_state_ports import QWEN3_5, _qwen3_5
 
 from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.kv.bounded.config import BoundedKVSpec, SinkWindow
+from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateSpec
@@ -29,20 +32,39 @@ from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spe
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
+    Block,
     Causal,
     CausalConv,
     Entry,
     GatedDeltaNet,
     KVEntry,
+    Mamba2,
+    Positions,
     Read,
+    Rope,
     Sampler,
     TensorType,
     Value,
     Window,
+    position,
 )
-from mstar.engine.state.adapters import BINDINGS, VALUE, LinearAttnBinding, build_specs, node_resources
+from mstar.engine.state.adapters import (
+    BINDINGS,
+    VALUE,
+    BoundedHandle,
+    LinearAttnBinding,
+    StateSetup,
+    _resolve,
+    build_specs,
+    node_handles,
+    node_resources,
+    state_setup,
+)
 from mstar.engine.state.contract import Mask, Op
-from mstar.model.base import Model, enabled_resources
+from mstar.model.base import Model, enabled_resources, serving_resources
+from mstar.model.qwen3_5.config import GDN_STATE
+from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.validation import DeploymentError
 
 _SPLIT = CombinedSplit("mixed", prefill_walks=("prefill",))
@@ -70,6 +92,22 @@ def _gdn(**overrides) -> Array:
     return Value("gdn", **{
         "nodes": {"llm"}, "layers": {0, 1, 3}, "entry": _gdn_entry(),
         "updates": {"conv": CausalConv(), "delta": GatedDeltaNet()}, **overrides,
+    })
+
+
+def _ssm_entry(ssm_dtype=torch.float32, conv_channels=4 * 16 + 2 * 16, **extra) -> Entry:
+    """A Mamba-2 Value's entry, 4 heads of 16 over a state of 16 in one group, which a conv of 96 channels matches."""
+    return Entry({
+        "ssm": TensorType((4, 16, 16), dtype=ssm_dtype, shard=0),
+        "conv": TensorType((conv_channels, 3), dtype=None, shard=0),
+        **extra,
+    })
+
+
+def _mamba(**overrides) -> Array:
+    return Value("mamba", **{
+        "nodes": {"llm"}, "layers": {2, 4}, "entry": _ssm_entry(),
+        "updates": {"conv": CausalConv(), "ssm": Mamba2()}, **overrides,
     })
 
 
@@ -153,6 +191,17 @@ def test_an_append_only_array_on_other_nodes_does_not_stop_the_link():
     other = Array("vision_kv", nodes={"vision"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=512,
                   reads={"vision_attn": _read()})
     assert _by_key(other, _kv(), _gdn())["gdn"].config.kv_cache == "kv", "only an array on the value's nodes can link"
+
+
+def test_a_cross_read_array_on_the_value_nodes_does_not_stop_the_link():
+    context = Array("context", nodes={"llm"}, layers={2, 5}, entry=KVEntry(heads=4, head_dim=16), max_len=64,
+                    reads={"cross": _read(mask=Bidirectional(), queries="kv")})
+    assert _by_key(_kv(), context, _gdn())["gdn"].config.kv_cache == "kv", "a context holds no row's own entries"
+
+
+def test_a_value_beside_an_array_whose_reads_differ_by_walk_links_to_its_pages():
+    by_walk = _kv(reads={"attn": _read(walks={"prefill"}), "attn_decode": _read(walks={"decode"})})
+    assert _by_key(by_walk, _gdn())["gdn"].config.kv_cache == "kv", "its pages hold each row's own entries"
 
 
 def test_a_value_specs_sit_on_the_value_nodes_not_the_pool_nodes():
@@ -242,6 +291,9 @@ def test_a_gated_delta_net_defaults_to_the_config_defaults():
 class _OtherMask(Mask):
     """A mask `build_specs` has no layout for."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 @dataclass(frozen=True)
 class _OtherUpdate(Op):
@@ -254,7 +306,10 @@ _MIXED = _read(op=Attend(q_heads=4))
 # The array each refusal names, its declarations, and what the message says is missing.
 NO_LAYOUT = {
     "a read through no op": ("kv", lambda: [_kv(reads={"r": _read(op=None)})], "reads['r'].op"),
-    "a read of one walk": ("kv", lambda: [_kv(reads={"r": _read(walks={"decode"})})], "reads['r'].walks"),
+    "a cross read of one walk": ("ctx", lambda: [_kv(), Array(
+        "ctx", nodes={"llm"}, layers={2, 5, 7, 9}, entry=KVEntry(heads=4, head_dim=16), max_len=512,
+        reads={"x": _read(mask=Bidirectional(), queries="kv", walks={"decode"})},
+    )], "reads['x'].walks"),
     "a mask of no known name": ("kv", lambda: [_kv(reads={"r": _read(mask=_OtherMask())})], "reads['r'].mask"),
     "two query head counts": ("kv", lambda: [_kv(reads={"a": _read(layers={2}), "b": _MIXED})], "q_heads"),
     "no reads": ("kv", lambda: [_kv(reads={})], "reads is empty"),
@@ -289,24 +344,18 @@ NO_LAYOUT = {
         lambda: [_kv(entry=Entry({"k": TensorType((4, 16), dtype=None), "v": TensorType((4, 16), dtype=None)}))],
         "sharded on",
     ),
-    "a host field": (
-        "kv",
-        lambda: [_kv(entry=Entry(KVEntry(heads=4, head_dim=16).tensors, host={"done": bool}))],
-        "no host field",
-    ),
     "a rewritable log": ("kv", lambda: [_kv(rewritable=True)], "rewritable"),
     "a read on a value": ("gdn", lambda: [_kv(), Array(
         "gdn", nodes={"llm"}, layers={0}, entry=_gdn_entry(), max_len=1, rewritable=True,
         reads={"r": Read(mask=Causal())},
-    )], "reads must be empty"),
+    )], "today's resources run no read on this array"),
     "a value of one tensor": (
         "gdn",
         lambda: [_kv(), _gdn(entry=Entry({"state": TensorType((8, 128, 64), dtype=None)}),
                              updates={"delta": GatedDeltaNet()})],
         "entry",
     ),
-    "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "entry"),
-    "a value with no update": ("gdn", lambda: [_kv(), _gdn(updates={})], "GatedDeltaNet"),
+    "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "updates"),
     "a value with only a conv": ("gdn", lambda: [_kv(), _gdn(updates={"conv": CausalConv()})], "GatedDeltaNet"),
     "an update of another kernel": (
         "gdn", lambda: [_kv(), _gdn(updates={"delta": GatedDeltaNet(), "x": _OtherUpdate()})], "updates ['x']",
@@ -359,9 +408,25 @@ class _OtherLinear(LinearAttnBinding):
 
 
 def test_an_op_with_no_binding_on_its_storage_is_refused_as_no_layout_yet():
-    refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet"
+    refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet or Mamba2"
     with pytest.raises(ValueError, match=re.escape(refusal)):
         build_specs([_kv(), _gdn(updates={"delta": GatedDeltaNet(), "other": _OtherRecurrence()})])
+
+
+def test_resolve_records_the_resource_every_op_runs_on():
+    resolved = _resolve([_kv(positions=Positions()), _gdn()], StateSetup())
+    assert resolved.resource_of == {"attn": "attn", "rope": "rope", "delta": "delta", "conv": "delta"}, (
+        "an op with no resource here falls back to its own key, and the conv has no resource of its own"
+    )
+
+
+@pytest.mark.parametrize("field, refusal", [
+    ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
+])
+def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):
+    flags = replace(Value("flags", nodes={"talker"}, layers={0}, entry=Entry({}, host={"sent": bool})), **field)
+    with pytest.raises(ValueError, match=f"Array 'flags': no layout yet: {refusal}"):
+        build_specs([flags])
 
 
 def test_a_within_step_read_of_another_mask_is_refused_as_no_layout_yet():
@@ -380,7 +445,7 @@ def test_a_conv_needs_exactly_one_linear_attention_update_to_run_inside(monkeypa
     monkeypatch.setitem(BINDINGS, (VALUE, _OtherRecurrence), _OtherLinear())
     with pytest.raises(ValueError, match=re.escape(
         f"Array 'gdn': no layout yet: updates['conv'] is a CausalConv, which today's resources run inside one linear "
-        f"attention update (GatedDeltaNet, _OtherRecurrence), and the array has {linear}",
+        f"attention update (GatedDeltaNet, Mamba2, _OtherRecurrence), and the array has {linear}",
     )):
         build_specs([_kv(), _gdn(updates=updates)])
 
@@ -401,7 +466,7 @@ def test_with_no_kernel_settings_the_fields_keep_their_defaults():
 
 @pytest.mark.parametrize("settings, word", [
     ({"nope": {"splits": ()}}, "'nope'"),
-    ({"kv": {"splits": ()}}, "'kv'"),    # the array's name, not a read or an update
+    ({"kv": {"splits": ()}}, "'kv'"),    # a kernel choice under an array's name
     ({"conv": {"splits": ()}}, "'conv'"),    # a CausalConv has no spec of its own
     ({"attn": {"backend": "sdpa"}}, "backend"),
     ({"attn": {"sliding_window": 4}}, "sliding_window"),
@@ -418,6 +483,108 @@ def test_kernel_settings_refuse_anything_else(settings, word):
 def test_a_refused_kernel_setting_names_the_array_its_key_belongs_to(key, array):
     with pytest.raises(ValueError, match=f"Array '{array}'"):
         build_specs([_kv(), _gdn()], kernel_settings={key: {"sm_scale": 1.0}})
+
+
+def _within(**overrides) -> Array:
+    return Array("vision", **{
+        "nodes": {"llm"}, "layers": {0}, "entry": KVEntry(heads=4, head_dim=16), "max_len": 0,
+        "reads": {"vision_attn": _read(mask=Block())}, **overrides,
+    })
+
+
+_FLAG = Value("flag", nodes={"llm"}, layers={0}, entry=Entry({}, host={"seen": bool}))
+
+
+def test_a_hook_page_count_builds_the_spec_the_same_key_under_resources_builds():
+    hooked = build_specs([_kv()], kernel_settings={"kv": {"max_num_pages": 256}})
+    written = build_specs([_kv()])
+    apply_yaml_overrides(written, {"resources": {"kv": {"max_num_pages": 256}}})
+    apply_yaml_overrides(hooked, {})
+    assert hooked[0].config == written[0].config and hooked[0].config.max_num_pages == 256
+
+
+def test_a_hook_slot_count_builds_the_spec_the_same_key_under_resources_builds():
+    hooked = build_specs([_kv(), _gdn()], kernel_settings={"gdn": {"max_slots": 64}})
+    written = build_specs([_kv(), _gdn()])
+    apply_yaml_overrides(written, {"resources": {"gdn": {"max_slots": 64}}})
+    apply_yaml_overrides(hooked, {})
+    assert hooked[2].config == written[2].config and hooked[2].config.max_slots == 64
+
+
+def test_a_hook_slot_count_sizes_qwen3_5s_value_and_the_yaml_overrides_it():
+    class _Sized(Qwen3_5DenseModel):
+        def kernel_settings(self):
+            return {**super().kernel_settings(), GDN_STATE: {"max_slots": 64}}
+
+    model = _Sized.__new__(_Sized)
+    model.config = _qwen3_5(**QWEN3_5["9B"]).config
+    model.vision_config = None
+
+    def slots(config: dict) -> int:
+        return next(s for s in serving_resources(model, config) if s.resource_key == GDN_STATE).config.max_slots
+
+    assert slots({}) == 64, "the hook is the default"
+    assert slots({"resources": {GDN_STATE: {"max_slots": 128}}}) == 128, "a deployment overrides the hook"
+
+
+def test_a_yaml_page_count_overrides_the_hook_as_a_server_builds_the_specs():
+    model = _Declaring(_kv(), settings={"kv": {"max_num_pages": 256}})
+    specs = serving_resources(model, {"resources": {"kv": {"max_num_pages": 1024}}})
+    assert specs[0].config.max_num_pages == 1024, "a deployment overrides the hook"
+    assert serving_resources(model, {})[0].config.max_num_pages == 256, "the hook is the default"
+
+
+@pytest.mark.parametrize("arrays, key, settings, allowed", [
+    (lambda: [_kv()], "kv", {"max_slots": 8}, "['max_num_pages']"),
+    (lambda: [_kv()], "kv", {"page_size": 64}, "['max_num_pages']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots']"),
+    (lambda: [_FLAG], "flag", {"max_slots": 8}, "[]"),
+    (lambda: [_FLAG], "flag", {"max_num_pages": 8}, "[]"),
+    (lambda: [_within()], "vision", {"max_slots": 8}, "[]"),
+    (lambda: [_within()], "vision", {"max_num_pages": 8}, "[]"),
+])
+def test_a_size_its_built_spec_doesnt_take_is_refused_naming_the_array_the_key_and_what_it_may_set(
+    arrays, key, settings, allowed,
+):
+    with pytest.raises(ValueError) as refused:
+        build_specs(arrays(), kernel_settings={key: settings})
+    message = str(refused.value)
+    assert f"Array {key!r}: kernel_settings[{key!r}] sets" in message and allowed in message, message
+
+
+def test_a_hook_slot_count_meets_the_pools_own_check_as_the_same_key_under_resources_does():
+    # one slot is a positive count, and the pool refuses it because the sink takes it
+    with pytest.raises(ValueError) as written:
+        apply_yaml_overrides(build_specs([_kv(), _gdn()]), {"resources": {"gdn": {"max_slots": 1}}})
+    with pytest.raises(ValueError) as hooked:
+        build_specs([_kv(), _gdn()], kernel_settings={"gdn": {"max_slots": 1}})
+    assert str(hooked.value) == f"Array 'gdn': kernel_settings['gdn']: {written.value}", (
+        "the hook would size the pool by a rule of its own"
+    )
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, "8", True])
+@pytest.mark.parametrize("arrays, key, field", [
+    (lambda: [_kv()], "kv", "max_num_pages"),
+    (lambda: [_kv(), _gdn()], "gdn", "max_slots"),
+])
+def test_a_size_that_isnt_a_positive_int_is_refused_naming_the_array_and_the_key(arrays, key, field, value):
+    with pytest.raises(ValueError) as refused:
+        build_specs(arrays(), kernel_settings={key: {field: value}})
+    message = str(refused.value)
+    assert f"Array {key!r}: kernel_settings[{key!r}]" in message and field in message, message
+
+
+@pytest.mark.parametrize("arrays, key", [(lambda: [_FLAG], "flag"), (lambda: [_within()], "vision")])
+def test_empty_settings_on_an_array_with_no_pool_set_nothing(arrays, key):
+    build_specs(arrays(), kernel_settings={key: {}})
+
+
+def test_a_key_naming_nothing_lists_the_arrays_among_the_names():
+    with pytest.raises(ValueError) as refused:
+        build_specs([_kv()], kernel_settings={"nope": {"max_num_pages": 8}})
+    assert "names no read" in str(refused.value) and "['attn', 'kv']" in str(refused.value), refused.value
 
 
 class _Declaring(_ToyModel):
@@ -462,7 +629,7 @@ def test_a_declared_name_clashing_with_a_hand_written_key_is_caught_on_the_joine
 
 
 def test_enabled_resources_builds_from_the_declarations():
-    specs = enabled_resources(_Declaring(_kv(), specs=[_SAMPLER]), {})
+    specs = enabled_resources(_Declaring(_kv(), specs=[_SAMPLER]), {}, StateSetup())
     assert {spec.resource_key for spec in specs} == {"kv", "attn", "sampler"}
 
 
@@ -474,7 +641,7 @@ def test_kernel_settings_with_no_declarations_are_refused():
 def test_enabled_resources_raises_the_first_problem():
     model = _Declaring(_kv(nodes={"dit"}), _kv(nodes={"sit"}))
     with pytest.raises(ValueError, match="the name 'kv' is declared twice"):
-        enabled_resources(model, {})
+        enabled_resources(model, {}, StateSetup())
 
 
 def _validation_problems(model, tmp_path, **config) -> list[str]:
@@ -540,6 +707,55 @@ def test_validate_deployment_reports_no_layout_yet_with_the_rest(tmp_path):
     assert len(problems) == 1 and "Array 'kv': no layout yet" in problems[0], problems
 
 
+def _tokens(packed: bool) -> Array:
+    return Array("tokens", nodes={"llm"}, layers={0}, entry=KVEntry(heads=2, head_dim=4), max_len=0,
+                 reads={"tokens_attn": Read(mask=Block(), op=Attend(q_heads=2), packed=packed)})
+
+
+_ON_SDPA = {"tokens_attn": {"backend": "sdpa"}}
+
+
+def test_validate_deployment_refuses_sdpa_on_a_read_of_packed_queries(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(True)), tmp_path, resources=_ON_SDPA)
+    (problem,) = problems
+    assert "reads['tokens_attn'] runs SDPA, which can't tell one segment" in problem, "a worker would bind it and fail"
+
+
+def test_validate_deployment_takes_sdpa_on_a_read_of_rows(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, resources=_ON_SDPA)
+    assert problems == [], "the block chose a binding, which builds no spec for it to name"
+
+
+def test_validate_deployment_reports_a_refused_sdpa_block_with_the_rest_of_the_block_checks(tmp_path):
+    problems = _validation_problems(_Declaring(_tokens(True)), tmp_path, resources={**_ON_SDPA, "nope": {}})
+    assert len(problems) == 2 and "runs SDPA, which can't tell" in problems[0] and "['nope']" in problems[1], (
+        "a refused binding would hide the deployment's other problems"
+    )
+
+
+def test_a_worker_builds_no_spec_for_a_resource_on_sdpa():
+    assert serving_resources(_Declaring(_tokens(False)), {"resources": _ON_SDPA}) == [], (
+        "the overrides would name a resource SDPA doesn't build"
+    )
+
+
+def test_validate_deployment_refuses_attention_backend_on_a_node_group_naming_the_new_key(tmp_path):
+    groups = [{"node_names": ["llm"], "ranks": [0], "attention_backend": "sdpa"}]
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, node_groups=groups)
+    assert problems == [
+        "node_groups[0].attention_backend: the backend is a resource's setting, as "
+        "`resources: {<the read's resource key>: {backend: sdpa}}`",
+    ], "a config that asks for SDPA there would run the ragged kernel"
+
+
+def test_a_config_half_moved_to_the_new_key_gets_one_problem(tmp_path):
+    groups = [{"node_names": ["llm"], "ranks": [0], "attention_backend": "sdpa"}]
+    problems = _validation_problems(_Declaring(_tokens(False)), tmp_path, node_groups=groups, resources=_ON_SDPA)
+    assert len(problems) == 1 and problems[0].startswith("node_groups[0].attention_backend"), (
+        "the backend block it already moved would be refused too"
+    )
+
+
 def test_validate_deployment_labels_a_declaration_it_cannot_read(tmp_path):
     class _Unreadable(_Declaring):
         def declare_state(self):
@@ -558,3 +774,266 @@ def test_validate_deployment_reports_a_state_with_no_declared_dtype_with_the_res
 def test_validate_deployment_refuses_kernel_settings_with_the_rest(tmp_path):
     problems = _validation_problems(_Declaring(_kv(), settings={"attn": {"backend": "sdpa"}}), tmp_path)
     assert len(problems) == 1 and "kernel_settings['attn']" in problems[0], problems
+
+
+def _plain(**overrides) -> Array:
+    return Value("state", **{
+        "nodes": {"llm"}, "layers": {0, 2}, "entry": Entry({
+            "h": TensorType((2, 8), dtype=torch.float32),
+            "count": TensorType((), dtype=torch.int64),
+            "conv": TensorType((4, 3), dtype=None),
+            "sharded": TensorType((4, 3), dtype=torch.float32, shard=0),
+        }), **overrides,
+    })
+
+
+def test_a_plain_value_builds_one_block_per_field_and_no_kernel():
+    specs = _by_key(_plain())
+    assert set(specs) == {"state"} and isinstance(specs["state"], RecurrentStateSpec), "it needs no KV or LinearAttn"
+    config = specs["state"].config
+    assert config.num_layers == 2 and config.kv_cache is None
+    assert list(config.blocks) == ["h", "count", "conv", "sharded"], "a pool's blocks keep the entry's order"
+    assert config.blocks["count"].shape == () and config.blocks["count"].dtype is torch.int64, "0-d reaches the pool"
+    assert config.blocks["conv"].dtype is None, "None is the compute dtype, resolved by the pool"
+    assert config.blocks["sharded"].shard_dims == (0,) and config.blocks["h"].shard_dims == ()
+
+
+def test_a_values_labels_reach_its_spec_on_both_paths():
+    plain = replace(_plain(), labels=frozenset({"main", "cfg"}))
+    gdn = replace(_gdn(), labels=frozenset({"main", "cfg"}))
+    assert _by_key(plain)["state"].config.labels == ("cfg", "main")
+    assert _by_key(_kv(), gdn)["gdn"].config.labels == ("cfg", "main")
+    assert _by_key(_kv(), _gdn())["gdn"].config.labels == ("main",), "a pool's default, as main's"
+
+
+def test_a_field_named_state_on_a_plain_value_is_an_ordinary_field():
+    entry = Entry({"state": TensorType((2, 8, 4), dtype=torch.float16)})
+    block = _by_key(_plain(entry=entry))["state"].config.blocks["state"]
+    assert block.shape == (2, 8, 4) and block.dtype is torch.float16, "only a GatedDeltaNet's state is stored K-last"
+
+
+def test_kernel_settings_sizes_a_plain_value_and_yaml_overrides_it():
+    (hooked,) = build_specs([_plain()], kernel_settings={"state": {"max_slots": 5}})
+    assert hooked.config.max_slots == 5, "the hook's size reaches a plain Value's pool"
+    apply_yaml_overrides([hooked], {"resources": {"state": {"max_slots": 9}}})
+    assert hooked.config.max_slots == 9, "YAML wins over the hook"
+
+
+@pytest.mark.parametrize("build, cause", [
+    (lambda: replace(_plain(), reads={"r": Read(mask=Causal())}), r"reads\['r'\]\.op: today's resources run no read"),
+])
+def test_a_plain_value_refuses_what_a_pool_cant_hold(build, cause):
+    with pytest.raises(ValueError, match=cause):
+        build_specs([build()])
+
+
+def test_kernel_settings_picks_a_kept_reads_decode_kernel_and_yaml_overrides_it():
+    specs = build_specs([_kv()], kernel_settings={"attn": {"decode_tensor_cores": False}})
+    assert specs[1].config.decode_tensor_cores is False, "Qwen3-TTS's two query heads per KV head want the CUDA kernel"
+    apply_yaml_overrides(specs, {"resources": {"attn": {"decode_tensor_cores": True}}})
+    assert specs[1].config.decode_tensor_cores is True, "YAML wins over the hook"
+
+
+@pytest.mark.parametrize("field", ["decode_tensor_cores", "decode_fmha"])
+def test_a_kept_reads_decode_setting_takes_the_yaml_paths_check(field):
+    """The string "false" would otherwise be stored as set, and read as true."""
+    with pytest.raises(ValueError, match=rf"Array 'kv': kernel_settings\['attn'\]: {field} must be true or false"):
+        build_specs([_kv()], kernel_settings={"attn": {field: "false"}})
+
+
+def test_decode_tensor_cores_on_a_within_step_read_is_refused():
+    array = Array("a", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                  reads={"r": _read(mask=Block(), op=Attend(q_heads=4))})
+    with pytest.raises(ValueError, match=r"Array 'a': kernel_settings\['r'\] sets \['decode_tensor_cores'\]"):
+        build_specs([array], kernel_settings={"r": {"decode_tensor_cores": False}})
+
+
+_EXTRA = {"extra": TensorType((2,), dtype=None)}
+
+
+@pytest.mark.parametrize("value, refusal", [
+    (lambda: _gdn(entry=Entry({**_gdn_entry().tensors, **_EXTRA})),
+     "Array 'gdn': no layout yet: entry must be exactly state and conv, the blocks DeltaNetGeometry reads"),
+    (lambda: _mamba(entry=_ssm_entry(**_EXTRA)),
+     "Array 'mamba': no layout yet: entry must be exactly ssm and conv, the blocks Mamba2Geometry reads"),
+], ids=["gdn", "mamba2"])
+def test_a_linear_value_holds_its_op_s_field_and_a_conv(value, refusal):
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        build_specs([_kv(), value()])
+
+
+@pytest.mark.parametrize("value, field", [
+    (lambda: _gdn(entry=_gdn_entry(state_dtype=None)), "Array 'gdn'.entry.tensors['state']"),
+    (lambda: _mamba(entry=_ssm_entry(ssm_dtype=None)), "Array 'mamba'.entry.tensors['ssm']"),
+], ids=["gdn", "mamba2"])
+def test_a_linear_value_declares_its_state_dtype(value, field):
+    with pytest.raises(ValueError, match=re.escape(f"{field}.dtype must be declared")):
+        build_specs([_kv(), value()])
+
+
+def test_a_mamba2_conv_matches_its_heads_and_groups():
+    """A conv one channel short of ``heads * head_dim + 2 * groups * state_size`` matches no group count."""
+    with pytest.raises(ValueError, match=re.escape("Array 'mamba': no layout yet: conv block (95, 3) does not match")):
+        build_specs([_kv(), _mamba(entry=_ssm_entry(conv_channels=95))])
+
+
+def test_a_mamba2_update_takes_no_kernel_settings():
+    with pytest.raises(ValueError, match=re.escape(
+        "kernel_settings['ssm'] names no read or update of the declarations that takes kernel settings",
+    )):
+        build_specs([_kv(), _mamba()], kernel_settings={"ssm": {"splits": (_SPLIT,)}})
+
+
+def test_only_a_snapshot_writing_value_links_its_pool_to_the_kv():
+    specs = _by_key(_kv(), _gdn(), _mamba())
+    assert specs["gdn"].config.kv_cache == "kv", "GDN's kernels write the snapshots a prefix hit restores"
+    assert specs["mamba"].config.kv_cache is None, "no Mamba-2 kernel writes a snapshot, so the pool keeps none"
+    assert specs["ssm"].config.variant is LinearAttnVariant.MAMBA2
+    alone = _by_key(_mamba())
+    assert alone["mamba"].config.kv_cache is None, "a Mamba-2 Value needs no paged array on its nodes"
+
+
+def _context(read: Read) -> Array:
+    return Array("ctx", nodes={"llm"}, layers={2, 5}, entry=KVEntry(heads=4, head_dim=16), max_len=64,
+                 reads={"x": read})
+
+
+@pytest.mark.parametrize("arrays, key", [
+    (lambda: [_kv(reads={"r": _read(packed=False)})], "r"),
+    (lambda: [_kv(reads={"r": _read(packed=False, walks={"decode"}), "p": _read(walks={"prefill"})})], "r"),
+    (lambda: [_kv(), _context(_read(mask=Bidirectional(), queries="kv", packed=False))], "x"),
+], ids=["paged", "paged by walk", "paged cross"])
+def test_a_paged_read_takes_packed_queries(arrays, key):
+    """Padded rows reach no paged kernel, which would read the padding as tokens."""
+    with pytest.raises(ValueError, match=re.escape(
+        f"no layout yet: reads[{key!r}].packed is False, and the paged kernels take packed queries",
+    )):
+        build_specs(arrays())
+
+
+# Unbounded arrays
+
+
+def _window(**overrides) -> Read:
+    return Read(**{"mask": Window(5), "op": Attend(q_heads=4), "packed": False, **overrides})
+
+
+def _unbounded(**overrides) -> Array:
+    return Array("enc", **{
+        "nodes": {"llm"}, "layers": {0, 1}, "entry": KVEntry(heads=4, head_dim=16), "max_len": None,
+        "reads": {"enc_attn": _window()}, **overrides,
+    })
+
+
+def _no_layout(refusal: str, *arrays, **kwargs) -> None:
+    with pytest.raises(ValueError, match=re.escape(f"Array 'enc': no layout yet: {refusal}")):
+        build_specs(arrays, **kwargs)
+
+
+def test_an_unbounded_array_is_one_bounded_kv_holding_its_window():
+    (spec,) = build_specs([_unbounded()])
+    config = spec.config
+    assert isinstance(spec, BoundedKVSpec) and spec.resource_key == "enc" and spec.nodes == {"llm"}
+    assert (config.num_layers, config.num_heads, config.head_dim, config.dtype) == (2, 4, 16, None)
+    assert (config.rows_per_request, config.max_source_len) == (1, 0), "one row per request, with no source"
+    assert config.retention == SinkWindow(0, 4) and config.query_window == 4, "Window(5) reaches distances 0 to 4"
+
+
+@pytest.mark.parametrize("reads, masks", [
+    ({"enc_attn": _window(mask=Causal())}, ["Causal"]),
+    ({"enc_attn": _window(layers={0}), "more": _window(layers={1})}, ["Window", "Window"]),
+    ({}, []),
+], ids=["causal", "two reads", "no read"])
+def test_an_unbounded_array_reads_through_one_window(reads, masks):
+    _no_layout(f"an unbounded array reads through one Window read, whose window the bounded KV keeps, and its reads "
+               f"have masks {masks}", _unbounded(reads=reads))
+
+
+def test_an_unbounded_array_has_no_reach_read_yet():
+    _no_layout("reads['enc_attn'].op must be Attend, the reads today's resources run on this array",
+               _unbounded(reads={"enc_attn": Read(mask=Window(5), packed=False)}))
+
+
+@pytest.mark.parametrize("read, refusal", [
+    (_window(packed=True), "reads['enc_attn'] takes packed queries, and the bounded kernels take rows padded"),
+    (_window(walks={"decode"}), "reads['enc_attn'].walks must be None"),
+    (_window(layers={0}), "reads['enc_attn'].layers must be the array's"),
+], ids=["packed", "walks", "some layers"])
+def test_a_bounded_read_takes_padded_rows_and_no_walks(read, refusal):
+    _no_layout(refusal, _unbounded(reads={"enc_attn": read}))
+
+
+def test_an_unbounded_array_s_entry_is_a_kv_entry():
+    entry = Entry({"k": TensorType((4, 16), dtype=None), "v": TensorType((4, 16), dtype=None)})
+    _no_layout("entry must be a KVEntry, which may declare one dtype, all BoundedKVConfig holds",
+               _unbounded(entry=entry))
+
+
+def test_a_bounded_read_has_as_many_query_heads_as_its_entry():
+    _no_layout("reads['enc_attn'].op.q_heads is 8, and the bounded kernels run one query head per head of the "
+               "entry's 4", _unbounded(reads={"enc_attn": _window(op=Attend(q_heads=8))}))
+
+
+def test_a_bounded_read_takes_a_head_dim_the_kernels_tile():
+    _no_layout("entry head_dim 72, and the bounded kernels tile a power of two of at least 16",
+               _unbounded(entry=KVEntry(heads=4, head_dim=72)))
+
+
+def test_a_bounded_array_has_one_label():
+    _no_layout("an unbounded array takes one label, the bounded KV's one row per request, and it has ['cfg', 'main']",
+               _unbounded(labels={"main", "cfg"}))
+
+
+def test_a_bounded_array_takes_no_rope():
+    assert len(build_specs([_unbounded(positions=Positions())])) == 1, "a count of entries builds no position spec"
+    _no_layout("positions.rope, and its storage keeps no position ids to rotate at",
+               _unbounded(positions=Positions(rope=Rope())))
+
+
+def test_the_bounded_read_takes_no_kernel_settings():
+    with pytest.raises(ValueError, match=re.escape(
+        "kernel_settings['enc_attn'] names no read or update of the declarations that takes kernel settings, and no "
+        "array, of ['enc']",
+    )):
+        build_specs([_unbounded()], kernel_settings={"enc_attn": {"max_slots": 4}})
+
+
+def test_kernel_settings_size_the_bounded_array():
+    (spec,) = build_specs([_unbounded()], kernel_settings={"enc": {"max_slots": 7}})
+    assert spec.config.max_slots == 7, "max_slots under the array's name sizes its bounded KV"
+    with pytest.raises(ValueError, match=re.escape("kernel_settings['enc'] sets ['max_num_pages']; it may set only "
+                                                   "['max_slots']")):
+        build_specs([_unbounded()], kernel_settings={"enc": {"max_num_pages": 7}})
+
+
+def test_a_bounded_read_runs_on_no_sdpa():
+    """The read runs on the array's own resource, so a deployment names that."""
+    _, problems = state_setup({"resources": {"enc": {"backend": "sdpa"}}}, [_unbounded()])
+    assert problems == ["resources.enc: backend sdpa runs only an Attend read within a step, and Array "
+                        "'enc'.reads['enc_attn'] isn't one"]
+
+
+def test_a_cross_read_of_an_unbounded_array_s_queries_is_refused():
+    context = Array("ctx", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=4, head_dim=16), max_len=64,
+                    reads={"x": _read(mask=Bidirectional(), op=Attend(q_heads=4), queries="enc")})
+    with pytest.raises(ValueError, match=re.escape(
+        "Array 'ctx': no layout yet: reads['x'] keeps entries and reads the queries of 'enc', which isn't an "
+        "append-only array that keeps entries in pages",
+    )):
+        build_specs([_unbounded(), context])
+
+
+class _StubBounded:
+    """Counts as the bounded KV does, without a cache."""
+
+    position = BoundedKVManager.position
+
+    def written(self, rid):
+        return {1: 9}.get(rid, 0)
+
+
+def test_node_handles_build_a_bounded_handle():
+    (h,) = node_handles(_Declaring(_unbounded(positions=Positions())), "llm", {"enc": _StubBounded()}).values()
+    assert isinstance(h, BoundedHandle) and list(h.reads) == ["enc_attn"], "the handle takes its read by its key"
+    assert [bound.key for bound in h._bindings] == ["enc_attn", "rope"], "the read, then the positions entry"
+    assert position(h, 1, "main") == 9 and h.written(1) == 9, "position() and the step builder read one count"

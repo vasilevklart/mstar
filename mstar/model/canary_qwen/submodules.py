@@ -4,14 +4,10 @@ in at its placeholders. The encoder node is the shared
 ``FastConformerEncoderSubmodule`` with the projection into the LLM's width."""
 from __future__ import annotations
 
-from mstar.engine.resources import AttentionStep, KVStep
-from mstar.engine.resources.step import ResourceStep
-from mstar.model.canary_qwen.config import ATTN, KV_CACHE
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 
 
-class CanaryQwenLLMSubmodule(SampledTokenDecoder):
-    ATTN_KEY = ATTN
+class CanaryQwenLLMSubmodule(DeclaredTokenDecoder):
     # off: with torch.compile, Canary-Qwen's throughput was 7-15% lower at c=1-64 (H100 A/B)
     disable_torch_compile = True
     # the ladder it captured before moving onto the scaffold
@@ -24,6 +20,3 @@ class CanaryQwenLLMSubmodule(SampledTokenDecoder):
     # decode reads its ids back from the routed token and emits a tensor a
     # request, as before the scaffold; the device path is a measured change
     device_loopback = None
-
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

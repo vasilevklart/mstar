@@ -314,9 +314,10 @@ def test_concurrent_prompts_match_one_at_a_time(tmp_path):
     serial = [prepare(image) for image in images]
     with ThreadPoolExecutor(4) as pool:
         parallel = list(pool.map(prepare, images))
-    for (a, meta_a), (b, meta_b) in zip(serial, parallel, strict=True):
+    for one, other in zip(serial, parallel, strict=True):
+        a, b = one.new_input_tensors, other.new_input_tensors
         assert torch.equal(a["text_inputs"][0], b["text_inputs"][0])
         for name in ("global_views", "tiles"):
             assert len(a.get(name, [])) == len(b.get(name, []))
             assert all(torch.equal(x, y) for x, y in zip(a.get(name, []), b.get(name, []), strict=True))
-        assert meta_a == meta_b
+        assert one.metadata == other.metadata and one.lora_adapter == other.lora_adapter

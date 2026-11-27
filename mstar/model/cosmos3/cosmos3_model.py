@@ -75,6 +75,7 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    SeqShardSpec,
 )
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec, RaggedAttnBackend
 from mstar.engine.resources.spec import CombinedSplit
@@ -92,7 +93,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.mrope import layout_extent
-from mstar.model.components.video_encode import encode_mp4
+from mstar.model.components.video_encode import encode_mp4, encode_mp4_chunked
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -105,15 +106,19 @@ from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
+    ACTION_WALKS,
     ATTN,
     ATTN_GEN,
     COND_LABEL,
     DENOISE_LOOP_FOR_WALK,
+    GEN_WALKS,
     IMAGE_GEN_LOOP,
     KV_CACHE,
     REASONER_DECODE_LOOP,
     REASONER_LABEL,
     SAMPLER,
+    SEQ_SHARD,
+    SOUND_WALKS,
     UNCOND_LABEL,
     VIDEO_GEN_AR_LOOP,
     VIDEO_GEN_LOOP,
@@ -417,6 +422,11 @@ class Cosmos3Model(Model):
         ``attention_backend="flashinfer"`` skips the dense spec, which leaves
         every step on the paged path.
 
+        On SP ranks the sequence shard splits a generation step's tokens
+        (each guidance branch's, or the batched pack's) over them; the
+        attentions trade them for heads around the kernel, the pool storing
+        K/V by head. Prefills and the reasoner's steps run whole on each rank.
+
         The two specs share one ``PagedKVConfig`` object on purpose: a deployment
         that resizes the cache through ``apply_yaml_overrides`` has to resize
         what the wrappers are planned against too.
@@ -442,6 +452,11 @@ class Cosmos3Model(Model):
                     # only the reasoner runs mixed (prompt + decode) steps
                     splits=(REASONER_MIXED_SPLIT,) if self._reasoner_enabled() else (),
                 ),
+            ),
+            # over every node of the pool: the attentions over it depend on it
+            SeqShardSpec(
+                resource_key=SEQ_SHARD, nodes=kv_nodes, labels=(COND_LABEL, UNCOND_LABEL), axis=0,
+                walks=(*GEN_WALKS, *SOUND_WALKS, *ACTION_WALKS),
             ),
         ]
         if self._reasoner_enabled():
@@ -621,11 +636,9 @@ class Cosmos3Model(Model):
         # the MLP intermediate dim shard across ranks, the residual stream stays
         # full, and the row-parallel out/down projections all-reduce. Signals
         # between nodes stay replicated (empty shard_dim) — the sharding is
-        # in-module, Megatron-style. The VAE decoder runs un-sharded on one rank.
-        return ShardingConfig(
-            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={},
-            sp_enabled_nodes={DIT_NODE},
-        )
+        # in-module, Megatron-style. The VAE decoder can split its decode by
+        # rows over a TP group too (``HeightShardedDecoder``).
+        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE, VAE_DECODER_NODE}, shard_dim={})
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # prefill: the understanding tower runs over the text prompt and writes
@@ -1294,10 +1307,9 @@ class Cosmos3Model(Model):
                 for i in ids
             )
         if modality == "image":
-            import io
             import os
 
-            from PIL import Image
+            from mstar.model.components.diffusion.image_io import uint8_to_png
 
             # The decoder emits 8-bit frames [B, C, T, H, W]; take the first one.
             x = output
@@ -1305,17 +1317,12 @@ class Cosmos3Model(Model):
                 x = x[0, :, 0]
             elif x.ndim == 4:
                 x = x[0]
-            arr = x.permute(1, 2, 0).cpu().numpy()  # H, W, C uint8
-            buf = io.BytesIO()
             # PNG is lossless at every compression level, so the level only trades
-            # encode time for file size. PIL defaults to 6, which spends ~0.75 s on a
-            # 720p frame and dominates the serving latency. Level 0 (no deflate) is
-            # the fastest and matches what the OpenAI image endpoint emits at full
-            # quality; the decoded pixels are identical regardless. Override with
-            # COSMOS3_PNG_COMPRESS for A/B.
+            # encode time for file size; level 0 (stored) is the fastest. The shared
+            # writer also skips PIL's adaptive scanline filters, which cost ~110 ms
+            # at 1024^2 even at level 0. Override with COSMOS3_PNG_COMPRESS for A/B.
             compress_level = int(os.environ.get("COSMOS3_PNG_COMPRESS", "0"))
-            Image.fromarray(arr).save(buf, format="PNG", compress_level=compress_level)
-            return buf.getvalue()
+            return uint8_to_png(x, compress_level=compress_level)
         if modality == "video":
             import os
 
@@ -1335,26 +1342,21 @@ class Cosmos3Model(Model):
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             try:
-                # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
-                from torchcodec.encoders import VideoEncoder
-
-                encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
-                    "mp4",
-                    codec="libx264",
-                    crf=18,
-                    preset=preset,
-                    extra_options={"threads": "0"},
-                )
-                data = encoded.numpy().tobytes()
+                # Preferred: torchcodec (torchvision >= 0.27 removed write_video),
+                # the clip's frames in parallel pieces, a keyframe at each.
+                data = encode_mp4_chunked(frames, fps, crf=18, preset=preset)
             except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError/OSError without FFmpeg
                 # Fallback for environments without a loadable torchcodec (no
                 # FFmpeg shared libraries on the host, or the older
-                # decode-only build that lacks VideoEncoder): PyAV, whose
-                # wheel bundles FFmpeg with libx264, at the same CRF/preset.
-                if not isinstance(exc, ImportError):
+                # decode-only build that lacks VideoEncoder), or a failed
+                # chunked encode: PyAV, whose wheel bundles FFmpeg with
+                # libx264, at the same CRF/preset, in one piece.
+                # torchcodec simply not installed is the expected fallback; any
+                # other failure (PyAV missing for the chunked mux included) says so
+                if not (isinstance(exc, ImportError) and (exc.name or "").startswith("torchcodec")):
                     logger.warning(
-                        "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
-                        str(exc).splitlines()[0][:160],
+                        "Cosmos3 video encode: the torchcodec encode failed (%s: %s); encoding with PyAV",
+                        type(exc).__name__, str(exc).splitlines()[0][:160] if str(exc) else "",
                     )
                 # NTSC rates exactly (encode_mp4's denominator is 1001)
                 data = encode_mp4(
@@ -1913,26 +1915,24 @@ class Cosmos3Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
         # autocast_dtype is accepted for interface parity (the engine manager
         # passes it to every model). Cosmos3 already casts the meta module to
         # bf16 before to_empty in _build_transformer, so params are allocated
         # directly in the checkpoint dtype and the hint is redundant here.
-        # sp_group is the DiT's sequence-parallel comm group (trivial unless the
-        # config sets sp_size > 1); it is orthogonal to the tp_group.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
+        submodule = self._create_submodule(node_name, device, tp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Cosmos3 submodule for %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str, tp_group=None, sp_group=None):
+    def _create_submodule(self, node_name: str, device: str, tp_group=None):
         if node_name == DIT_NODE:
             return Cosmos3DiTSubmodule(
-                transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
+                transformer=self._build_transformer(device, tp_group=tp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
                 # Chained windows re-encode the frames they continue from: the
@@ -1948,13 +1948,21 @@ class Cosmos3Model(Model):
             )
         if node_name == VAE_DECODER_NODE:
             # The fast decode converts its VAE to channels-last in place, so it
-            # takes the decoder-only copy rather than the shared instance.
-            vae = (
-                self._build_decoder_only_vae(device)
-                if self.config.vae_decode_fast
-                else self._build_vae(device)
+            # takes the decoder-only copy rather than the shared instance. A
+            # decode split over several ranks also switches its layers to their
+            # row-band classes, which no other node on the device may see (a
+            # windowed decoder or the DiT's chained head would hand them whole
+            # frames), so it loads a copy of its own.
+            sharded = tp_group is not None and tp_group.world_size > 1
+            if sharded:
+                vae = self._load_decoder_only_vae(device)
+            elif self.config.vae_decode_fast:
+                vae = self._build_decoder_only_vae(device)
+            else:
+                vae = self._build_vae(device)
+            return Cosmos3VAEDecoderSubmodule(
+                vae=vae, config=self.config, fast=self.config.vae_decode_fast, tp_group=tp_group,
             )
-            return Cosmos3VAEDecoderSubmodule(vae=vae, config=self.config, fast=self.config.vae_decode_fast)
         if node_name == VAE_DECODER_AR_NODE:
             return Cosmos3VAEDecoderARSubmodule(vae=self._build_streaming_decode_vae(device), config=self.config)
         if node_name == AUDIO_DECODER_NODE:
@@ -1965,7 +1973,7 @@ class Cosmos3Model(Model):
             # The same transformer instance as the DiT node (built once, cached
             # below): one copy of the text weights, shared kv/attn resources.
             return Cosmos3ReasonerSubmodule(
-                transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
+                transformer=self._build_transformer(device, tp_group=tp_group),
                 config=self.config,
                 encoders=(self._vision_encoder(),),
             )
@@ -1993,14 +2001,14 @@ class Cosmos3Model(Model):
             return diffusers.UniPCMultistepScheduler
         raise ValueError(f"Unsupported Cosmos3 scheduler class {name!r}")
 
-    def _build_transformer(self, device: str, tp_group=None, sp_group=None):
+    def _build_transformer(self, device: str, tp_group=None):
         # Built once per process: the DiT and the reasoner nodes share it.
         if self._transformer is not None:
             return self._transformer
-        self._transformer = self._build_transformer_uncached(device, tp_group=tp_group, sp_group=sp_group)
+        self._transformer = self._build_transformer_uncached(device, tp_group=tp_group)
         return self._transformer
 
-    def _build_transformer_uncached(self, device: str, tp_group=None, sp_group=None):
+    def _build_transformer_uncached(self, device: str, tp_group=None):
         from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
         from mstar.model.cosmos3.loader import load_transformer_weights
 
@@ -2017,7 +2025,7 @@ class Cosmos3Model(Model):
         # thrown away (seconds per billion params on the skip_weight_loading
         # path). Same shape as the orpheus / higgs_audio builders.
         with torch.device("meta"):
-            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
+            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group)
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:
             return model.to_empty(device=device)
@@ -2057,12 +2065,18 @@ class Cosmos3Model(Model):
         if self.skip_weight_loading:
             return None
         if device not in self._decoder_only_vaes:
-            from diffusers import AutoencoderKLWan
-
-            vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
-            vae.encoder = None
-            self._decoder_only_vaes[device] = vae.to(device).eval()
+            self._decoder_only_vaes[device] = self._load_decoder_only_vae(device)
         return self._decoder_only_vaes[device]
+
+    def _load_decoder_only_vae(self, device: str):
+        """A new decoder-only instance on ``device``, shared with nothing."""
+        if self.skip_weight_loading:
+            return None
+        from diffusers import AutoencoderKLWan
+
+        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+        vae.encoder = None
+        return vae.to(device).eval()
 
     def _build_encode_vae(self, device: str):
         # The encoder node keeps its own instance instead of sharing the

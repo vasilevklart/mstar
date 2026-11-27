@@ -9,10 +9,8 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep
-from mstar.engine.resources.step import ResourceStep
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.orpheus.config import ATTN, KV_CACHE, SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
+from mstar.model.orpheus.config import SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -25,11 +23,10 @@ from mstar.streaming.stream_buffer import StreamChunkInfo
 logger = logging.getLogger(__name__)
 
 
-class OrpheusLLMSubmodule(SampledTokenDecoder):
+class OrpheusLLMSubmodule(DeclaredTokenDecoder):
     """Llama 3.2 3B for Orpheus TTS: samples the audio tokens the SNAC node decodes."""
 
     PREFILL_WALK = "prefill"
-    ATTN_KEY = ATTN
     # The decode step also streams its token to SNAC, as a stored tensor (its
     # connection is not ``by_value``), so its outputs never all stay on the
     # device, which the loop-back needs: the sampler keeps no slot masters for it.
@@ -51,9 +48,6 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     def capture_compile_mode(self, graph_walk: str) -> str | None:
         # max-autotune until the default compile level (mstar serve -O) is measured on this model
         return "max-autotune-no-cudagraphs"
-
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

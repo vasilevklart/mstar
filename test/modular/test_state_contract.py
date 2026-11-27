@@ -19,6 +19,7 @@ import torch
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
@@ -26,6 +27,8 @@ from mstar.engine.state import (
     Fork,
     GatedDeltaNet,
     KVEntry,
+    Mamba2,
+    PagedNHD,
     Positions,
     Read,
     Rope,
@@ -34,7 +37,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.contract import Op
+from mstar.engine.state.contract import Mask, Op
 
 _ENTRY = KVEntry(heads=4, head_dim=8)
 _GDN = Entry({
@@ -64,7 +67,6 @@ def _holding(tensor: TensorType) -> Array:
 
 
 REFUSALS = {
-    "empty shape": (lambda: _holding(TensorType((), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "list shape": (lambda: _holding(TensorType([4, 8], dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "zero in shape": (lambda: _holding(TensorType((4, 0), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "bool in shape": (lambda: _holding(TensorType((True, 8), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
@@ -74,10 +76,10 @@ REFUSALS = {
                        "Array 'kv'.entry.tensors['k'].shard"),
     "a value's tensor": (lambda: _value(entry=Entry({"conv": TensorType((32, 0), dtype=None)})),
                          "Array 'gdn'.entry.tensors['conv'].shape"),
-    "host object": (lambda: _array(entry=Entry({}, host={"gen": torch.Generator})), "Array 'kv'.entry.host['gen']"),
-    "host list": (lambda: _array(entry=Entry({}, host={"ids": list})), "Array 'kv'.entry.host['ids']"),
-    "host tuple of objects": (lambda: _array(entry=Entry({}, host={"ids": tuple[object, ...]})),
-                              "Array 'kv'.entry.host['ids']"),
+    "host object": (lambda: _value(entry=Entry({}, host={"gen": torch.Generator})), "Array 'gdn'.entry.host['gen']"),
+    "host list": (lambda: _value(entry=Entry({}, host={"ids": list})), "Array 'gdn'.entry.host['ids']"),
+    "host tuple of objects": (lambda: _value(entry=Entry({}, host={"ids": tuple[object, ...]})),
+                              "Array 'gdn'.entry.host['ids']"),
     "window of zero": (lambda: _array(reads={"r": _read(mask=Window(0))}), "Array 'kv'.reads['r'].mask.size"),
     "q_heads of zero": (lambda: _array(reads={"r": _read(op=Attend(q_heads=0))}), "Array 'kv'.reads['r'].op.q_heads"),
     "empty read layers": (lambda: _array(reads={"r": _read(layers=set())}), "Array 'kv'.reads['r'].layers"),
@@ -140,6 +142,22 @@ REFUSALS = {
     ),
     "q_heads off the heads": (lambda: _array(reads={"r": _read(op=Attend(q_heads=6))}), "Array 'kv'.reads['r'].op"),
     "update off a Value": (lambda: _array(updates={"u": CausalConv()}), "Array 'kv'.updates['u']"),
+    "host fields off a Value": (lambda: _array(entry=Entry({}, host={"sent": bool})), "Array 'kv'.entry.host"),
+    "queries with a mask that uses the query's position": (
+        lambda: _array(reads={"r": _read(queries="video")}), "Array 'kv'.reads['r'].queries",
+    ),
+    "queries with no op": (
+        lambda: _array(reads={"r": Read(mask=Bidirectional(), queries="video")}),
+        "Array 'kv'.reads['r'].queries: a read with no op",
+    ),
+    "queries naming the read's own array": (
+        lambda: _array(reads={"r": _read(mask=Bidirectional(), queries="kv")}),
+        "Array 'kv'.reads['r'].queries names this array",
+    ),
+    "queries naming the read's own array, within the step": (
+        lambda: _array(max_len=0, reads={"r": _read(mask=Block(), queries="kv")}),
+        "Array 'kv'.reads['r'].queries names this array",
+    ),
     "update on one entry that isn't rewritable": (
         lambda: _array(entry=_GDN, max_len=1, updates={"u": CausalConv()}),
         "Array 'kv'.updates['u']: only a Value",
@@ -172,8 +190,14 @@ def test_a_bad_declaration_is_refused_naming_the_array_and_field(name):
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
 
 
+@dataclass(frozen=True)
+class _UndeclaredMask(Mask):
+    """Sets neither property a mask declares."""
+
+
 @pytest.mark.parametrize("build, where", [
     (lambda: Read(mask="nope"), "Read.mask"),
+    (lambda: Read(mask=_UndeclaredMask()), "Read.mask: _UndeclaredMask leaves ['uses_query_position'"),
     (lambda: Read(mask=Causal(), op="garbage"), "Read.op"),
     (lambda: Read(mask=Causal(), op=CausalConv()), "Read.op: a read changes no field"),
 ])
@@ -181,6 +205,16 @@ def test_a_bad_mask_or_op_is_refused_when_the_read_is_built(build, where):
     with pytest.raises(ValueError) as refused:
         build()
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
+
+
+@pytest.mark.parametrize("mask, uses_query_position, sees_step_whole", [
+    (Causal(), True, False), (Window(4), True, False), (Block(), False, True), (Bidirectional(), False, True),
+])
+def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole(
+    mask, uses_query_position, sees_step_whole,
+):
+    """`queries` takes a mask that uses no query position, and a regrouped walk refuses one that sees a step whole."""
+    assert (mask.uses_query_position, mask.sees_step_whole) == (uses_query_position, sees_step_whole)
 
 
 @dataclass(frozen=True)
@@ -265,6 +299,11 @@ def test_an_entry_may_hold_only_host_fields():
     assert Entry({}, host={"eos_sent": bool}).tensors == {}, "a Value of host fields has no tensors"
 
 
+def test_a_paged_format_is_a_value_whatever_set_it_is_given():
+    assert PagedNHD(devices=["cuda"]) == PagedNHD(devices={"cuda"})
+    assert hash(PagedNHD(dtypes={torch.bfloat16})) == hash(PagedNHD(dtypes=[torch.bfloat16]))
+
+
 def test_a_fork_refuses_a_time_it_doesnt_have():
     assert Fork(src="main", dst="cfg", at="end").at == "end"
     with pytest.raises(ValueError, match="Fork.at must be 'start' or 'end', got 'begin'"):
@@ -274,3 +313,47 @@ def test_a_fork_refuses_a_time_it_doesnt_have():
 def test_a_sampler_with_a_list_of_eos_ids_stays_hashable():
     sampler = Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=[1, 2])
     assert hash(sampler) == hash(Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=(1, 2)))
+
+
+def test_a_scalar_field_declares_an_empty_shape():
+    assert _value(entry=Entry({"count": TensorType((), dtype=torch.int64)})).entry.tensors["count"].shape == ()
+
+
+def test_a_scalar_field_has_no_axis_to_shard():
+    with pytest.raises(ValueError, match=r"shard must be None or an axis of shape \(\)"):
+        _value(entry=Entry({"count": TensorType((), dtype=torch.int64, shard=0)}))
+
+
+def test_a_scalar_field_has_no_kv_layout():
+    with pytest.raises(ValueError, match="Attend needs entry fields"):
+        _array(entry=_entry(TensorType((), dtype=None), TensorType((), dtype=None)), reads={"attn": _read()})
+
+
+_SSM = Entry({
+    "ssm": TensorType((4, 8, 16), dtype=torch.float32, shard=0),
+    "conv": TensorType((4 * 8 + 2 * 16, 3), dtype=None, shard=0),
+})
+
+
+def test_a_mamba2_update_needs_a_rank_three_ssm():
+    _value(entry=_SSM, updates={"ssm": Mamba2()})
+    with pytest.raises(ValueError, match=re.escape(
+        "Array 'gdn'.updates['ssm']: Mamba2 needs entry field ssm of shape (heads, head_dim, state_size)",
+    )):
+        _value(entry=Entry({"ssm": TensorType((4, 8), dtype=torch.float32)}), updates={"ssm": Mamba2()})
+
+
+@pytest.mark.parametrize("limit", [(1.0, 0.0), (0.5, 0.5), (-1.0, 1.0), (0.0, 1.0, 2.0), [0.0, 1.0], ("0", "1")])
+def test_a_mamba2_time_step_limit_is_an_increasing_range(limit):
+    _value(entry=_SSM, updates={"ssm": Mamba2(time_step_limit=(0.001, 0.1))})
+    with pytest.raises(ValueError, match=re.escape(
+        f"Array 'gdn'.updates['ssm'].time_step_limit must be a tuple (low, high) with 0 <= low < high, got {limit!r}",
+    )):
+        _value(entry=_SSM, updates={"ssm": Mamba2(time_step_limit=limit)})
+
+
+@pytest.mark.parametrize("max_len", [-1, 1.5, True, "8"])
+def test_max_len_is_none_or_a_non_negative_int(max_len):
+    assert _array(max_len=None).max_len is None, "None declares an unbounded log"
+    with pytest.raises(ValueError, match=re.escape(f"Array 'kv'.max_len must be None or an int >= 0, got {max_len!r}")):
+        _array(max_len=max_len)

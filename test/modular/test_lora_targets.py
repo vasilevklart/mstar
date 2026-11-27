@@ -706,7 +706,7 @@ def _fastconformer(part: str) -> nn.Module:
     from mstar.model.components import fastconformer as fc
 
     config = fc.FastConformerConfig(hidden_size=HIDDEN, num_heads=2, num_mel_bins=16, subsampling_channels=4)
-    return fc.RelPositionAttention(config) if part == "attention" else fc._Subsampling(config)
+    return fc.RelPositionAttention(config) if part == "attention" else fc.DwStridingSubsampling(config)
 
 
 def _chatterbox_attention() -> nn.Module:
@@ -740,7 +740,9 @@ def _cross_attention(parallel: bool) -> nn.Module:
     from mstar.model.components.attention import CrossAttention
     from mstar.model.components.distributed.attention import ParallelCrossAttention
 
-    return (ParallelCrossAttention if parallel else CrossAttention)(hidden_size=HIDDEN, num_heads=2, head_dim=4)
+    if parallel:
+        return ParallelCrossAttention(hidden_size=HIDDEN, num_heads=2, head_dim=4, context_kv_key="context", layer=0)
+    return CrossAttention(hidden_size=HIDDEN, num_heads=2, head_dim=4)
 
 
 # a module that runs these children other than through their forward over the step's

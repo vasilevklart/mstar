@@ -9,7 +9,9 @@ from typing import ClassVar, Literal, NamedTuple, get_args, get_origin
 
 import torch
 
+from mstar.engine.resources.attn.config import SP_EXCHANGES
 from mstar.engine.resources.kv.config import Span
+from mstar.engine.resources.position.config import LongRoPE
 from mstar.engine.resources.step import Segment
 
 
@@ -52,7 +54,7 @@ def _is_host_type(kind) -> bool:
 
 @dataclass(frozen=True)
 class TensorType:
-    shape: tuple[int, ...]       # global, before sharding
+    shape: tuple[int, ...]       # global, before sharding; () is one scalar per entry
     _: KW_ONLY
     dtype: torch.dtype | None    # math dtype, None is the engine's compute dtype
     shard: int | None = None     # axis split across TP ranks, None is replicated
@@ -78,15 +80,27 @@ def KVEntry(*, heads: int, head_dim: int) -> Entry:
 class Mask:
     """Which entries a read at log position q sees. An entry's index is its log position."""
 
+    # whether what a read sees depends on its query's log position, which another array's queries don't carry here
+    uses_query_position: ClassVar[bool]
+    # whether a read sees a row's adds of each step as a whole, so splitting them across steps changes what it sees
+    sees_step_whole: ClassVar[bool]
+
 
 @dataclass(frozen=True)
 class Causal(Mask):
     """Sees {k : k <= q}."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 @dataclass(frozen=True)
 class Window(Mask):
-    """Sees {k : q - size < k <= q}."""
+    """Sees {k : q - size < k <= q}. A read through `Attend` may pass ``distance_bias``, (rows, q_heads, T, size), whose
+    entry d is added to the score of the key at distance d before the op's scale."""
+
+    uses_query_position = True
+    sees_step_whole = False
 
     size: int
 
@@ -94,6 +108,20 @@ class Window(Mask):
 @dataclass(frozen=True)
 class Block(Mask):
     """Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""
+
+    uses_query_position = False
+    sees_step_whole = True
+
+
+@dataclass(frozen=True)
+class Bidirectional(Mask):
+    """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
+    row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
+    segment, on this array's label. It uses no query position. On an array that keeps entries; ``Block`` is the
+    within-step form."""
+
+    uses_query_position = False
+    sees_step_whole = True
 
 
 class Op:
@@ -155,6 +183,24 @@ class GatedDeltaNet(Op):
 
 
 @dataclass(frozen=True, kw_only=True)
+class Mamba2(Op):
+    """Mamba-2's SSD recurrence over each row's ``ssm`` state, (heads, head_dim, state_size), updated in place. Its
+    conv is a separate `CausalConv` update on the same Value."""
+
+    reads = ("ssm",)
+    writes = ("ssm",)
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))    # dt's clamp after softplus, HF's time_step_limit
+
+    def check(self, where: str, entry: Entry) -> None:
+        if len(entry.tensors["ssm"].shape) != 3:
+            raise ValueError(f"{where}: Mamba2 needs entry field ssm of shape (heads, head_dim, state_size)")
+        limit = self.time_step_limit
+        if not (type(limit) is tuple and len(limit) == 2 and all(type(t) in (int, float) for t in limit)
+                and 0.0 <= limit[0] < limit[1]):
+            raise ValueError(f"{where}.time_step_limit must be a tuple (low, high) with 0 <= low < high, got {limit!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
 class Read:
     """A view of the entries a row has kept. ``mask`` says which entries each query can still reach, so the engine
     can free the rest and tell when two requests can share a prefix. A read leaves the entries as they were."""
@@ -163,15 +209,27 @@ class Read:
     op: Op | None = None
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
+    queries: str | None = None              # the array whose segments lay out the queries; None: this array
+    # queries may come as (tokens, heads, head_dim). False: only as (rows, T, heads, head_dim), each row's span first
+    # and the rest of its T padding.
+    packed: bool = True
+    segmented: bool = False                 # a request's segments lie end to end in one row
 
     def __post_init__(self):
         if not isinstance(self.mask, Mask):
             raise ValueError(f"Read.mask must be a Mask, got {self.mask!r}")
+        unset = [name for name in Mask.__annotations__ if not hasattr(type(self.mask), name)]
+        if unset:
+            raise ValueError(f"Read.mask: {type(self.mask).__name__} leaves {unset} unset, which every mask declares")
         if not (self.op is None or isinstance(self.op, Op)):
             raise ValueError(f"Read.op must be None or an Op, got {self.op!r}")
         if self.op is not None and (self.op.writes or self.op.adds):
             raise ValueError(f"Read.op: a read changes no field, and {type(self.op).__name__} writes "
                              f"{list(self.op.writes)} and adds {list(self.op.adds)}")
+        if self.segmented and (self.packed or self.queries is not None or not isinstance(self.mask, Block)):
+            raise ValueError(f"Read.segmented lays a request's segments end to end in one row, which takes Block(), "
+                             f"packed=False and no queries, and got mask={self.mask!r}, packed={self.packed}, "
+                             f"queries={self.queries!r}")
         for name in ("layers", "walks"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, frozenset(getattr(self, name)))
@@ -189,6 +247,21 @@ class Rope:
     old_context_len: int | None = None
     dtype: torch.dtype | None = None           # None: q's
     table_dtype: torch.dtype | None = None     # None: angles in the kernel
+    longrope: LongRoPE | None = None           # None: one table for every request
+
+    def __post_init__(self):
+        llama31 = (self.low_freq_factor, self.high_freq_factor, self.old_context_len)
+        if self.longrope is not None and (self.scale != 1.0 or any(f is not None for f in llama31)):
+            raise ValueError(
+                f"Rope.longrope divides the frequencies by its own factors, so it takes scale 1.0 and no Llama 3.1 "
+                f"factors, and got scale={self.scale}, (low_freq_factor, high_freq_factor, old_context_len)={llama31}"
+            )
+        factors = None if self.longrope is None else len(self.longrope.short_factor)
+        if factors is not None and self.rotary_dim is not None and factors != self.rotary_dim // 2:
+            raise ValueError(
+                f"Rope.longrope needs {self.rotary_dim // 2} factors per set for rotary_dim {self.rotary_dim}, "
+                f"and got {factors}"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -209,6 +282,7 @@ class Array:
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
     With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
+    With ``max_len`` None the log has no bound, and the engine keeps what the reads can still reach.
     """
 
     name: str
@@ -216,7 +290,7 @@ class Array:
     nodes: frozenset[str]
     layers: frozenset[int]
     entry: Entry
-    max_len: int
+    max_len: int | None
     reads: Mapping[str, Read] = EMPTY    # empty: read whole
     updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
@@ -238,8 +312,8 @@ class Array:
             raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
         if not self.labels:
             raise ValueError(f"{where}.labels must be non-empty")
-        if not (type(self.max_len) is int and self.max_len >= 0):
-            raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if not (self.max_len is None or type(self.max_len) is int and self.max_len >= 0):
+            raise ValueError(f"{where}.max_len must be None or an int >= 0, got {self.max_len!r}")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
@@ -251,12 +325,14 @@ class Array:
         least = 1 if self.layers or self.reads else 0
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
-            if not (isinstance(tensor.shape, tuple) and tensor.shape and all(
+            if not (isinstance(tensor.shape, tuple) and all(
                 type(axis) is int and axis >= least for axis in tensor.shape
             )):
-                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {tensor.shape!r}")
+                raise ValueError(f"{where}.shape must be a tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
+        if self.entry.host and not is_value(self):
+            raise ValueError(f"Array {self.name!r}.entry.host: only a Value (rewritable, max_len 1) holds host fields")
         for name, kind in self.entry.host.items():
             if not _is_host_type(kind):
                 raise ValueError(f"Array {self.name!r}.entry.host[{name!r}] must be int, float, bool, str, bytes or a "
@@ -273,6 +349,14 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
+        if read.queries is not None and read.mask.uses_query_position:
+            raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
+                             f"position, and {type(read.mask).__name__} does")
+        if read.queries is not None and read.op is None:
+            raise ValueError(f"{where}.queries: a read with no op lays out no queries")
+        if read.queries == self.name:
+            raise ValueError(f"{where}.queries names this array, and a read without queries lays out its own queries; "
+                             "leave it None")
         if read.op is not None:
             self._check_op(f"{where}.op", read.op)
 
@@ -298,6 +382,11 @@ def is_value(array: Array) -> bool:
     return array.rewritable and array.max_len == 1
 
 
+def read_layers(array: Array, read: Read) -> frozenset[int]:
+    """The layers ``read`` reads of ``array``: its own, or all of the array's."""
+    return read.layers or array.layers
+
+
 def Value(name, *, nodes, layers, entry, updates=EMPTY) -> Array:
     """A rewritable array of one entry."""
     return Array(name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True)
@@ -312,13 +401,54 @@ class Sampler:
     penalty: bool = True
     min_p: bool = False
     eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
-    draws: int = 1                   # calls to sample in each step that lists it
+    draws: int = 1                   # draws in each step that lists it
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
         object.__setattr__(self, "eos_ids", tuple(self.eos_ids))
         if not self.nodes:
             raise ValueError(f"Sampler {self.name!r}.nodes must be non-empty")
+
+
+@dataclass(frozen=True)
+class SeqShard:
+    """A node's steps may split over its SP ranks: per step, the engine decides from the step whether ``labels``'
+    tokens split, each rank running the token-local layers on its share, or are copied. A layer stack calls
+    `scatter` before and `gather` after; at one SP rank, and on a copied step, both pass their inputs through. Reads
+    and updates of the node's arrays exchange what a split step needs by themselves.
+
+    ``labels`` lists one label, which an array on ``nodes`` opens, since the shard's handle brackets one; a node with
+    no arrays declares a `SeqShardSpec` itself. The shard cuts the label's tensors as the node's reads take queries on
+    it: rows of one span (``Read.packed`` False, not ``segmented``) each row alike, packed tokens or a request's
+    segments in one row contiguously; the reads take one of the two. ``walks`` are the walks whose steps may split,
+    as a row's walk (a combined walk splits where a walk it combines is listed); None: every walk. ``exchange`` is the
+    author's default for how a split step reaches the node's paged attentions, which the deployment's ``resources:``
+    block overrides under the shard's name: ``auto`` (Ulysses over KV stored by head, copied over KV stored by
+    position), ``none`` (never split), ``ulysses``, ``all_gather`` or ``ring``.
+    """
+
+    name: str
+    _: KW_ONLY
+    nodes: frozenset[str]
+    labels: frozenset[str] = frozenset({"main"})
+    walks: frozenset[str] | None = None
+    exchange: Literal["auto", "none", "ulysses", "all_gather", "ring"] = "auto"
+
+    def __post_init__(self):
+        where = f"SeqShard {self.name!r}"
+        # a string would split into characters, which name no label or walk
+        for name in ("nodes", "labels", "walks"):
+            if isinstance(getattr(self, name), str):
+                raise ValueError(f"{where}.{name} must be a collection of names, not a string")
+        object.__setattr__(self, "nodes", frozenset(self.nodes))
+        object.__setattr__(self, "labels", frozenset(self.labels))
+        if self.walks is not None:
+            object.__setattr__(self, "walks", frozenset(self.walks))
+        for name in ("nodes", "labels", "walks"):
+            if getattr(self, name) is not None and not getattr(self, name):
+                raise ValueError(f"{where}.{name} must be non-empty")
+        if self.exchange not in ("auto", *SP_EXCHANGES):
+            raise ValueError(f"{where}.exchange must be one of auto, {', '.join(SP_EXCHANGES)}; got {self.exchange!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -361,8 +491,10 @@ class ArrayStep:
     forks: tuple[Fork, ...] = ()
     placeholders: frozenset[tuple[int, str]] = frozenset()    # (row, label): holds a place, reads and keeps nothing
     eager_add: bool = False                        # this step's adds run outside the captured graph
+    fixed_layout: bool = False                     # replays of its capture bucket plan the capture's layout
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
+    host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -382,10 +514,36 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+    max_growth: int | None = None               # most entries the growth reserves; None: the loops' caps
 
 
-class Reached(NamedTuple):
-    """What a read with no op returns: each field's reached entries packed by row, and where each row starts."""
+@dataclass(frozen=True, kw_only=True)
+class PagedNHD:
+    """A storage format a state op can address: pages of (tokens, heads, head_dim)."""
 
-    fields: Mapping[str, torch.Tensor]
-    row_offsets: torch.Tensor
+    dtypes: frozenset[torch.dtype] | None = None    # None: any
+    devices: frozenset[str] | None = None           # None: any
+
+    def __post_init__(self):
+        for name in ("dtypes", "devices"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, frozenset(getattr(self, name)))
+
+
+class PagedNHDTarget(NamedTuple):
+    """Where a state op writes this step's entries on one layer of a `PagedNHD` array."""
+
+    cache: torch.Tensor
+    page_of_token: torch.Tensor
+    slot_of_token: torch.Tensor
+    count: int    # tokens to write
+
+
+@dataclass(frozen=True)
+class Reached:
+    """What a read with no op returns, tensors the caller owns: writing them changes no state. Each field's reached
+    entries packed by row, and where each row starts. A Value's row r holds its one entry at index r."""
+
+    fields: Mapping[str, torch.Tensor]    # field -> (entries, *shape on this rank), in the field's declared dtype
+    _: KW_ONLY
+    row_offsets: torch.Tensor             # (rows + 1,) int32 on the device

@@ -49,11 +49,20 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import CachedLease, EngineResourceInfo, KeyedWalks, StepAllowance, build_resource
+from mstar.engine.resources.base import (
+    CachedLease,
+    EngineResourceInfo,
+    KeyedWalks,
+    StepAllowance,
+    build_resource,
+    head_shards,
+)
+from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -61,9 +70,13 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
+    StepHandle,
     lean_subsets,
 )
-from mstar.engine.state.adapters import node_handles
+from mstar.engine.state.adapters import StateSetup, node_handles
+from mstar.engine.state.analysis import host_field_holders, split_read_problems
+from mstar.engine.state.contract import Array
+from mstar.engine.state.state_op import bind_state_ops
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -85,7 +98,7 @@ from mstar.model.submodule_base import (
     StopPolicy,
     engine_step,
 )
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import keep_split_scans_in_their_workspace, with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
@@ -105,6 +118,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.admission import Refusal
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.base import Model
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -232,8 +246,14 @@ class SubmoduleManagement:
     capture_runner: AcceleratorGraphRunner | None = None
     # the submodule's declared float32 settings; None keeps the process default
     fp32_precision: Fp32Precision | None = None
+    # see `EngineResourceInfo.head_shards`
+    head_shards: int = field(kw_only=True)
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
+    # a deployment asks a walk of this node to repeat (`Engine.enable_repeats`):
+    # only then does a step take the repeat path; every other node replays its
+    # captured graph and nothing more
+    may_repeat: bool = False
     # the serving config's prefill_token_buckets for the node: capture walk -> ladder,
     # and piecewise region label -> ladder
     token_ladders: Mapping[str, Any] = field(default_factory=dict)
@@ -497,7 +517,8 @@ class ExecutingBatch:
     failed_resource: str | None = None
 
     # Every output signal of this step stays on the device (the node's
-    # ``device_loopback_signals``): collect builds no per-request output
+    # ``device_loopback_signals``) or rides the step's inline column
+    # (``GpuStepBody.all_on_device``): collect builds no per-request output
     # dicts and the per-request ``postprocess`` is skipped; the stop check,
     # the inline emit and the speculation splice read the rows instead.
     rows_only: bool = False
@@ -661,14 +682,19 @@ class Engine:
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
         side_stream_nodes: Collection[str] = (),
+        state_setup: StateSetup | None = None,
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
+        # before the first forward, which is when every engine- and model-owned torch.compile compiles and tunes
+        keep_split_scans_in_their_workspace()
         self._device = None
         self._device_capability = device_capability
         # nodes whose steps run beside the worker's chain (``EngineManager.build``)
         self._side_stream_nodes = frozenset(side_stream_nodes)
+        # the deployment's bindings and its host fields, which the handles of every node share
+        self._state_setup = state_setup or StateSetup()
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -722,10 +748,13 @@ class Engine:
         model: "Model | None" = None,
         token_ladders: Mapping[str, Any] | None = None,
         region_ladders: Mapping[str, Any] | None = None,
+        moe_parallel: "Mapping[str, MoeParallelConfig] | None" = None,
     ):
         """``token_ladders`` and ``region_ladders``: the serving config's
         ``prefill_token_buckets``, node -> capture walk -> ladder and node ->
-        piecewise region label -> ladder, which the node's captures take at warmup."""
+        piecewise region label -> ladder, which the node's captures take at warmup.
+        ``moe_parallel``: each node's ``ep_config``, which a node splitting its steps over SP
+        ranks can't take."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -744,6 +773,32 @@ class Engine:
         prefix_caches = opening_prefix_caches(specs, instance, checkpoint_named=checkpoint is not None)
 
         self._classify_tp_roles(node_names, parallel_groups)
+        # node -> whether it runs replicated over its SP ranks, its pools placing positions over them,
+        # and how many ways its heads split then: TP alone where it does
+        over_sp, shards = {}, {}
+        # the nodes whose steps may split over their SP ranks
+        splitting = set()
+        for node in sorted(node_names):
+            group = parallel_groups.get_joint_group_for_node(node)
+            sp = group.sp_group.world_size
+            refusals = sequence_parallel_refusals(
+                specs, node, group.tp_group.world_size, sp, (moe_parallel or {}).get(node),
+            )
+            if refusals:
+                raise ValueError("; ".join(refusals))
+            over_sp[node] = sp > 1 and any(position_pools(specs, node).values())
+            shards[node] = head_shards(group, over_sp[node])
+            if sp > 1 and any(isinstance(spec, SeqShardSpec) and spec.splits and node in spec.nodes for spec in specs):
+                splitting.add(node)
+        if model is not None and splitting:
+            split = {
+                node: spec.labels for spec in specs if isinstance(spec, SeqShardSpec) and spec.splits
+                for node in spec.nodes & splitting
+            }
+            sdpa_reads = [read for read, binding in self._state_setup.by_read.items() if not binding.plans]
+            refusals = split_read_problems(model.declare_state(), sdpa_reads, split)
+            if refusals:
+                raise ValueError("; ".join(refusals))
 
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
@@ -754,7 +809,24 @@ class Engine:
             # different workers (for example BAGEL's three CFG branches).
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
-            joint_comm_group = parallel_groups.get_joint_group_for_node(min(relevant_nodes))
+            first_node = min(relevant_nodes)
+            # one resource is sized by one head-shard count over one parallel group, so its nodes
+            # all run replicated over SP or none do (validate_deployment checks this first);
+            # conservative for a resource that never reads it
+            if len({over_sp[node] for node in relevant_nodes}) > 1:
+                raise ValueError(
+                    f"resource {spec.resource_key!r} serves nodes that split heads different ways "
+                    f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
+                    "positions over its SP ranks and another keeps KV by head over them"
+                )
+            joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
+            # heads over TP alone on a node whose pools place positions, and for a pool every SP rank
+            # stores whole or a resource over such pools alone (`NodeResourceSpec.storage`)
+            storages = (
+                {spec.storage} if spec.storage is not None
+                else {specs_by_key[key].storage for key in spec.depends_on()} - {None}
+            )
+            replicated = over_sp[first_node] or storages == {"copied"}
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -777,14 +849,27 @@ class Engine:
                     ),
                     host_allowance=self.host_allowance,
                     prefix_caches=prefix_caches,
+                    replicated_over_sp=replicated,
                 ),
             )
-
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
             self._add_split_row_order(spec, relevant_nodes)
             declared_by[spec.resource_key] = frozenset(spec.nodes)
+        for key, resource in self._resources.items():
+            for dep in sorted(specs_by_key[key].depends_on() & self._resources.keys()):
+                if self._resources[dep].placement is not None and not resource.supports_context_parallel:
+                    raise ValueError(
+                        f"resource {key!r} ({type(resource).__name__}) does not support context "
+                        f"parallelism, and the pool {dep!r} it depends on sets context_parallel"
+                    )
+            split_nodes = sorted(self._resource_nodes[key] & splitting)
+            if split_nodes and not resource.supports_split_steps:
+                raise ValueError(
+                    f"resource {key!r} ({type(resource).__name__}) does not support steps split over SP "
+                    f"ranks, and node {split_nodes[0]!r} splits them (SeqShardSpec)"
+                )
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -804,6 +889,7 @@ class Engine:
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
 
+        shared: dict[str, StepHandle] = {}
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
             # `postprocess_batch` are not, so anything they derive from a
@@ -822,12 +908,17 @@ class Engine:
                 # the dtype the engine manager cast this node to
                 node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
+                # the count its resources shard heads by
+                head_shards=shards[node_name],
                 token_ladders=(token_ladders or {}).get(node_name) or {},
                 region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
-            handles = node_handles(model, node_name, resources) if model is not None else {}
+            handles = {} if model is None else node_handles(
+                model, node_name, resources, setup=self._state_setup, built=shared,
+            )
             if handles:
+                bind_state_ops(handles)
                 submodule.bind_node_state(handles)
             loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
             if loopback is not None:
@@ -837,6 +928,7 @@ class Engine:
         share_slot_rotations(self._submodules.values())
         if model is not None:
             self._check_rebuild_policies(model)
+            self._check_host_fields(model)
 
     def _check_rebuild_policies(self, model: "Model") -> None:
         """Raise for a node here whose rebuild policy a rebuild row couldn't run under."""
@@ -858,6 +950,28 @@ class Engine:
                     f"{type(model).__name__}: {node!r} declares a rebuild policy, but splits steps of {split} by "
                     "capture key, which the scheduler reads from a request's forward-pass info, and that names "
                     "the decode walk while the request is rebuilt"
+                )
+
+    def _check_host_fields(self, model: "Model") -> None:
+        """Raise for a node here that holds host fields and reports `step_is_input_free` for one of its walks."""
+        held: dict[str, list[str]] = {}
+        for array in host_field_holders(declared for declared in model.declare_state() if isinstance(declared, Array)):
+            for node in array.nodes & self._submodules.keys():
+                held.setdefault(node, []).append(array.name)
+        if not held:
+            return
+        walks = {walk: graph.get_nodes() for walk, graph in model.get_graph_walk_graphs().items()}
+        combined = model.get_combined_graph_walks()
+        for node, names in held.items():
+            own = [walk for walk, nodes in walks.items() if node in nodes] + list(combined.get(node, ()))
+            free = sorted(walk for walk in own if self._submodules[node].submodule.step_is_input_free(walk))
+            if free:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} holds the host fields of {sorted(names)} and reports "
+                    f"step_is_input_free for {free}. `_pre_plan_for_batch` hands exec the step it declared in two "
+                    "cases: over the prepared rows, when the batch has its inputs, and over the bucket's template "
+                    "rows, for an input-free walk. A step over the template rows would take its host writes from the "
+                    "template, not from the requests."
                 )
 
     def node_dtype(self, node_name: str) -> torch.dtype | None:
@@ -1030,6 +1144,7 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
+                head_shards=submodule_mgmt.head_shards,
                 capture_stream=capture_stream,
                 token_ladders=submodule_mgmt.token_ladders,
                 step_tokens=functools.partial(self._chunking.max_step_tokens, node_name),
@@ -1039,6 +1154,10 @@ class Engine:
                 node_name, submodule_mgmt, capture_stream,
             )
         self._bind_foreign_planners()
+
+        for node_name, submodule_mgmt in self._submodules.items():
+            for resource in submodule_mgmt.resources.values():
+                resource.check_captures(node_name, ag_runners[node_name].capture_configs, piecewise[node_name])
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
@@ -1229,7 +1348,7 @@ class Engine:
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
             node_dtype or torch.float32,
-            submodule_mgmt.joint_comm_group.world_size,
+            submodule_mgmt.head_shards,
         )
         apply_region_ladders(
             node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders,
@@ -2361,6 +2480,7 @@ class Engine:
             t0 = phase_start()
             try:
                 self._runner.commit(step)
+                step.commit_calls()
                 batch.committed = step
                 if submodule_mgmt.resident is not None:
                     submodule_mgmt.resident.commit(step, ctx)
@@ -2395,11 +2515,12 @@ class Engine:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
-            return cg_runner.run_forward(
+            out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
+            return cg_runner.repeat(lease, out, ctx.repeats) if submodule_mgmt.may_repeat or ctx.repeats != 1 else out
         if release_event is not None:
             release_event.set()
         if running_batched:
@@ -3005,6 +3126,37 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def enable_repeats(self, node_name: str, walks: Collection[str]) -> None:
+        """Before capture: the deployment asks these walks of the node to repeat,
+        which turns on what the node says they need (``enable_repeats``)."""
+        mgmt = self._submodules[node_name]
+        mgmt.may_repeat = True
+        mgmt.submodule.enable_repeats(walks)
+        if (loopback := getattr(mgmt.submodule, "device_loopback", None)) is not None:
+            mgmt.resources[loopback.sampler].enable_device_loopback_reader()
+
+    def record_tokens(self, batch: ExecutingBatch, host_rows: HostRows, info_of) -> None:
+        self._submodules[batch.node_name].submodule.record_tokens(batch.step_context.graph_walk, host_rows, info_of)
+
+    def repeat_refusal(self, node_name: str, graph_walk: str, loop_back: Collection[str]) -> str | None:
+        """Why no step of this walk can replay with no host work between, or
+        None. After capture: its node must run the walk on resident tables,
+        carry every loop-back signal, and every resource must allow it."""
+        mgmt = self._submodules[node_name]
+        if mgmt.resident is None or graph_walk not in mgmt.resident.walks:
+            return "it doesn't run on resident tables (resident_walks, resident_planning)"
+        carries = mgmt.submodule.repeat_carry(graph_walk, loop_back)
+        if carries is None:
+            return "node: it keeps no device loop-back to carry between replays"
+        refusal = mgmt.accelerator_graph_runner.carry_refusal(graph_walk, carries)
+        if refusal is None:
+            step = mgmt.resident.captured_steps[graph_walk]
+            step.ctx.resident = mgmt.resident  # the capture's context; its step is over
+            refusal = self._runner.repeat_refusal(step)
+        if refusal is None:
+            mgmt.accelerator_graph_runner.accept_repeats(graph_walk, carries)
+        return refusal
+
     def batch_cap_varies(self, node_name: str, graph_walk: str) -> bool:
         """Whether this walk's ``get_max_batch_size`` can move between passes."""
         return self._submodules[node_name].submodule.batch_cap_varies(graph_walk)
@@ -3438,6 +3590,10 @@ class Engine:
         """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
         return self._runner.newer_than(request_id)
 
+    def older_than(self, request_id: int) -> list[str]:
+        """The requests the conductor numbered before the request, newest first (`Admission.older_than`)."""
+        return self._runner.older_than(request_id)
+
     def refusals(self) -> "list[Refusal]":
         """The waiting requests that didn't fit, oldest first, as `Admission.refusals` gives them."""
         return self._runner.refusals()
@@ -3787,6 +3943,7 @@ class Engine:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
         self._runner.ingest_request(request_id, overrides, None if request_info is None else request_info.arrival)
+        self._state_setup.host_fields.open(request_id)
         if request_info is None:
             return
         try:
@@ -3820,6 +3977,7 @@ class Engine:
             if resource.reclaimable(request_id)
         }
         self._runner.remove_request(request_id)
+        self._state_setup.host_fields.remove_request(request_id)
         self._chunking.forget_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)

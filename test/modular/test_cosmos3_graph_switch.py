@@ -26,7 +26,6 @@ class _FakeTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.proj_in = nn.Linear(1, 1, bias=False)
-        self.sp_group = SimpleNamespace(world_size=1)
         self.comm_group = SimpleNamespace(world_size=1)
         self.rotary_emb = Cosmos3RotaryEmbedding(config.head_dim, config.rope_theta, config.rope_axes_dim)
 
@@ -76,9 +75,11 @@ def test_switch_gates_all_cosmos3_captures(monkeypatch, enabled, disable_env):
     dit_configs = dit.get_accelerator_graph_configs(torch.device("cpu"))
     reasoner_configs = reasoner.get_accelerator_graph_configs(torch.device("cpu"))
     if enabled and not disable_env:
+        # a guided checkpoint captures its prefill in both guidance regimes
         assert [config.capture_graph_walk for config in dit_configs] == [
-            C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK, C.PREFILL_WALK,
+            C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK, C.PREFILL_WALK, C.PREFILL_WALK,
         ]
+        assert [config.additional_key_info for config in dit_configs[2:]] == ["cfg", "cond"]
         # the VLM scaffold's: decode, packed text prefill, and mixed prefill + decode
         assert [config.capture_graph_walk for config in reasoner_configs] == [
             C.REASONER_DECODE_WALK, C.REASONER_PREFILL_WALK, "mixed",

@@ -131,9 +131,7 @@ def test_bagel_process_prompt_rejects_before_tokenizing():
 
 
 def test_bagel_sampling_forwards_min_p_and_penalize_prompt():
-    sampling = _bagel_model().get_sampling_config(
-        "LLM", {"min_p": 0.1, "penalize_prompt": False, "temperature": 0.0},
-    )
+    sampling = _bagel_model()._sample_settings({"min_p": 0.1, "penalize_prompt": False, "temperature": 0.0})
     assert sampling.min_p == 0.1
     assert sampling.penalize_prompt is False
     assert sampling.temperature == 0.0
@@ -151,7 +149,7 @@ def test_bagel_checkpoint_knob_values_are_ignored_but_do_sample_false_is_greedy(
     (tmp_path / "generation_config.json").write_text(json.dumps(qwen2_5))
     model.sampling_defaults = model._load_sampling_defaults("repo", None)
     assert model.sampling_defaults == BAGEL_CONFIG_DEFAULTS
-    sampling = model.get_sampling_config("LLM", {"top_k": 5})
+    sampling = model._sample_settings({"top_k": 5})
     assert (sampling.temperature, sampling.top_p, sampling.top_k) == (0.6, 1.0, 5)
     assert sampling.min_p == 0.0
 
@@ -184,11 +182,11 @@ def _higgs_model(defaults=None) -> HiggsAudioModel:
 
 
 def _higgs_sampler(model, **kw) -> SamplingReqConfig:
-    return model.get_request_resource_configs([], [], kw)[HIGGS_SAMPLER]
+    return sampling_configs(model.get_request_resource_configs([], [], kw), model.declare_state())[HIGGS_SAMPLER]
 
 
 def _higgs_spec(model):
-    return next(s for s in model.get_node_resources() if s.resource_key == HIGGS_SAMPLER)
+    return next(s for s in node_resources(model) if s.resource_key == HIGGS_SAMPLER)
 
 
 def test_higgs_request_kwargs_are_the_keys_it_reads():
@@ -465,6 +463,13 @@ def omni_released(tmp_path):
     return _omni_model(tmp_path)
 
 
+def _omni_samplers(model, model_kwargs) -> dict[str, SamplingReqConfig]:
+    """The request's sampler configs, as the conductor converts Qwen3-Omni's settings."""
+    samplers = [Sampler(name, nodes={"Thinker"}, vocab_size=16) for name in (THINKER_SAMPLER, TALKER_SAMPLER,
+                                                                              CODE_PRED_SAMPLER)]
+    return sampling_configs(model.get_request_resource_configs([], [], model_kwargs), samplers)
+
+
 def _omni_talker_args(model, model_kwargs, output_modalities=("text", "audio")):
     """The Talker's first step (its prefill), or None when it runs no walks."""
     plan = model.walk_plan("Talker", ["text"], list(output_modalities), {"text_inputs": ["t0"]}, model_kwargs)
@@ -522,10 +527,10 @@ def test_qwen3_omni_plain_keys_target_the_thinker_and_prefixed_keys_win(omni_rel
 
 def test_qwen3_omni_code_predictor_gets_no_penalty_and_refuses_one(omni_released):
     spec = SimpleNamespace(enable_repetition_penalty=False, enable_min_p=False)
-    config = omni_released.get_request_resource_configs([], [], {})[CODE_PRED_SAMPLER]
+    config = _omni_samplers(omni_released, {})[CODE_PRED_SAMPLER]
     assert config.repetition_penalty == 1
     config.validate(spec)
-    asked = omni_released.get_request_resource_configs([], [], {"code_predictor_repetition_penalty": 1.2})
+    asked = _omni_samplers(omni_released, {"code_predictor_repetition_penalty": 1.2})
     with pytest.raises(ValueError, match="repetition_penalty"):
         asked[CODE_PRED_SAMPLER].validate(spec)
 
@@ -541,14 +546,17 @@ def test_qwen3_omni_checkpoint_min_p_turns_the_capability_on(tmp_path):
     )
     model.config = SimpleNamespace(
         thinker_text=text, talker_text=text, thinker_head_dim=8, talker_head_dim=8,
-        code_predictor=SimpleNamespace(vocab_size=16),
+        code_predictor=SimpleNamespace(vocab_size=16), num_code_groups=2,
+        audio_encoder=SimpleNamespace(encoder_layers=1, encoder_attention_heads=1, head_dim=8),
+        vision=SimpleNamespace(depth=1, num_heads=1, head_dim=8),
     )
-    model._encoder_resources = lambda: []  # the encoders' attention needs their configs
-    specs = {s.resource_key: s for s in model.get_node_resources() if isinstance(s, SamplerSpec)}
+    # the encoders' settings and the Thinker's LoRA spec need configs this one lacks
+    model.kernel_settings, model.get_node_resources = dict, list
+    specs = {s.resource_key: s for s in node_resources(model) if isinstance(s, SamplerSpec)}
     assert specs[THINKER_SAMPLER].enable_min_p and specs[TALKER_SAMPLER].enable_min_p
     assert not specs[CODE_PRED_SAMPLER].enable_min_p
     # a plain request takes those defaults and is not refused
-    for key, config in model.get_request_resource_configs([], [], {}).items():
+    for key, config in sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state()).items():
         config.validate(specs[key])
 
 
@@ -715,11 +723,11 @@ def _whisper_model(defaults=None) -> WhisperModel:
 
 
 def _whisper_sampler(model, **kw) -> SamplingReqConfig:
-    return model.get_request_resource_configs([], [], kw)[WHISPER_SAMPLER]
+    return sampling_configs(model.get_request_resource_configs([], [], kw), model.declare_state())[WHISPER_SAMPLER]
 
 
 def _whisper_spec(model):
-    return next(s for s in model.get_node_resources() if s.resource_key == WHISPER_SAMPLER)
+    return next(s for s in node_resources(model) if s.resource_key == WHISPER_SAMPLER)
 
 
 def test_whisper_request_kwargs_are_the_keys_it_reads():

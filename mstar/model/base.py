@@ -1,8 +1,9 @@
+import enum
 import functools
 import itertools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, NamedTuple, Type
@@ -142,7 +143,9 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state import Array, Layout, Sampler, SampleSettings, SeqShard
+    from mstar.engine.state.adapters import StateSetup
+    from mstar.model.components.lora.modules import LoraRoot
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -164,15 +167,30 @@ class RobotIO(NamedTuple):
     action_dim: int
 
 
+class KeepAdapter(enum.Enum):
+    """``ProcessPromptOutput.lora_adapter`` left unset."""
+    KEEP = "keep"
+
+
+# the request runs on the adapter its client named, or on the base model
+KEEP_ADAPTER = KeepAdapter.KEEP
+
+
 class ProcessPromptOutput(NamedTuple):
     """Tensors from `process_prompt`, and metadata to carry beside them.
 
     The data worker folds ``metadata`` into the request's ``model_kwargs``, so
     what a model settles while tokenizing reaches
     `get_request_resource_configs` without a field of its own on the request.
+
+    ``lora_adapter`` is the LoRA adapter the model runs this prompt on, one of
+    ``Model.prompt_lora_adapters``, or None for the base model; the data worker
+    gives the request what the API server gives a client that names it
+    (``ServedModels.model_chose``). Unset keeps the client's choice.
     """
     new_input_tensors: NameToTensorList
     metadata: dict
+    lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
 
 
 class ClientChunk(NamedTuple):
@@ -243,6 +261,35 @@ class LabelLayout(NamedTuple):
             self.keyed_count(),
             self.max_growth,
         ]
+
+
+class StateLayouts(NamedTuple):
+    """What a model on the state contract returns from `process_prompt` for its paged labels."""
+    state_layout: "dict[str, dict[str, Layout]]"
+    keyed_spans: dict[str, dict[str, int]]
+
+
+def state_layouts(kv_layout: Mapping[str, Mapping[str, LabelLayout]]) -> StateLayouts:
+    """``kv_layout`` as a ``state_layout``, with the ``keyed_spans`` of each label that sets them.
+    `PagedStorage.layouts` converts back, and both go when `LabelLayout` goes.
+
+    `Layout` has no field for ``retention`` or ``max_growth`` yet, so a label that sets one raises
+    ``RuntimeError``, a 500, rather than lose it.
+    """
+    from mstar.engine.state import Layout
+
+    state_layout, keyed_spans = {}, {}
+    for array, by_label in kv_layout.items():
+        for label, layout in by_label.items():
+            for name, value in (("retention", layout.retention), ("max_growth", layout.max_growth)):
+                if value is not None:
+                    raise RuntimeError(f"kv_layout[{array!r}][{label!r}].{name} is set, and a Layout can't hold it")
+            state_layout.setdefault(array, {})[label] = Layout(
+                spans=layout.spans, growth=layout.growth, scratch=layout.scratch,
+            )
+            if layout.keyed_spans is not None:
+                keyed_spans.setdefault(array, {})[label] = layout.keyed_spans
+    return StateLayouts(state_layout, keyed_spans)
 
 
 def prompt_spans(
@@ -532,32 +579,38 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
     }
 
 
-def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
-    overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
-    its ``resources:`` block does not name. Raises the first problem with the declaration,
-    for callers that skip ``validate_deployment``, which reports them all."""
+    overrides: the model's declaration and the LoRA spec of its `lora_roots`, less the
+    opt-in specs (``NodeResourceSpec.opt_in``) its ``resources:`` block does not name.
+    Raises the first problem with the declaration, for callers that skip
+    ``validate_deployment``, which reports them all."""
     from mstar.engine.state.adapters import node_resources
     from mstar.engine.state.analysis import state_declaration_problems
+    from mstar.model.components.lora.modules import declared_lora_spec
 
     problems = state_declaration_problems(model)
     if problems:
         raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
+    lora = declared_lora_spec(model.lora_roots())
     return [
-        spec for spec in node_resources(model)
+        spec for spec in [*node_resources(model, setup=setup), *([lora] if lora is not None else [])]
         if not spec.opt_in or spec.resource_key in named
     ]
 
 
-def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def declared_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
     overrides applied. A ``per_node`` spec is whole here, as the API server checks
     requests and adapters against it; ``serving_resources`` splits it."""
     from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.engine.state.adapters import spec_overrides
 
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
+    specs = enabled_resources(model, model_config, setup or deployment_setup(model, model_config))
+    apply_yaml_overrides(specs, spec_overrides(model_config))
     return specs
 
 
@@ -585,7 +638,20 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
     return dtype
 
 
-def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
+    """The `StateSetup` ``model_config`` asks for, raising its first problem, for callers that skip
+    ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import state_setup
+
+    setup, problems = state_setup(model_config, model.declare_state())
+    if problems:
+        raise ValueError(problems[0])
+    return setup
+
+
+def serving_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment builds: ``declared_resources``, as
     ``built_resources``.
 
@@ -594,7 +660,7 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     ``validate_deployment`` takes the same steps, reporting every problem rather than
     the first.
     """
-    return built_resources(declared_resources(model, model_config))
+    return built_resources(declared_resources(model, model_config, setup))
 
 
 class Model(ABC):
@@ -767,12 +833,17 @@ class Model(ABC):
         The whole declaration, apart from what `declare_state` declares: a KV
         cache's shape, the attention backend over it, positions, samplers. The
         engine builds one resource per spec and hands each node the subset naming it.
-        An opt-in spec (per-request LoRA adapters) is declared here too, and built
-        only for a deployment whose ``resources:`` block names it.
+        Per-request LoRA adapters are declared in `lora_roots`.
         """
         return []
 
-    def declare_state(self) -> "list[Array | Sampler]":
+    def lora_roots(self) -> "tuple[LoraRoot, ...]":
+        """The weights roots per-request LoRA adapters may reach, one per node, from which the bridge builds the
+        opt-in LoRA spec. LoRA stands outside `declare_state`: adapters are weights that no request writes, and a
+        request picks one by its kwargs."""
+        return ()
+
+    def declare_state(self) -> "list[Array | Sampler | SeqShard]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
 
         A pure function of the model's config and the deployment's settings, since each process calls it.
@@ -780,8 +851,14 @@ class Model(ABC):
         return []
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        """``splits``, ``decode_fmha`` and a within-step read's ``max_segments_per_step`` and ``compile_op``, by read or
-        update key, until the engine picks kernels itself."""
+        """By read, update or array name, what the engine doesn't pick itself yet: ``splits``, ``decode_fmha`` and
+        ``decode_tensor_cores`` on a read of an array that keeps entries, ``splits`` on a GatedDeltaNet, the capture
+        sizes and the ``backend`` of a ``Block`` read, and a pool's default size, ``max_num_pages`` on a paged array
+        and ``max_slots`` on a Value with tensor fields. A deployment's ``resources:`` block overrides each pool size.
+
+        A pure function of the model's config and the deployment's settings, as `declare_state` is, since each process
+        calls it.
+        """
         return {}
 
     def checkpoint_path(self) -> str | None:
@@ -1047,6 +1124,12 @@ class Model(ABC):
         that splits ``text_inputs`` around its attachments adds theirs."""
         return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
 
+    def prompt_lora_adapters(self) -> frozenset[str]:
+        """The LoRA adapters ``process_prompt`` may run a prompt on
+        (``ProcessPromptOutput.lora_adapter``). The API server refuses, at startup, a
+        deployment whose ``resources: lora: adapters:`` block does not serve them all."""
+        return frozenset()
+
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
         ``{"audio": 1}``. The data worker refuses a request over it before
@@ -1201,7 +1284,7 @@ class Model(ABC):
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
         moe_parallel: "MoeParallelConfig | None" = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
@@ -1211,12 +1294,6 @@ class Model(ABC):
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at
         init time and the weight loaders shard correctly.
-
-        ``sp_group`` is the node's sequence-parallel comm group, orthogonal
-        to ``tp_group``. The engine manager only passes it when the node
-        participates in a non-trivial SP group, so models without SP support
-        never receive it. Models that support SP forward it to their
-        attention so it can all-to-all the sequence around the kernel.
 
         ``cfg_group`` is the node's classifier-free-guidance comm group, for
         a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``
