@@ -98,6 +98,8 @@ To keep the cache:
 
 Nothing prunes the cache. Deleting it is safe and costs the next start's compile. To measure a cold start, point `TORCHINDUCTOR_CACHE_DIR` at an empty directory.
 
+On ROCm, MIOpen, AITER and FlyDSL keep caches of their own, and a cold MIOpen database makes the first convolution of each size search for a kernel. [Caches on ROCm](/installation#rocm-caches) lists them and how to keep them.
+
 ## Startup errors {#startup-errors}
 
 | Message | Cause | Fix |

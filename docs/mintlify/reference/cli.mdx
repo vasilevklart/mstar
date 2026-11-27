@@ -17,7 +17,7 @@ mstar serve <model> [options]
 | `--host` | `0.0.0.0` | Address to bind. An exported `MSTAR_SERVER_HOST` wins over it on `mstar-server`. |
 | `--port` | `8000` | HTTP port. |
 | `--api-key` | `MSTAR_API_KEY`, else no check | Require `Authorization: Bearer <key>` on every route except `/health` and `/metrics`. An empty value turns the check off ([API key](/serving#api-key)). |
-| `--gpus` | unchanged | Sets `CUDA_VISIBLE_DEVICES`, for example `0` or `0,1`. It sets no other variable. |
+| `--gpus` | unchanged | Sets `CUDA_VISIBLE_DEVICES`, for example `0` or `0,1`, and on ROCm `HIP_VISIBLE_DEVICES` too ([Picking GPUs](/hardware#amd-gpus)). |
 | `-O`, `--compile-level` | `MSTAR_COMPILE_LEVEL`, else `1` | Compile tuning at startup for captured forwards: `0` is `torch.compile`'s default mode, `1` adds coordinate-descent tuning, `2` uses `max-autotune-no-cudagraphs`. A forward whose model sets its own compile mode keeps it. Sets `MSTAR_COMPILE_LEVEL` ([Compile levels](/cold-start#compile-levels)). |
 | `--config` | the model's default | Path to your own deployment YAML. The command exits if the path does not exist. |
 | `--cache-dir` | Hugging Face default | Weight cache directory. |
@@ -34,7 +34,7 @@ mstar serve <model> [options]
 | `--python-frontend` | off | Serve HTTP from the deprecated uvicorn/FastAPI frontend instead of `mstar-server`. Cannot be combined with `--rust-frontend-bin`. |
 | `--rust-frontend-bin` | lookup | Path to the `mstar-server` binary. Without it the launcher tries `MSTAR_SERVER_BIN`, the environment's scripts directory, `$PATH`, then `rust/server/target/release` ([Frontends](/serving#frontends)). |
 
-`mstar serve` sets `CUDA_VISIBLE_DEVICES` and `MSTAR_COMPILE_LEVEL` from `--gpus` and `-O`, then calls `mstar-serve` with the resolved config, `--host`, `--port`, `--socket-path-prefix`, `--upload-dir`, `--tensor-comm-protocol` and `--log-level`, plus every other flag you set.
+`mstar serve` sets `CUDA_VISIBLE_DEVICES` (and `HIP_VISIBLE_DEVICES` on ROCm) and `MSTAR_COMPILE_LEVEL` from `--gpus` and `-O`, then calls `mstar-serve` with the resolved config, `--host`, `--port`, `--socket-path-prefix`, `--upload-dir`, `--tensor-comm-protocol` and `--log-level`, plus every other flag you set.
 
 It prints example calls for the model before the model loads. The server accepts connections once it is ready; poll `/health` ([Cold start](/cold-start#startup-sequence)).
 
