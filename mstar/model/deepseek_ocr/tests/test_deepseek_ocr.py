@@ -29,6 +29,13 @@ def _checkpoint_dir(tmp_path, **language):
     return tmp_path
 
 
+def _specs(model) -> list:
+    """The specs the model's declarations build."""
+    from mstar.engine.state.adapters import node_resources
+
+    return node_resources(model)
+
+
 class _CharTokenizer:
     """One id per character, enough for the prompt's encode; ``<image>`` is 7."""
 
@@ -194,7 +201,7 @@ def test_graph_and_resources(tmp_path):
     model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)))
     assert isinstance(model, Model)
     assert set(model.get_graph_walk_graphs()) == {"prefill_text", "prefill_vision", "decode"}
-    resources = {spec.resource_key: spec for spec in model.get_node_resources()}
+    resources = {spec.resource_key: spec for spec in _specs(model)}
     assert set(resources) == {"kv_cache", "attn", "rope", "sampler"}
     assert all(spec.nodes == {"LLM"} for spec in resources.values())
     kv = resources["kv_cache"].config
@@ -260,15 +267,19 @@ def test_request_with_neither_image_nor_text_is_refused(tmp_path, prompt):
 
 def test_min_p_reaches_the_samplers_refusal(tmp_path):
     # Qwen3_5Adapter documents min_p as refused; dropped here, a request would run without it
+    from mstar.engine.state.adapters import sampling_configs
+
     model = DeepseekOCRModel(str(_checkpoint_dir(tmp_path)))
-    (spec,) = [s for s in model.get_node_resources() if s.resource_key == "sampler"]
-    config = model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.1})["sampler"]
+    (spec,) = [s for s in _specs(model) if s.resource_key == "sampler"]
+    # as the conductor reads the request's `SampleSettings`
+    settings = model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.1})
+    config = sampling_configs(settings, model.declare_state())["sampler"]
     with pytest.raises(ValueError, match="min_p"):
         config.validate(spec)
 
 
 def test_unlimited_ocr_window_is_refused(tmp_path):
-    """R-SWA keeps the prompt visible beside the window, which no attention resource expresses yet."""
+    """R-SWA keeps the prompt visible beside the window, which no mask on the state contract expresses yet."""
     with pytest.raises(NotImplementedError, match="sliding-window"):
         DeepseekOCRModel(str(_checkpoint_dir(tmp_path, sliding_window_size=128)))
 

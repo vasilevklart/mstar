@@ -10,8 +10,8 @@ script calls itself with ``reference``: once with eager attention, the gate,
 and once with ``flash_attention_2``, the model card's. The eager run also
 keeps DeepEncoder's rows in fp32.
 
-Per page, M* runs its two nodes eagerly, each driven through its resources
-the way the engine steps it (declare, admit, plan, forward, commit), and is
+Per page, M* runs its two nodes eagerly, the LLM driven through its declared
+state the way the engine steps it (declare, admit, plan, forward, commit), and is
 compared with the eager reference on:
 
 1. the prompt ids, exactly;
@@ -185,13 +185,14 @@ def run_reference(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# M*: the two nodes, eager, through their resources
+# M*: the two nodes, eager, the LLM through its declared state
 # ---------------------------------------------------------------------------
 
 
 class LLMDriver:
     """Steps the ``LLM`` node one request at a time on resources built from
-    the model's own declaration, as ``Engine`` steps it, minus the worker."""
+    the model's declared state, through the node's handles, as ``Engine``
+    steps it, minus the worker."""
 
     def __init__(self, model, llm, device: torch.device, max_num_pages: int = 1024):
         from mstar.communication.tensors import LocalTransferEngine
@@ -199,8 +200,9 @@ class LLMDriver:
         from mstar.engine.resources import StepRunner, resolve_spec_dependencies
         from mstar.engine.resources.base import EngineResourceInfo, build_resource
         from mstar.engine.resources.kv.transfer import TransferEngineInfo
+        from mstar.engine.state.adapters import node_handles, node_resources
 
-        specs = [s for s in model.get_node_resources() if "LLM" in s.nodes]
+        specs = [s for s in node_resources(model) if "LLM" in s.nodes]
         by_key = resolve_spec_dependencies(specs)
         for spec in specs:
             config = getattr(spec, "config", None)
@@ -216,14 +218,18 @@ class LLMDriver:
             for spec in specs
         }
         llm.bind_node_resources(self.resources)
+        llm.bind_node_state(node_handles(model, "LLM", self.resources))
         self.model, self.llm = model, llm
         self.runner = StepRunner(self.resources)
 
     def open(self, rid: int, name: str, step_metadata: dict):
         """``rid`` is the request's worker handle, as the engine keys resources."""
         from mstar.conductor.request_info import CurrentForwardPassInfo
+        from mstar.engine.state.adapters import sampling_configs
 
-        configs = self.model.get_request_resource_configs(["image", "text"], ["text"], {})
+        # the request's `SampleSettings` as the conductor converts them
+        settings = self.model.get_request_resource_configs(["image", "text"], ["text"], {})
+        configs = sampling_configs(settings, self.model.declare_state())
         for config in configs.values():
             config.apply_conductor_config(seed=0)
         self.runner.ingest_request(rid, configs)
@@ -232,22 +238,30 @@ class LLMDriver:
 
     def step(self, walk: str, fwd, inputs: dict) -> torch.Tensor:
         from mstar.engine.resources import StepContext
-        from mstar.model.submodule_base import ModelInputsFromEngine
+        from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
         rid = fwd.rid_handle
         fwd.graph_walk = walk
         prepared = self.llm.prepare_inputs(walk, fwd, inputs)
-        step = self.llm.declare_step(walk, [rid], [prepared])
+        # the node's declared step, expanded as the engine expands it
+        step = engine_step(self.llm, graph_walk=walk, request_ids=[rid], inputs=[prepared])
         step.set_ctx(StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False))
         outcome = self.runner.admit(step)
         assert outcome.ok, f"admit failed: {outcome.reason}"
         self.runner.plan(step)
-        engine_inputs = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd},
-                                              resources=dict(self.resources), step=step)
-        tensors = self.llm.preprocess(walk, engine_inputs, [prepared])
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            token = self.llm.forward(walk, engine_inputs, **tensors)["new_token"][0]
-        self.runner.commit(step)
+        # the handles open for the step's calls, in the engine's order
+        step.begin_calls()
+        try:
+            engine_inputs = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd},
+                                                  resources=dict(self.resources), step=step)
+            tensors = self.llm.preprocess(walk, engine_inputs, [prepared])
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                token = self.llm.forward(walk, engine_inputs, **tensors)["new_token"][0]
+            step.check_calls()
+            self.runner.commit(step)
+            step.commit_calls()
+        finally:
+            step.end_calls()
         return token.view(-1)
 
     def close(self, rid: int) -> None:

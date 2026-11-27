@@ -1015,7 +1015,8 @@ DeepSeek-OCR (``deepseek_ocr``)
 Document OCR on ``deepseek-ai/DeepSeek-OCR``: page images in, text out. The
 ``vision_encoder`` node runs DeepEncoder (SAM-B into CLIP-L, then a linear
 projector) and the ``LLM`` node a 3B DeepSeek-V2 MoE decoder (64 experts, top-6,
-570M active) with plain multi-head attention::
+570M active) with plain multi-head attention, its state declared on the state
+contract::
 
     mstar serve deepseek_ocr --gpus 0
     curl -s http://localhost:8000/generate -F 'text=Free OCR.' -F 'files=@page.png'
@@ -1039,8 +1040,9 @@ size and count, up to 8 views a call); decode loops its token back on the device
 
 ``baidu/Unlimited-OCR`` shares the architecture and weights layout but attends with
 R-SWA: generated tokens see the whole prompt plus the last 128 generated tokens.
-No attention resource expresses a per-request prompt sink beside a window yet, so
-its checkpoint is refused rather than served with full attention.
+No mask on the state contract expresses a per-request prompt sink beside a window
+yet (``Window`` keeps only the last entries), so its checkpoint is refused rather
+than served with full attention.
 
 Kokoro notes
 ------------

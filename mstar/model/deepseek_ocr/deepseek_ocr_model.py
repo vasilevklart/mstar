@@ -2,31 +2,26 @@
 
 Two nodes: ``vision_encoder`` (DeepEncoder: SAM-B + CLIP-L + projector) turns
 a request's image views into the rows of its ``<image>`` tokens, and ``LLM``
-(a DeepSeek-V2 MoE decoder with plain attention, a `SampledTokenDecoder`)
-splices them in and prefills the prompt as one row, then decodes. The views
-are cut on the API server, as the model card's ``infer`` cuts them; see
-``preprocessing``.
+(a DeepSeek-V2 MoE decoder with plain attention, a `DeclaredTokenDecoder`)
+splices them in and prefills the prompt as one row, then decodes. The LLM's
+state is declared on the state contract: one paged KV array and a sampler.
+The encoder keeps none. The views are cut on the API server, as the model
+card's ``infer`` cuts them; see ``preprocessing``.
 """
 
 import dataclasses
 from itertools import chain
+from typing import Any
 
 import torch
 
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-)
+from mstar.engine.state import Array, Attend, Causal, KVEntry, Positions, Read, Rope, Sampler
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.deepseek_ocr.config import ATTN, IMAGE_TOKEN, MODES, DeepseekOCRConfig
 from mstar.model.deepseek_ocr.preprocessing import image_views, num_image_tokens, to_pil
-from mstar.model.keys import KV_CACHE, ROPE
+from mstar.model.keys import KV_CACHE, SAMPLER
 from mstar.model.multimodal import MediaEncoder, PromptPart
-from mstar.model.multimodal_decoder import MIXED_SPLIT, MediaIntake, MultimodalDecoderModel, PreparedMedia
+from mstar.model.multimodal_decoder import MIXED_SPLIT, DeclaredDecoderModel, MediaIntake, PreparedMedia
 from mstar.model.submodule_base import NodeSubmodule
 
 TEXT_WEIGHTS = ("model.embed_tokens.", "model.layers.", "model.norm.", "lm_head.")
@@ -36,7 +31,7 @@ VISION_WEIGHTS = ("model.sam_model.", "model.vision_model.", "model.projector.",
 PROMPT_TEXT_ROOM = 64
 
 
-class DeepseekOCRModel(MultimodalDecoderModel):
+class DeepseekOCRModel(DeclaredDecoderModel):
     NAME = "DeepSeek-OCR"
     METADATA_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
     # The API server cuts a page's views with PIL (~100 ms a page, the GIL released);
@@ -53,9 +48,10 @@ class DeepseekOCRModel(MultimodalDecoderModel):
         text = self.full_config.text
         if text.sliding_window is not None:
             # Unlimited-OCR: generated tokens see the prompt plus a window of
-            # generated ones. No attention resource expresses a per-request
-            # prompt sink beside a window yet, and full attention diverges
-            # from the reference once a reply outgrows the window.
+            # generated ones. No mask on the state contract expresses a
+            # per-request prompt sink beside a window yet (`Window` keeps the
+            # last entries only), and full attention diverges from the
+            # reference once a reply outgrows the window.
             raise NotImplementedError(
                 f"{model_path_hf}: prompt-sink sliding-window attention (window "
                 f"{text.sliding_window}) is not supported yet"
@@ -91,27 +87,31 @@ class DeepseekOCRModel(MultimodalDecoderModel):
         self.sampling_defaults = {"temperature": 0.0, **self.sampling_defaults}
 
     # ------------------------------------------------------------------
-    # resources
+    # state
 
-    def get_node_resources(self):
-        config = self.config
+    def declare_state(self) -> list[Array | Sampler]:
+        config, nodes = self.config, {"LLM"}
         return [
-            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=PagedKVConfig(
-                num_layers=config.num_hidden_layers, num_qo_heads=config.num_attention_heads,
-                num_kv_heads=config.num_key_value_heads, head_dim=config.head_dim,
-                max_seq_len=self.max_seq_len,
-            )),
-            AttentionSpec(resource_key=ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE, splits=(MIXED_SPLIT,),
-            )),
-            # The reference rotates with a bf16 cos/sin table (Llama's rotary
-            # embedding casts it to the activations' dtype).
-            PositionSpec(resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(
-                kv_cache=KV_CACHE, rotary_dim=config.head_dim, interleave=False,
-                rope_theta=config.rope_theta, rope_table_dtype=torch.bfloat16,
-            )),
-            self._sampler_spec(config.vocab_size),
+            Array(
+                KV_CACHE, nodes=nodes, layers=frozenset(range(config.num_hidden_layers)),
+                entry=KVEntry(heads=config.num_key_value_heads, head_dim=config.head_dim),
+                max_len=self.max_seq_len,
+                # Rotate-half over the whole head. The reference rotates with a bf16
+                # cos/sin table (Llama's rotary embedding casts it to the activations' dtype).
+                positions=Positions(rope=Rope(
+                    theta=config.rope_theta, rotary_dim=config.head_dim, interleave=False,
+                    table_dtype=torch.bfloat16,
+                )),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=config.num_attention_heads))},
+            ),
+            Sampler(
+                SAMPLER, nodes=nodes, vocab_size=config.vocab_size, penalty=True,
+                min_p=self._sampler_spec(config.vocab_size).enable_min_p,
+            ),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {ATTN: {"splits": (MIXED_SPLIT,)}}
 
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", 4096)

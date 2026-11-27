@@ -9,8 +9,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-# The decoder's attention resource; its KV cache, RoPE and sampler sit under
-# the scaffold's keys (``mstar.model.keys``).
+# The decoder's attention read of its KV array; the array and the sampler sit
+# under the scaffold's keys (``mstar.model.keys``), and the array's positions
+# under ``rope``.
 ATTN = "attn"
 
 # The tokenizer's ``<image>``; every image position carries it.

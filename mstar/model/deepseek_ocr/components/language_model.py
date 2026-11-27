@@ -2,7 +2,9 @@
 
 Parameter paths match the checkpoint with ``model.`` dropped (``embed_tokens``,
 ``layers.N.*``, ``norm``) plus ``lm_head``; per-expert ``gate/up/down_proj``
-load into the fused expert tensors the Triton MoE kernel reads.
+load into the fused expert tensors the Triton MoE kernel reads. The rotation
+(rotate-half over the whole head, unscaled) is the KV array's declared
+``Rope``, so the layers are plain ``ParallelAttention``.
 """
 
 import re
@@ -21,20 +23,10 @@ from mstar.model.components.distributed import (
 )
 from mstar.model.components.moe import ParallelSparseMoeBlock, TopKRouter
 from mstar.model.components.norm import RMSNorm
-from mstar.model.deepseek_ocr.config import ATTN, DeepseekOCRTextConfig
-from mstar.model.keys import KV_CACHE, ROPE
+from mstar.model.deepseek_ocr.config import DeepseekOCRTextConfig
+from mstar.model.keys import KV_CACHE
 
 _EXPERT_KEY = re.compile(r"^(layers\.\d+\.mlp\.experts)\.(\d+)\.(gate|up|down)_proj\.weight$")
-
-
-class DeepseekOCRAttention(ParallelAttention):
-    """Llama attention: rotate-half RoPE over the whole head, no scaling."""
-
-    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor, label: str) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.pos.apply_qk(
-            q, k, label=label, rotary_dim=self.head_dim, interleave=False,
-            rope_theta=self.rope_theta, rope_scale=1.0,
-        )
 
 
 class DeepseekOCRMoE(ParallelSparseMoeBlock):
@@ -87,14 +79,14 @@ class DeepseekOCRLanguageModel(nn.Module):
                     comm_group=comm_group, activation="silu",
                 )
             self.layers.append(DecoderLayer(
-                self_attn=DeepseekOCRAttention(
+                self_attn=ParallelAttention(
                     comm_group=comm_group,
                     hidden_size=config.hidden_size,
                     num_heads=config.num_attention_heads,
                     num_kv_heads=config.num_key_value_heads,
                     head_dim=config.head_dim,
-                    rope_theta=config.rope_theta,
-                    attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE,
+                    kv_key=KV_CACHE,
+                    layer=layer_idx,
                 ),
                 mlp=mlp,
                 input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
@@ -116,13 +108,11 @@ class DeepseekOCRLanguageModel(nn.Module):
     def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
         """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
 
-        The label and layer index are cursors on the shared resources: bind the
-        label once, advance the index per layer.
+        Each layer reaches the KV array by its own layer id, and each row's
+        label comes from the step's segments, so ``label`` goes unread.
         """
         hidden = input_embeds
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
+        for layer in self.layers:
             hidden = layer(hidden)
         return self.norm(hidden)
 

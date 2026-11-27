@@ -1,5 +1,5 @@
 """DeepSeek-OCR's two nodes: the DeepEncoder over image views, and the decoder
-on the shared `SampledTokenDecoder`."""
+on the shared `DeclaredTokenDecoder`."""
 
 from collections.abc import Sequence
 from typing import Any
@@ -13,12 +13,10 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
 )
-from mstar.engine.resources import AttentionStep, KVStep, ResourceStep
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 from mstar.model.deepseek_ocr.components.deepencoder import DeepEncoder
 from mstar.model.deepseek_ocr.components.language_model import DeepseekOCRLanguageModel
-from mstar.model.deepseek_ocr.config import ATTN, DeepseekOCRTextConfig
-from mstar.model.keys import KV_CACHE
+from mstar.model.deepseek_ocr.config import DeepseekOCRTextConfig
 from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_grids
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -128,8 +126,9 @@ class DeepseekOCRVisionSubmodule(NodeSubmodule):
         return {rid: {self.output: [r]} for rid, r in zip(engine_inputs.request_ids, rows, strict=True)}
 
 
-class DeepseekOCRLLMSubmodule(SampledTokenDecoder):
-    ATTN_KEY = ATTN
+class DeepseekOCRLLMSubmodule(DeclaredTokenDecoder):
+    """``model`` is a `DeepseekOCRLanguageModel` that attends through the node's ``kv_cache`` array."""
+
     # Decode and the prefills replay CUDA graphs of the eager kernels;
     # torch.compile stays off until compiled numerics get their own parity check.
     disable_torch_compile = True
@@ -148,9 +147,6 @@ class DeepseekOCRLLMSubmodule(SampledTokenDecoder):
         most = max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES)
         top = self.PREFILL_MEDIA_TOKEN_BUCKETS[-1]
         self.media_max_batch_size = most if max_prompt_tokens is None else max(1, min(most, top // max_prompt_tokens))
-
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
