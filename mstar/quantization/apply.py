@@ -2,10 +2,12 @@
 
 - ``prepare`` (before the checkpoint streams in): each ``DIRECT`` layer swaps its bf16 weight for the format's
   empty storage, named as the checkpoint names it, so the model's loader (remap, stacked rules, the layer's
-  own TP sharding) fills it unchanged.
+  own TP sharding) fills it unchanged. A fused layer's trailing sub-blocks that the checkpoint keeps bf16 get a
+  ``weight_tail`` beside it.
 - ``intercept`` (wrapping the stream): tensors of ``DEQUANT`` / ``REQUANT`` layers are paired per checkpoint
   linear (every quantized tensor the checkpoint holds for it) and come out as one bf16 ``weight``, which loads as
-  a bf16 checkpoint's would; a ``DIRECT`` layer's tensors pass as they are.
+  a bf16 checkpoint's would; a ``DIRECT`` layer's tensors pass as they are, its bf16 tail shards under the name
+  ``weight_tail``.
 - ``finalize`` (after the load): every ``DIRECT`` layer's scales are checked to have arrived; ``QUANTIZE`` /
   ``REQUANT`` layers quantize their loaded bf16 shard; the formats' kernels load before any capture.
 """
@@ -76,7 +78,7 @@ def prepare(root: nn.Module, plan: QuantPlan) -> None:
     """Give every ``DIRECT`` layer the stored format's empty storage, its scales NaN until loaded."""
     direct = plan.by_action(Action.DIRECT)
     for layer in direct:
-        root.get_submodule(layer.path).quant_prepare(format_of(layer))
+        root.get_submodule(layer.path).quant_prepare(format_of(layer), tail_blocks=layer.tail)
     mark_unloaded(root, plan)
     if direct:
         logger.info("%s: %d layers load as stored", plan.node, len(direct))
@@ -101,28 +103,35 @@ def intercept(
     ckpt: CheckpointQuant | None = None,
     prefix: str = "",
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """``weights`` with the quantized tensors of every dequantized layer replaced by its bf16 ``weight``. A
-    tensor's layer is found the way ``load_weights_into`` places it: ``name_remapper``, then the stacked rules.
-    ``ckpt`` (the checkpoint's scan) says which tensors make up each checkpoint linear (its names carry
-    ``prefix``, which the stream's don't); without it a linear is a ``weight`` and one fp8 scale."""
+    """``weights`` with the quantized tensors of every dequantized layer replaced by its bf16 ``weight``, and the
+    bf16 tail shards of a stored layer renamed to its ``weight_tail``. A tensor's layer is found the way
+    ``load_weights_into`` places it: ``name_remapper``, then the stacked rules. ``ckpt`` (the checkpoint's scan)
+    says which tensors make up each checkpoint linear (its names carry ``prefix``, which the stream's don't);
+    without it a linear is a ``weight`` and one fp8 scale."""
     dequant = {layer.path: layer for layer in plan.by_action(Action.DEQUANT, Action.REQUANT)}
-    if not dequant:
+    tails = {layer.path: layer.tail_shards for layer in plan.by_action(Action.DIRECT) if layer.tail}
+    if not dequant and not tails:
         yield from weights
         return
     match = _StackedMatcher(list(stacked_params or []))
-    located: dict[str, LayerPlan | None] = {}
+    located: dict[str, tuple[str | None, str | int | None]] = {}
 
-    def layer_of(base: str) -> LayerPlan | None:
+    def place(base: str) -> tuple[str | None, str | int | None]:
+        """The module path and stacked shard id ``base``'s weight lands on."""
         if base not in located:
             mapped = name_remapper(base + ".weight") if name_remapper is not None else base + ".weight"
-            path = None if mapped is None else match(mapped)[0].rpartition(".")[0]
-            located[base] = dequant.get(path)
+            target, shard = (None, None) if mapped is None else match(mapped)
+            located[base] = (None if target is None else target.rpartition(".")[0], shard)
         return located[base]
 
     pending: dict[str, dict[str, torch.Tensor]] = {}
     for name, tensor in weights:
         base, suffix = split_name(name)
-        layer = layer_of(base) if suffix else None
+        path, shard = place(base) if suffix else (None, None)
+        if suffix == "weight" and shard in tails.get(path, ()):
+            yield base + ".weight_tail", tensor
+            continue
+        layer = dequant.get(path)
         if layer is None:
             yield name, tensor
             continue

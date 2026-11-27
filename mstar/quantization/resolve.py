@@ -86,6 +86,8 @@ class LayerPlan:
     tail: int = 0
     # how the checkpoint stores it, when every shard is stored alike
     source: StoredBase | None = None
+    # a stored layer with a tail: the stacked shard ids whose bf16 tensors are that tail (``apply.intercept``)
+    tail_shards: tuple = ()
 
 
 @dataclass
@@ -202,21 +204,24 @@ def stored_formats(
     return per_layer, stray
 
 
-def _head_stored(module: nn.Module, tail: int, by_shard: dict) -> tuple[str | None, object]:
-    """The stored format of a fused layer's rows before its ``tail`` sub-blocks, when its tail shards are all
-    bf16 (``_stored_of`` of the rest); None when the layer has no tail or the tail is stored quantized."""
+def _head_stored(module: nn.Module, tail: int, by_shard: dict) -> tuple[str | None, object, tuple]:
+    """The stored format and block of a fused layer's rows before its ``tail`` sub-blocks, when its tail shards
+    are all bf16 (``_stored_of`` of the rest), and those tail shards' ids; None when the layer has no tail or the
+    tail is stored quantized."""
     blocks_of = getattr(module, "quant_shard_blocks", None)
     if not tail or blocks_of is None or not by_shard:
-        return None, None
+        return None, None, ()
     first_tail = len(module.quant_geometry().rows) - tail
     head: set[StoredBase] = set()
+    tail_shards = []
     for shard, formats in by_shard.items():
         if min(blocks_of(shard)) >= first_tail:
             if any(s.format != BF16 for s in formats):
-                return None, None
+                return None, None, ()
+            tail_shards.append(shard)
         else:
             head |= formats
-    return _stored_of(head)[:2]
+    return (*_stored_of(head)[:2], tuple(tail_shards))
 
 
 def _stored_of(stored: set[StoredBase]) -> tuple[str, tuple[int, int] | None, StoredBase | None]:
@@ -260,7 +265,8 @@ def resolve_plan(
     for path, (kind, module) in layers.items():
         shards = stored_by_layer.get(path, set())
         stored, block, source = _stored_of(shards)
-        head_stored, head_block = _head_stored(module, decl.linears.tail_of(path), by_shard.get(path, {}))
+        head_stored, head_block, tail_shards = _head_stored(
+            module, decl.linears.tail_of(path), by_shard.get(path, {}))
         bad = sorted({_described(s) for s in shards if s.format != BF16 and not loadable(s)})
         if bad:
             for name in bad:
@@ -293,11 +299,16 @@ def resolve_plan(
 
         tail = decl.linears.tail_of(path) if candidate and runtime not in (BF16, AUTO) else 0
         if tail and stored != BF16:
-            # the stored rows dequantize and quantize again at load in the format's blocks (block fp8 at 128 x 128
-            # gives back the checkpoint's bytes where the per-rank rows are whole blocks), the tail stays bf16
-            plan.notes.append(f"{path}: re-quantized at load, its last {tail} sub-blocks kept bf16 (stored "
-                              f"{head_stored or stored} with a bf16 tail)")
-            stored = MIXED
+            if head_stored in LOADABLE:
+                # the checkpoint keeps the tail bf16 too: the rows before it are what the format holds, so they
+                # serve as stored (or are refused, or re-quantized per rank, as a layer with no tail is)
+                stored, block = head_stored, head_block
+            else:
+                # the tail is stored quantized, or the rows before it in more than one format: all of it
+                # dequantizes as it loads, then those rows quantize again
+                plan.notes.append(f"{path}: re-quantized at load, its last {tail} sub-blocks kept bf16 (the "
+                                  f"checkpoint stores it {stored})")
+                stored = MIXED
         if runtime != BF16:
             problem = _runtime_problem(module, kind, runtime, stored, block, device_capability, tail)
             if problem is not None:
@@ -312,7 +323,7 @@ def resolve_plan(
             plan.notes.append(f"{path}: {type(module).__name__} holds no checkpoint layout; re-quantized at load")
             action = Action.REQUANT
         if action is Action.DIRECT:
-            geometry = layer_geometry(module)
+            geometry = head_geometry(layer_geometry(module), tail)
             misfit = geometry_problem(runtime, geometry, direct=True, block=block)
             if misfit is not None:
                 # the checkpoint's scales don't land on this rank's blocks: dequantize, then quantize the shard
@@ -329,7 +340,8 @@ def resolve_plan(
                                       f"compounds two roundings; ask for {stored} or bf16 there")].append(path)
             continue
         tail = tail if runtime != BF16 else 0
-        plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block, tail, source)
+        plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block, tail, source,
+                                      tail_shards if tail and action is Action.DIRECT else ())
 
     for (origin, runtime, reason), paths in refused.items():
         what = repr(paths[0]) if len(paths) == 1 else f"{len(paths)} layers (e.g. {paths[:2]})"

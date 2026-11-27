@@ -445,7 +445,9 @@ class InPlaceQuant:
     ``quant_prepare`` swaps the weight for the format's empty ``storage`` before a checkpoint stored in that
     format loads (each tensor sharded by the layer's own loader, in the tensor's units); ``quant_quantize``
     quantizes this rank's loaded bf16 shard. Either way the layer then holds the same tensors, under the
-    checkpoint's names, in integer containers, and ``_quant_local`` runs the format's GEMM.
+    checkpoint's names, in integer containers, and ``_quant_local`` runs the format's GEMM. Both take
+    ``tail_blocks``: the last sub-blocks of ``quant_geometry().rows`` stay bf16, in ``weight_tail``, and the
+    forward appends their output.
 
     The host class calls ``_attach_quant_loaders`` from its ``_attach_weight_loaders`` and routes ``_local``
     through ``_quant_local`` when ``quant_format`` is set; its ``weight_loader`` takes ``units=(rows, cols)``."""
@@ -455,7 +457,7 @@ class InPlaceQuant:
     def quant_geometry(self):
         raise NotImplementedError
 
-    # the trailing weight rows kept bf16 beside the format's (``quant_quantize``'s ``tail_blocks``)
+    # the trailing weight rows kept bf16 beside the format's (``tail_blocks``)
     quant_tail_rows: int = 0
 
     def _quant_nk(self) -> tuple[int, int]:
@@ -463,33 +465,42 @@ class InPlaceQuant:
         geometry = self.quant_geometry()
         return geometry.n - self.quant_tail_rows, geometry.k
 
-    def quant_prepare(self, fmt: LinearFormat) -> None:
+    def _quant_keep_tail(self, tail_blocks: int) -> None:
+        rows = self.quant_geometry().rows
+        assert 0 < tail_blocks < len(rows), (tail_blocks, rows)
+        self.quant_tail_rows = sum(rows[-tail_blocks:])
+
+    def quant_prepare(self, fmt: LinearFormat, tail_blocks: int = 0) -> None:
+        """Swap the weight for ``fmt``'s empty storage, for a checkpoint stored in it. With ``tail_blocks`` the
+        checkpoint's bf16 shards of those sub-blocks load into ``weight_tail`` (``_quant_tail_loader``)."""
+        if tail_blocks:
+            self._quant_keep_tail(tail_blocks)
         n, k = self._quant_nk()
-        device = self.weight.device
+        weight = self.weight.data
         storage = fmt.storage(n, k)
         if not storage:
             raise ValueError(f"{fmt.name} has no checkpoint layout to load into")
-        shards = len(self.quant_geometry().rows)
+        shards = len(self.quant_geometry().rows) - tail_blocks
         if shards > 1 and any(st.units == (None, None) for st in storage):
             # (the resolver re-quantizes such a layer instead)
             raise ValueError(f"{fmt.name}: one per-tensor scale can't hold the scales of this layer's {shards} "
                              "checkpoint shards")
         del self.weight
+        if self.quant_tail_rows:
+            # the rows as built: a block no shard fills (a pad its owner zeroed) keeps what it held
+            self.register_parameter("weight_tail", nn.Parameter(weight[n:].clone(), requires_grad=False))
         self._quant_views = {}
         for st in storage:
-            self.register_parameter(st.name, nn.Parameter(torch.empty(st.shape, dtype=st.dtype, device=device),
-                                                          requires_grad=False))
+            self.register_parameter(st.name, nn.Parameter(
+                torch.empty(st.shape, dtype=st.dtype, device=weight.device), requires_grad=False))
             self._quant_views[st.name] = st.stands_for
         self.quant_format = fmt
         self._attach_weight_loaders()
 
     def quant_quantize(self, fmt: LinearFormat, input_amax: float | None = None, tail_blocks: int = 0) -> None:
-        """Quantize the loaded weight in place; ``tail_blocks``: the last sub-blocks of ``quant_geometry().rows``
-        stay as they are, in ``weight_tail``, and the forward appends their output."""
+        """Quantize the loaded weight in place, less its ``tail_blocks``."""
         if tail_blocks:
-            rows = self.quant_geometry().rows
-            assert 0 < tail_blocks < len(rows), (tail_blocks, rows)
-            self.quant_tail_rows = sum(rows[-tail_blocks:])
+            self._quant_keep_tail(tail_blocks)
         n, k = self._quant_nk()
         weight = self.weight.data
         if self.quant_tail_rows:
@@ -516,7 +527,24 @@ class InPlaceQuant:
             param = getattr(self, st.name, None)
             if param is not None:
                 param.weight_loader = partial(self._quant_storage_loader, st)
+        tail = getattr(self, "weight_tail", None)
+        if tail is not None:
+            tail.weight_loader = self._quant_tail_loader
         return True
+
+    def _quant_tail_loader(self, param, loaded: torch.Tensor, shard_id=None) -> None:
+        """One checkpoint shard of the bf16 tail. The layer's own loader places it in a full-height weight, whose
+        last rows are ``weight_tail``, so the shard is sliced per rank as it would be without a format."""
+        geometry = self.quant_geometry()
+        head = geometry.n - self.quant_tail_rows
+        full = nn.Parameter(torch.empty((geometry.n, geometry.k), dtype=param.dtype, device=param.device),
+                            requires_grad=False)
+        full.data[head:] = param.data
+        if shard_id is None:
+            self.weight_loader(full, loaded)
+        else:
+            self.weight_loader(full, loaded, shard_id)
+        param.data.copy_(full.data[head:])
 
     def _quant_storage_loader(self, st: Storage, param, loaded: torch.Tensor, shard_id=None) -> None:
         loaded = self.quant_format.from_checkpoint(st.name, loaded)

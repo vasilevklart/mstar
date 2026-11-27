@@ -25,8 +25,10 @@ from mstar.model.components.distributed import (  # noqa: E402
 )
 from mstar.model.components.distributed.linear_attn import _FusedBlockColumnParallelLinear  # noqa: E402
 from mstar.model.loader.quantization import UnservedQuantizationError  # noqa: E402
-from mstar.quantization.resolve import Action  # noqa: E402
+from mstar.quantization.checkpoint import CheckpointQuant, TensorInfo, read_headers, read_quant_config  # noqa: E402
+from mstar.quantization.resolve import Action, resolve_plan  # noqa: E402
 from mstar.quantization.scope import load_submodule, node_scope  # noqa: E402
+from mstar.quantization.spec import parse_quantization  # noqa: E402
 from mstar.quantization.validate import quantization_problems  # noqa: E402
 from mstar.utils.fp8_block import dequantize_fp8_block_weight, quantize_fp8_block_weight  # noqa: E402
 
@@ -123,21 +125,25 @@ def test_the_fp8_checkpoint_loads_as_stored_into_the_tensor_parallel_linears(che
     tensors = checkpoints["tensors"]
     full, linear = lm.model.layers[1], lm.model.layers[0]  # layer_types: [linear_attention, full_attention]
 
+    # the whole plan: every stored fp8 linear of both layers serves as stored, and nothing is dequantized
     expected = {
-        "model.layers.1.self_attn.qkv_proj": (QKVParallelLinear, Action.DIRECT),
-        "model.layers.1.self_attn.o_proj": (RowParallelLinear, Action.DIRECT),
+        # [q|k|v|z] fp8 beside the checkpoint's bf16 a / b gate rows
+        "model.layers.0.self_attn.in_proj_fused": (_FusedBlockColumnParallelLinear, Action.DIRECT),
         "model.layers.0.self_attn.out_proj": (RowParallelLinear, Action.DIRECT),
         "model.layers.0.mlp.gate_up_proj": (MergedColumnParallelLinear, Action.DIRECT),
+        "model.layers.0.mlp.down_proj": (RowParallelLinear, Action.DIRECT),
+        "model.layers.1.self_attn.qkv_proj": (QKVParallelLinear, Action.DIRECT),
+        "model.layers.1.self_attn.o_proj": (RowParallelLinear, Action.DIRECT),
+        "model.layers.1.mlp.gate_up_proj": (MergedColumnParallelLinear, Action.DIRECT),
         "model.layers.1.mlp.down_proj": (RowParallelLinear, Action.DIRECT),
-        # [q|k|v|z] fp8 beside bf16 a / b: dequantized and quantized again at load, the gate rows kept bf16
-        "model.layers.0.self_attn.in_proj_fused": (_FusedBlockColumnParallelLinear, Action.REQUANT),
         "lm_head": (ColumnParallelLinear, Action.KEEP),
     }
+    assert plan.layers.keys() == expected.keys()
     for path, (kind, action) in expected.items():
         assert type(lm.get_submodule(path)) is kind, path
         assert plan.layers[path].action is action, (path, plan.layers[path])
         assert plan.layers[path].runtime == ("bf16" if action is Action.KEEP else "fp8_block"), path
-    assert not plan.problems
+    assert not plan.problems and not plan.notes
 
     # a DIRECT layer holds the checkpoint's bytes and scales, in integer containers, as fp8_block
     qkv = full.self_attn.qkv_proj
@@ -151,10 +157,14 @@ def test_the_fp8_checkpoint_loads_as_stored_into_the_tensor_parallel_linears(che
     assert torch.equal(full.mlp.down_proj.weight_scale_inv.view(torch.float32), down_s)
     assert full.mlp.down_proj.weight_scale_inv.shape == (TEXT["hidden_size"] // 128, TEXT["intermediate_size"] // 128)
 
-    # the fused delta-net input: q|k|v|z in fp8_block, a / pad / b as the checkpoint's bf16
+    # the fused delta-net input: q|k|v|z hold the checkpoint's bytes and scales too (no second rounding), and
+    # a / pad / b its bf16
     fused = linear.self_attn.in_proj_fused
     head = sum(fused.output_sizes[:4])
     assert fused.quant_format.name == "fp8_block" and fused.weight.shape == (head, TEXT["hidden_size"])
+    parts = [_stored(tensors, f"layers.0.linear_attn.in_proj_{p}") for p in ("qkv", "z")]
+    assert torch.equal(fused.weight, torch.cat([w for w, _ in parts]).view(torch.uint8))
+    assert torch.equal(fused.weight_scale_inv.view(torch.float32), torch.cat([s for _, s in parts]))
     a, b = (tensors[f"{TEXT_PREFIX}layers.0.linear_attn.in_proj_{g}.weight"] for g in "ab")
     pad = fused.output_sizes[5]
     assert torch.equal(fused.weight_tail, torch.cat([a, torch.zeros(pad, a.shape[1], dtype=a.dtype), b]))
@@ -207,9 +217,21 @@ def test_a_bf16_checkpoint_takes_mains_path(checkpoints):
 
 def test_a_bf16_checkpoint_quantizes_at_load_when_asked(checkpoints):
     lm, plan = _llm(checkpoints["bf16"], "fp8_block")
-    assert plan.layers["model.layers.1.mlp.gate_up_proj"].action is Action.QUANTIZE
+    assert plan.summary() == "1 bf16 (keep), 8 fp8_block (quantize)"
     assert lm.model.layers[1].mlp.gate_up_proj.quant_format.name == "fp8_block"
     assert plan.layers["lm_head"].action is Action.KEEP
+    # the fused delta-net input is quantized less its gate rows: q|k|v|z in the blocks the FP8 checkpoint stores
+    # (`_to_fp8` quantizes the same bf16 weights the same way), a / pad / b as they loaded
+    fused = lm.model.layers[0].self_attn.in_proj_fused
+    assert plan.layers["model.layers.0.self_attn.in_proj_fused"].tail == 3
+    bf16 = load_file(str(next(checkpoints["bf16"].glob("*.safetensors"))))
+    qkvz = [bf16[f"{TEXT_PREFIX}layers.0.linear_attn.in_proj_{p}.weight"] for p in ("qkv", "z")]
+    q, scale_inv = quantize_fp8_block_weight(torch.cat(qkvz))
+    assert torch.equal(fused.weight, q.view(torch.uint8))
+    assert torch.equal(fused.weight_scale_inv.view(torch.float32), scale_inv)
+    stored, _ = _llm(checkpoints["fp8"])
+    as_stored = stored.model.layers[0].self_attn.in_proj_fused
+    assert torch.equal(fused.weight, as_stored.weight) and torch.equal(fused.weight_tail, as_stored.weight_tail)
 
 
 @pytest.mark.parametrize("tp", [2])
@@ -229,6 +251,18 @@ def test_each_rank_loads_its_rows_and_scale_rows(checkpoints, tp):
         gate_up = lm.model.layers[1].mlp.gate_up_proj
         scales = [_stored(tensors, f"layers.1.mlp.{p}_proj")[1].chunk(tp)[rank] for p in ("gate", "up")]
         assert torch.equal(gate_up.weight_scale_inv.view(torch.float32), torch.cat(scales))
+        # the fused delta-net input: this rank's q, k, v and z rows of the checkpoint's [q|k|v] and z tensors
+        # with their scale rows, then its a row, its own pad and its b row in bf16
+        fused = lm.model.layers[0].self_attn.in_proj_fused
+        qkv_w, qkv_s = _stored(tensors, "layers.0.linear_attn.in_proj_qkv")
+        z_w, z_s = _stored(tensors, "layers.0.linear_attn.in_proj_z")
+        weights = [b.chunk(tp)[rank] for b in (*qkv_w.chunk(3), z_w)]
+        scales = [b.chunk(tp)[rank] for b in (*qkv_s.chunk(3), z_s)]
+        assert torch.equal(fused.weight, torch.cat(weights).view(torch.uint8))
+        assert torch.equal(fused.weight_scale_inv.view(torch.float32), torch.cat(scales))
+        a, b = (tensors[f"{TEXT_PREFIX}layers.0.linear_attn.in_proj_{g}.weight"].chunk(tp)[rank] for g in "ab")
+        pad = fused.output_sizes[5] // tp
+        assert torch.equal(fused.weight_tail, torch.cat([a, torch.zeros(pad, a.shape[1], dtype=a.dtype), b]))
 
 
 def test_the_vision_tower_of_an_fp8_checkpoint_loads_bf16(checkpoints):
@@ -249,6 +283,32 @@ def test_the_boot_check_passes_the_checkpoint_and_refuses_a_second_rounding(chec
         **PLACED, "quantization": {"nodes": {"vision_encoder": "fp8_block"}}}) == [
         "quantization.nodes.vision_encoder: Qwen3_5DenseModel declares no quantizable layers there",
     ]
+
+
+def test_a_fused_input_stored_another_way_is_refused_or_requantized(checkpoints):
+    fp8 = _model(checkpoints["fp8"])
+    fused = "model.layers.0.self_attn.in_proj_fused"
+    # its fp8_block rows asked to run as another fp8 format: two roundings, as for a stored layer with no tail
+    (problem,) = quantization_problems(fp8, {
+        **PLACED, "quantization": {"layers": [{"match": fused, "format": "fp8_channel"}]}})
+    assert fused in problem and "it is stored fp8_block" in problem and "compounds two roundings" in problem
+
+    # a checkpoint that quantizes the gate rows too: no bf16 tail to keep as stored, so all of the layer
+    # dequantizes as it loads and its q|k|v|z rows quantize again
+    headers = read_headers(checkpoints["fp8"])
+    for gate in "ab":
+        base = f"{TEXT_PREFIX}layers.0.linear_attn.in_proj_{gate}"
+        rows, cols = headers[base + ".weight"].shape
+        headers[base + ".weight"] = TensorInfo("F8_E4M3", (rows, cols))
+        headers[base + ".weight_scale_inv"] = TensorInfo("BF16", (1, cols // 128))
+    ckpt = CheckpointQuant.from_tensors(headers, read_quant_config(checkpoints["fp8"]))
+    (decl,) = fp8.get_quantization_roots()
+    with torch.device("meta"):
+        root = decl.build(CommGroup.trivial())
+    plan = resolve_plan(root, decl, parse_quantization(None).for_node("LLM"), ckpt)
+    assert not plan.problems
+    assert plan.layers[fused].action is Action.REQUANT and plan.layers[fused].tail == 3
+    assert plan.summary() == "1 bf16 (keep), 7 fp8_block (direct), 1 fp8_block (requant)"
 
 
 def test_the_boot_check_refuses_an_unserved_method_from_the_declaration_alone(checkpoints, tmp_path):
