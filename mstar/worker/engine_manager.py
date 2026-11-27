@@ -26,6 +26,7 @@ from mstar.model.base import (
     serving_resources,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.platforms.compile import start_compile_pool
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -432,6 +433,10 @@ class EngineManager:
         ``conductor_digests`` are the conductor's `declaration_digests`, which this
         worker's must equal.
         """
+        # Before the model does anything: the process's first compile builds the
+        # pool, and a submodule can compile at load (klein warms its VAE decode).
+        if (device_capability or DeviceCapability.of(device)).is_available:
+            start_compile_pool()
         if conductor_digests is not None:
             mismatch = digest_mismatch(
                 declaration_digests(model.declare_state(), model.kernel_settings()), conductor_digests,
