@@ -2,9 +2,7 @@
 
 These stages (EarTTS talker, RVQ codec) are ported to
 **exact checkpoint parity** so the single composite ``model.safetensors`` loads
-with no missing / unexpected / shape-mismatched tensors. The forward passes for
-the audio stages are Phase 4/5 (they need the NeMo / EarTTS reference to verify
-numerically); the module *trees* here are authoritative and load-verified.
+with no missing / unexpected / shape-mismatched tensors.
 """
 from __future__ import annotations
 
