@@ -3,9 +3,10 @@
 The DiT and the token refiner declare MiniMax-H3's state (`dit_state`), and the decoder's sequence shard over its tiles
 is MiniMax-H3's, written by hand (`vae_shard_spec`), since the decoder has no arrays. The engine sees the same objects
 whichever way a spec arrives, so the port changes nothing it runs: the same resource names, kernels and capture sizes.
-The hand-written specs and steps below are the reference, copied from the model as it stood before it took H3's
-declarations (its own ``get_node_resources`` and the decoder's shard), with the fields main's contract renamed, so the
-adapter can't pass by agreeing with itself.
+The specs and steps below are the reference, written out by hand so the adapter can't pass by agreeing with itself:
+the two attentions as the model's own ``get_node_resources`` wrote them before it took H3's declarations (its
+``shard_over_sp`` is the DiT's sequence shard since #1138, as MiniMax-H3 wrote it), and the decoder's shard as the
+model writes it.
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
 from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard  # noqa: E402
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep  # noqa: E402
-from mstar.engine.state import SeqShard  # noqa: E402
+from mstar.engine.state import Array, SeqShard  # noqa: E402
 from mstar.engine.state.adapters import StateSetup, node_handles, node_resources, state_setup, state_steps  # noqa: E402
 from mstar.engine.state.analysis import state_declaration_problems  # noqa: E402
 from mstar.model.base import enabled_resources, serving_resources  # noqa: E402
@@ -43,13 +44,18 @@ from mstar.model.minimax_h3_image.minimax_h3_image_model import (  # noqa: E402
     H3ImageModel,
 )
 from mstar.model.minimax_h3_image.submodules import H3ImageDecoderSubmodule, H3ImageDenoiseSubmodule  # noqa: E402
-from mstar.model.submodule_base import NodeInputs, engine_step, with_segment_steps  # noqa: E402
+from mstar.model.minimax_h3_image.tests.test_model import _tiny_decode_case  # noqa: E402
+from mstar.model.submodule_base import NodeInputs, engine_step  # noqa: E402
 
-CONFIGS = sorted(str(path) for path in (Path(__file__).parents[4] / "configs").glob("minimax_h3_image*.yaml"))
+# by name, so a config that moves fails here rather than leaving the check without a case
+CONFIGS = [
+    Path(__file__).parents[4] / "configs" / name
+    for name in ("minimax_h3_image.yaml", "minimax_h3_image_1gpu.yaml", "minimax_h3_image_sp2.yaml")
+]
 
 
-def _model() -> H3ImageModel:
-    model = H3ImageModel(model_path_hf="test/minimax_h3_image", skip_weight_loading=True)
+def _model(**model_kwargs) -> H3ImageModel:
+    model = H3ImageModel(model_path_hf="test/minimax_h3_image", skip_weight_loading=True, **model_kwargs)
     model.set_config(H3ImageConfig())
     return model
 
@@ -88,20 +94,28 @@ def test_the_geometry_is_the_checkpoints():
     assert (t.num_attention_heads, t.attention_head_dim, t.num_layers, t.token_refiner_num_layers) == (56, 128, 50, 2)
 
 
+def test_the_declared_rows_list_every_layer_that_attends():
+    """A hand-written attention served whichever layer called it. A declared array refuses a read at a layer it doesn't
+    list, and no spec shows the list, so pin it: the DiT's 50 blocks and the refiner's 2."""
+    layers = {declared.name: declared.layers for declared in _model().declare_state() if isinstance(declared, Array)}
+    assert layers == {"dit_rows": frozenset(range(50)), "prompt_rows": frozenset(range(2))}
+
+
 def test_specs_equal_the_hand_written_ones():
     model = _model()
     _assert_equal_per_key(node_resources(model), _reference())
     _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _reference())
 
 
-@pytest.mark.parametrize("path", CONFIGS, ids=lambda path: Path(path).name)
+@pytest.mark.parametrize("path", CONFIGS, ids=lambda path: path.name)
 def test_specs_equal_the_hand_written_ones_on_each_published_config(path):
-    deployment = yaml.safe_load(Path(path).read_text())
+    deployment = yaml.safe_load(path.read_text())
     expected = _reference()
     # derives each spec's fields from the others, as the deployment's own do: the DiT's attention exchanges its
     # shard's rows by Ulysses, the refiner's nothing
     apply_yaml_overrides(expected, deployment)
-    specs = serving_resources(_model(), deployment)
+    # the model as the deployment builds it, with its ``model_kwargs`` (compile, 64 tiles a decoder call)
+    specs = serving_resources(_model(**deployment["model_kwargs"]), deployment)
     _assert_equal_per_key(specs, expected)
     by_key = {spec.resource_key: spec for spec in specs}
     assert (by_key["dit_attn"].sp_exchange, by_key["refiner_attn"].sp_exchange) == ("ulysses", "none")
@@ -210,27 +224,22 @@ def _decoder_shard(world: int) -> SequenceShard:
 @pytest.mark.parametrize("world, counts", [(1, None), (2, (3, 3)), (4, (2, 2, 1, 1))])
 def test_decoder_step_equals_the_hand_written_one_and_splits_the_tiles(world, counts):
     """Each request's six tiles (a 10 x 6 latent grid in 64-px tiles) under the shard's label, as the decoder declared
-    them by hand, which the shard deals out contiguously, a rank getting none where tiles run short."""
-    from mstar.model.minimax_h3_image.tests.test_model import _tiny_decode_case
-
+    them by hand, and the shard's step is those segments (the model declares none for it). The shard deals them out
+    contiguously, a rank getting none where tiles run short."""
     vae, config, layout, _ = _tiny_decode_case()
     node = H3ImageDecoderSubmodule(vae, config)
     shard = _decoder_shard(world)
     node.bind_node_resources({"vae_shard": shard})
     rids = ["r0", "r1"]
     step = engine_step(node, GENERATE_WALK, rids, [_inputs(layout)] * 2)
-    reference = with_segment_steps(
-        SubmoduleStep(steps={}, segments=[Segment(rid, "tiles", 6) for rid in rids]), ("vae_shard",),
-    )
-    assert step.segments == reference.segments and step.steps.keys() == reference.steps.keys() == {"vae_shard"}
-    assert step.steps["vae_shard"].segments == reference.steps["vae_shard"].segments
+    segments = [Segment(rid, "tiles", 6) for rid in rids]
+    assert step.segments == segments and step.cg_key_info is None
+    assert step.steps == {"vae_shard": ResourceStep(segments=tuple(segments))}
     ctx = StepContext(request_ids=rids, graph_walk=GENERATE_WALK, slot=0, capture=False)
-    plan = shard.plan(ResourceStep(segments=tuple(step.segments)), ctx)
+    plan = shard.plan(step.steps["vae_shard"], ctx)
     assert (plan.ranges["tiles"].counts if counts else plan.ranges) == (counts or {})
 
 
 def test_a_decoder_without_a_shard_declares_no_step():
-    from mstar.model.minimax_h3_image.tests.test_model import _tiny_decode_case
-
     vae, config, layout, _ = _tiny_decode_case()
     assert engine_step(H3ImageDecoderSubmodule(vae, config), GENERATE_WALK, ["r0"], [_inputs(layout)]) is None
