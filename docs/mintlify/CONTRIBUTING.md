@@ -1,7 +1,8 @@
 # Mintlify documentation
 
-This directory contains the M* Mintlify site. The existing
-Sphinx source and publishing workflow remain active during migration.
+This directory is the source of the M* guides, published at https://m-star-labs.mintlify.site.
+The Mintlify GitHub App deploys it from `main` on every merge. `.mintignore` keeps this file off
+the site.
 
 ## Preview and validate
 
@@ -11,61 +12,38 @@ Install Node.js 22 LTS, then run from this directory:
 npx --yes mint@4.2.1184 dev
 ```
 
-The preview opens at `http://localhost:3000`. Before submitting changes, run:
+The preview opens at `http://localhost:3000`. Before opening a PR, run:
 
 ```bash
 npx --yes mint@4.2.1184 validate
 npx --yes mint@4.2.1184 broken-links
 ```
 
-The pinned CLI is a documentation tool only; it is not a Python runtime dependency.
+`.github/workflows/docs-mintlify.yml` runs both on every PR that changes this directory. The
+pinned CLI is a documentation tool only; it is not a Python dependency.
 
-## Connect to Mintlify
+## Pages and navigation
 
-1. Create a project at https://www.mintlify.com/start or open an existing project.
-2. Connect the existing GitHub repository `mstar-project/mstar`. Install the Mintlify
-   GitHub App with access to this repository. An organization owner or repository
-   administrator may need to approve the installation.
-3. In Git Settings, choose the production branch (`main` after these files merge).
-4. Enable **docs.json is in a subdirectory** and enter `/docs/mintlify` without a
-   trailing slash. Save the settings.
-5. Check deployment status and open the site's URL from the Mintlify dashboard.
-   The project name determines its `*.mintlify.site` URL; availability is checked
-   during setup.
-6. Add a custom domain in Mintlify when ready. Use the DNS records supplied by the
-   dashboard, then verify the domain and HTTPS before changing public links.
+- A page is one `.mdx` file, and its path without the extension is its URL: `models/qwen.mdx`
+  is `/models/qwen`.
+- `docs.json` lists every page in the sidebar. Add a new page to a group there. When you remove
+  or rename a page, add its old path to `redirects`.
+- The frontmatter has a `title` and a `description`, one sentence saying what the page is for.
+- Every command, flag, config key, environment variable and route on a page exists in the code.
 
-Mintlify's GitHub App publishes updates from the configured branch. The Sphinx
-workflow publishes the existing site independently.
+## Headings and links
 
-Official instructions: [quickstart](https://www.mintlify.com/docs/quickstart),
-[GitHub](https://www.mintlify.com/docs/deploy/github), and
-[subdirectory setup](https://www.mintlify.com/docs/deploy/monorepo).
+- Every `##` and `###` heading has an explicit ID, such as `## Serve {#serve}`. Keep the ID when
+  you reword a heading, so links from other pages and from outside keep working.
+- Link within the site with `/page` or `/page#id`, not with the hostname.
+- Link Python symbols, configs and the design notes in `docs/design/` to their source on GitHub.
+  They are not part of the site.
+- Escape `{` and `<` outside code, and give every fenced code block a language.
 
-## Migration status
+## Python API reference
 
-- Installation, quickstart, architecture, serving, clients, models, speech
-  recognition, metrics, environment variables, evaluation, and model authoring
-  are converted from the corresponding `.rst` guides. The introduction and
-  `reference.mdx` provide the landing page and guide navigation.
-- The generated Python API reference continues to use Sphinx. Migrating narrative
-  pages does not replace the docstring generation pipeline. `api.mdx` links to
-  that reference; Python symbol links in the guides open their source on GitHub.
-- Both copies are maintained manually during migration. There is no automatic
-  RST-to-MDX synchronization.
-
-The `.rst` files remain the canonical sources during this transition. Update a
-guide's `.rst` and `.mdx` files in the same PR when changing overlapping content;
-this rule also appears in the [root contributor guide](../../CONTRIBUTING.md#documentation)
-and [AGENTS.md invariant 9](../../AGENTS.md#9-update-the-documentation). Check code blocks,
-tables, callouts, internal links, and section anchors in the local preview.
-
-Converted headings have explicit IDs, such as `## Metrics {#serving-metrics}`.
-Keep an ID stable when editing a heading so incoming section links continue to
-work. For links within Mintlify, use `/page` or `/page#section-id`.
-
-Follow-ups are automated documentation checks, a decision on generated Python API
-reference hosting, and a public-site cutover. At cutover, update the repository's
-contribution and agent instructions to name the new canonical sources. Retire or
-redirect the old site only after checking the replacement and its API-reference
-coverage.
+Sphinx builds the API reference from docstrings, from `docs/index.rst`, `docs/api.rst` and
+`docs/conf.py`. `.github/workflows/docs.yml` publishes it to the `gh-pages` branch on every push to
+`main` that touches `docs/`, `mstar/` or `pyproject.toml`, and it is served at
+https://m-star.org/mstar/api.html. The navbar links to it. To document a new subpackage, add it to
+the autosummary list in `docs/api.rst`.

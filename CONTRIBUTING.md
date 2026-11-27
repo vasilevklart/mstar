@@ -1,15 +1,12 @@
 # Contributing to M*
 
-Thanks for your interest in M\*! Contributions of all kinds are welcome, and you don't
-need to read a rulebook first.
-
 ## Issues
 
 - **Bug?** Open a [bug report](https://github.com/mstar-project/mstar/issues/new?template=bug_report.yml).
 - **Idea or feature?** Open a [feature request](https://github.com/mstar-project/mstar/issues/new?template=feature_request.yml).
 - **Want a model supported?** Open a [new model request](https://github.com/mstar-project/mstar/issues/new?template=new_model.yml).
 
-General questions are welcome too — a plain issue or an email to <atindra@cs.stanford.edu> is fine.
+General questions are welcome too: open a plain issue or email <atindra@cs.stanford.edu>.
 
 ## Pull requests
 
@@ -27,15 +24,24 @@ The Python HTTP frontend is being retired in favor of the Rust one (`rust/server
 
 ### Documentation
 
-During the Mintlify migration, `docs/*.rst` remains the canonical source. If a guide
-has a counterpart in `docs/mintlify/`, update its `.rst` and `.mdx` files in the
-same PR, including model, resource, installation, and environment-variable changes.
-See [the Mintlify contributor guide](docs/mintlify/CONTRIBUTING.md) for preview and
-validation commands. The generated Python API reference remains on Sphinx.
+The guides are the `.mdx` pages in `docs/mintlify/`, published at https://m-star-labs.mintlify.site
+when they merge to `main`. Update the page your change affects in the same PR. Preview and check
+the site with Node.js 22:
+
+```bash
+cd docs/mintlify
+npx --yes mint@4.2.1184 dev            # preview at http://localhost:3000
+npx --yes mint@4.2.1184 validate
+npx --yes mint@4.2.1184 broken-links
+```
+
+CI runs the last two on every PR that touches `docs/mintlify/`. `docs/*.rst` only builds the
+Python API reference from docstrings (https://m-star.org/mstar/api.html). Page conventions are in
+[docs/mintlify/CONTRIBUTING.md](docs/mintlify/CONTRIBUTING.md).
 
 ### Automated review
 
-A bot posts a review when someone asks for one with a `/review` command on a PR, from a fork or not; it never runs on its own when a PR is opened or pushed to. A contributor (the team, or anyone who has had a PR merged here) can comment `/review light` on their own PR for a light review, and someone with write access can do so on any PR, or, on a PR whose author has write access, comment `/review nogpu` for the nogpu mode, which also reports P3 improvements and design questions, or `/review`, which adds a live GPU test and can approve a PR that meets a fixed rule. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, one graph runtime, documented environment variables) and cites them by number. Light and nogpu reviews are advisory, and a maintainer still reviews your PR. Comment the same command again for a re-review after pushes. Reply to disagree. Details in [.github/review/](.github/review/).
+A bot reviews a PR only when someone comments a `/review` command. Anyone who has had a PR merged here can comment `/review light` on their own PR. Someone with write access can comment `/review light` on any PR, and on a PR whose author has write access, `/review nogpu` (which also reports P3 improvements and design questions) or `/review` (which adds a live GPU test and can approve a PR that meets a fixed rule). The bot cites the invariants in [AGENTS.md](AGENTS.md) by number. Light and nogpu reviews are advisory, and a maintainer still reviews your PR. Comment the same command again to re-review after a push, and reply to disagree. Details are in [.github/review/](.github/review/).
 
 ### AI-assisted contributions
 
@@ -43,95 +49,9 @@ These are welcome, with two conditions: read [AGENTS.md](AGENTS.md) first (point
 
 ### Optional Mac checks
 
-On **Apple Silicon macOS**, you can check your current worktree before
-committing or pushing:
-
-```bash
-./scripts/ci/mac.sh all
-```
-
-This is opt-in: no Git hooks are installed and running it is not a contribution
-requirement. It uses native `linux/arm64` Docker containers. **Passing these Mac
-checks does not establish that the full x86 CPU suite or GPU tests pass.** GitHub
-continues to run the full CPU Core suite on its Ubuntu runners.
-
-#### Setup
-
-You need Git, Python 3, and an ARM Docker engine, such as Docker Desktop or
-Docker with Colima on your Mac. Remote x86 Docker engines are unsupported.
-Colima is not an mstar dependency. Allocate at least **8 GiB
-of VM memory** for the Rust build; validation used 4 CPUs and 8 GiB. Rust release
-linking can exhaust a 2 GiB VM even with one compilation job.
-
-The runner uses your current Docker context. You can select another configured
-context with `DOCKER_CONTEXT=your-context ./scripts/ci/mac.sh all`. It does not
-create, resize, or reconfigure your VM. The initial run downloads images,
-Python packages and Rust dependencies; no GPU or model weights are needed.
-
-This first version supports Apple Silicon macOS with rootful Docker, without
-user-namespace remapping. Intel Macs, other host operating systems and x86
-emulation are outside its supported scope. In particular, setting
-`CI_PLATFORM=linux/amd64` is rejected.
-
-#### Checks and coverage
-
-| Command | Checks |
-| --- | --- |
-| `./scripts/ci/mac.sh lint` | Ruff and runner regression tests |
-| `./scripts/ci/mac.sh cpu-smoke` | ARM-compatible subset of the CPU Core suite |
-| `./scripts/ci/mac.sh dynamo` | Dynamo bridges and registration |
-| `./scripts/ci/mac.sh rust` | Native Rust tests, server/extension builds and Python integration tests |
-
-`all` runs these four checks sequentially and stops at the first failure.
-`cpu-smoke` runs the CPU Core job's test paths without
-the modules listed in [test/cpu-mac-exclude.txt](test/cpu-mac-exclude.txt):
-
-- `test_waypoint_components.py`
-- `test_waypoint_dit.py`
-- `test_flex_attention_resource.py`
-- `test_waypoint_benchmark_videos.py`
-
-The first three invoke compiled FlexAttention, which requires AVX2 with the
-pinned PyTorch CPU implementation (seen with 2.9.1). The video test hits an illegal
-instruction in PyAV 19.0.1 encoding in the tested Apple VM; this also reproduces
-without mstar. The entire modules are excluded,
-including their portable structural cases. The runner prints the exclusions
-and saves the exact pytest arguments in `cpu-smoke-tests.txt` with the
-reports. New core modules are included automatically unless explicitly
-excluded; invalid or stale exclusions fail the check. Existing GPU/optional-feature skips are reported by pytest.
-No test assertions are changed for the Mac runner.
-
-CPU smoke also disables PyTorch's oneDNN backend in its test process: the
-pinned ARM wheel crashes on a standalone BF16 Linear operation in the tested
-Apple VM. BF16 tests still execute through PyTorch's CPU fallback with their
-original assertions. These checks do not cover optimized oneDNN kernels.
-The setting does not affect GitHub or other jobs.
-
-The local installation and check scripts follow the existing GitHub jobs, with
-Python 3.12 and a separate environment for each check. The local image uses
-Debian ARM while GitHub uses Ubuntu x86. Some dependencies and Rust stable are
-unpinned; resolved packages and tool versions are recorded per run. When
-updating CI dependencies, update `scripts/ci/install.sh` and
-`scripts/ci/cpu-torch.txt` alongside `.github/workflows/ci.yml`.
-
-#### Source, reports and caches
-
-The snapshot includes current tracked files and eligible untracked source,
-including uncommitted edits. Untracked ignored files, local environments and
-build outputs are excluded; tracked files are retained. Tests run on copies
-inside disposable containers and do not modify your checkout. This checks the
-working tree, rather than only staged changes or GitHub's PR merge commit.
-
-Logs, timings and pytest reports go to `.ci-results/`. Download and Rust build
-caches use Docker volumes named `mstar-ci-*`. Images and caches remain for later
-runs; containers and temporary snapshots are removed. Ctrl-C also removes the
-active container and retains its logs. There is no automatic local job timeout.
-Rust defaults to two parallel compilation jobs; use `CI_BUILD_JOBS=1` to reduce
-parallelism when needed.
-
-The native Rust server links against the build interpreter's `libpython`.
-When launching the binary separately, make that matching library available to
-the dynamic loader. The local Rust check configures `LD_LIBRARY_PATH` for it.
+On Apple Silicon macOS, `./scripts/ci/mac.sh all` runs lint, part of the CPU Core suite, the Dynamo
+checks and the Rust tests in ARM Linux containers. It is opt-in and does not replace GitHub CI;
+setup and coverage are in [scripts/ci/README.md](scripts/ci/README.md).
 
 ### CPU core tests on GitHub
 
@@ -188,8 +108,9 @@ and recent operations to a failure; rerun one with the node id pytest prints.
 
 ## Adding a model
 
-Start with the [Adding a New Model](https://mstar-project.github.io/mstar/adding_models.html)
-guide — it walks through the component graph, Walks, and the submodule pattern.
+Start with the [Adding a New Model](https://m-star-labs.mintlify.site/adding_models) guide. It
+walks through the component graph, graph walks, the state a model declares and the submodule
+pattern.
 
 By contributing, you agree that your contributions are licensed under the repository's
 [Apache-2.0 license](LICENSE).

@@ -17,24 +17,105 @@
     "groups": [
       {
         "group": "Get started",
-        "pages": ["index", "installation", "quickstart", "reference"]
+        "pages": ["index", "quickstart", "installation", "hardware"]
+      },
+      {
+        "group": "Models",
+        "pages": [
+          "models",
+          {
+            "group": "Text and multimodal chat",
+            "pages": [
+              "models/qwen",
+              "models/glm",
+              "models/command-a-plus",
+              "models/muse-glimmer",
+              "models/ripple",
+              "models/phi4mm",
+              "models/qwen3-omni",
+              "models/minicpm-o",
+              "models/bagel"
+            ]
+          },
+          {
+            "group": "Speech generation and conversation",
+            "pages": [
+              "models/kokoro",
+              "models/orpheus",
+              "models/chatterbox",
+              "models/cosyvoice3",
+              "models/qwen3-tts",
+              "models/fish-s2-pro",
+              "models/voxcpm2",
+              "models/omnivoice",
+              "models/nemotron-voicechat"
+            ]
+          },
+          {
+            "group": "Speech recognition",
+            "pages": [
+              "asr",
+              "models/whisper-qwen-asr",
+              "models/fastconformer-asr",
+              "models/omnilingual-asr",
+              "models/higgs-audio"
+            ]
+          },
+          {
+            "group": "Images, video and world models",
+            "pages": [
+              "models/flux-z-image",
+              "models/cosmos3",
+              "models/wan22",
+              "models/ltx2-5",
+              "models/minimax-h3",
+              "models/world-models"
+            ]
+          },
+          "models/lora"
+        ]
       },
       {
         "group": "User guide",
-        "pages": ["serving", "metrics", "clients", "evaluation"]
+        "pages": [
+          "serving",
+          "clients",
+          "metrics",
+          "cold-start",
+          {
+            "group": "Evaluation",
+            "pages": ["evaluation", "evaluation/compare", "evaluation/full-duplex"]
+          }
+        ]
       },
       {
         "group": "Reference",
-        "pages": ["architecture", "models", "asr", "api", "environment_variables"]
+        "pages": [
+          "reference/cli",
+          "reference/config",
+          "reference/http-api",
+          "environment_variables",
+          "api"
+        ]
       },
       {
-        "group": "Contributing",
-        "pages": ["adding_models"]
+        "group": "Develop",
+        "pages": [
+          "architecture",
+          "adding_models",
+          "contributing/state-contract",
+          "contributing/worked-examples",
+          "contributing/legacy-resources"
+        ]
       }
     ]
   },
+  "redirects": [
+    { "source": "/reference", "destination": "/" }
+  ],
   "navbar": {
     "links": [
+      { "label": "Python API", "href": "https://m-star.org/mstar/api.html" },
       { "label": "GitHub", "href": "https://github.com/mstar-project/mstar" }
     ]
   },

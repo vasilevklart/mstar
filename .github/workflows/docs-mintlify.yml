@@ -1,0 +1,34 @@
+name: Docs (Mintlify)
+
+# Checks the guides in docs/mintlify/ on every pull request that changes them.
+# The Mintlify GitHub App publishes them from main to
+# https://m-star-labs.mintlify.site; this job only validates.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/mintlify/**"
+      - ".github/workflows/docs-mintlify.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: docs/mintlify
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate the site
+        run: npx --yes mint@4.2.1184 validate
+
+      - name: Check internal links
+        run: npx --yes mint@4.2.1184 broken-links

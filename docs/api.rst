@@ -1,21 +1,24 @@
 API Reference
 =============
 
-This reference is generated automatically from the docstrings in each module. It mirrors
-the package layout under ``mstar/``; expand a subpackage to drill down to individual
-modules, classes, and functions.
+Generated from the docstrings in the subpackages listed below. ``mstar.client`` is the Python
+SDK (``from mstar import MStarClient``) and ``mstar.cli`` is the ``mstar`` command
+(``mstar serve``); the rest are the server's internals.
 
 .. note::
 
-   Because the reference is built by importing each module to read its docstrings, the
-   build must run in the project's runtime environment (``pip install -e ".[dev]"`` plus
-   ``docs/requirements.txt``) so that ``torch`` and the other core dependencies are
-   importable. See ``docs/conf.py`` for details.
+   The reference is built by importing each module. The docs job installs CPU-only torch,
+   the base package (``pip install -e .``) and ``docs/requirements.txt``
+   (``.github/workflows/docs.yml``). A module that imports a package outside the base
+   install at module scope, such as ``triton`` or ``transformers``, fails to import and gets
+   no page.
 
 .. autosummary::
    :toctree: _autosummary
    :recursive:
 
+   mstar.client
+   mstar.cli
    mstar.api_server
    mstar.communication
    mstar.conductor

@@ -55,6 +55,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/mstar-project/mstar"
+Documentation = "https://m-star-labs.mintlify.site"
 Repository = "https://github.com/mstar-project/mstar"
 Issues = "https://github.com/mstar-project/mstar/issues"
 
@@ -70,8 +71,8 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 # Deliberately not pinned here: the PyPI release has no
 # `omnivoice.models.omnivoice_flashinfer`, which is the forward this graph
 # calls, so it has to come from git. A direct URL in requires_dist would make
-# PyPI reject the mstar upload, so it is an install step instead — see
-# docs/installation.rst, same as flash-attn.
+# PyPI reject the mstar upload, so it is an install step instead, as
+# flash-attn is: see docs/mintlify/models/omnivoice.mdx.
 omnivoice = []
 command_a_plus = [
     "flashinfer-python==0.7.2",
@@ -101,7 +102,7 @@ metrics = [
     "prometheus-client>=0.20",
 ]
 
-# Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
+# Optional: the eval framework (`python -m benchmark.eval`, docs/mintlify/evaluation.mdx).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
 # builders, compare's media inputs and PSNR checks (PyAV, Pillow) and the
@@ -194,7 +195,7 @@ cosmos3 = [
     "diffusers>=0.39",
     # bs=1 dense attention fast path. The wheel is ABI-tied to the torch/CUDA
     # build; on a mismatch the engine runs the dense pass on FlashInfer's
-    # ragged prefill instead. See docs/models.rst.
+    # ragged prefill instead. See docs/mintlify/models/cosmos3.mdx.
     "fa3-fwd",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
@@ -231,7 +232,7 @@ qwen3_omni = [
 # its 12 Hz speech-tokenizer modules (under transformers 4.57.3 or 5.x), but its
 # metadata pins transformers==4.57.3 and accelerate==1.12.0. No environment that
 # also has diffusers>=0.40 or OmniVoice can satisfy that pin, and installing it
-# into one downgrades huggingface-hub under them. See docs/installation.rst.
+# into one downgrades huggingface-hub under them. See docs/mintlify/models/qwen3-tts.mdx.
 qwen3_tts = [
     "einops",
     "flashinfer-python==0.7.2",
@@ -359,13 +360,13 @@ waypoint = [
     "huggingface-hub",
     "safetensors",
     # TAEHV is installed separately at a pinned revision. PyPI rejects project
-    # metadata containing direct-URL dependencies; see docs/installation.rst.
+    # metadata containing direct-URL dependencies; see docs/mintlify/models/world-models.mdx.
     # Only the reference needs this: world_engine passes pos_ids as a TensorDict,
-    # so the parity tests import it. Serving does not — components/dit.py uses a
+    # so the parity tests import it. Serving does not: components/dit.py uses a
     # NamedTuple to keep tensordict out of the serving path.
     "tensordict==0.10.0",
     # flash-attn-4 (flash_attn.cute, the default flex attention backend) is not
-    # on PyPI; install it separately, see docs/installation.rst.
+    # on PyPI; install it separately, see docs/mintlify/models/world-models.mdx.
 ]
 
 lingbot_world = [
@@ -374,7 +375,7 @@ lingbot_world = [
     # ftfy and regex clean the prompt as the reference's T5 tokenizer does.
     # The engine's ragged attention runs on FlashInfer; flash-attn (FA2 varlen,
     # what the reference attends with under reference_numerics) is installed
-    # separately, see docs/installation.rst.
+    # separately, see docs/mintlify/models/world-models.mdx.
     "accelerate",
     "diffusers>=0.39",
     "einops",
@@ -469,15 +470,16 @@ all = [
     # wan22 (see the [wan22] extra for the rationale; av / diffusers already above)
     "accelerate",
     # waypoint. TAEHV is intentionally installed separately because PyPI rejects
-    # direct-URL dependencies in project metadata; see docs/installation.rst.
+    # direct-URL dependencies in project metadata; see docs/mintlify/installation.mdx.
     "tensordict==0.10.0",
     # lingbot_world: camera trajectory resampling and prompt cleaning
     "scipy",
     "ftfy",
-    # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
-    # separately, see docs/installation.rst.
+    # flash-attn is intentionally omitted (LingBot-World's reference_numerics
+    # needs it, and it has no PyPI wheels): install it separately, see
+    # docs/mintlify/installation.mdx.
     # flash-attn-4 (waypoint's default flex attention backend) is also installed
-    # separately, see docs/installation.rst.
+    # separately, see docs/mintlify/installation.mdx.
     "jiwer",
     # kokoro's G2P (see the [kokoro] extra). The Docker images also install the
     # spaCy tagger it loads, en_core_web_sm.
@@ -488,7 +490,7 @@ all = [
     "soxr",  # see the voxcpm2 extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
-    # See docs/installation.rst.
+    # See docs/mintlify/installation.mdx.
 ]
 
 [tool.setuptools.packages.find]

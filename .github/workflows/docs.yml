@@ -10,9 +10,11 @@ on:
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
-# Builds the Sphinx site and publishes it to this repo's own gh-pages branch,
-# served as a GitHub Pages project page at https://mstar-project.github.io/mstar/.
-# Uses the built-in GITHUB_TOKEN — no deploy key or PAT to own, rotate, or expire.
+# Builds the Sphinx Python API reference and publishes it to this repo's
+# gh-pages branch. GitHub Pages serves it at http://mstar.stanford.edu/mstar/,
+# and mstar-project/m-star-site mirrors it hourly to https://m-star.org/mstar/.
+# The guides are the Mintlify site (docs/mintlify/, docs-mintlify.yml).
+# Uses the built-in GITHUB_TOKEN: no deploy key or PAT to own, rotate, or expire.
 permissions:
   contents: write
 
@@ -34,9 +36,9 @@ jobs:
           # deliberately does not mock torch (PEP 604 annotations break under mocks).
           pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
             --index-url https://download.pytorch.org/whl/cpu
-          # Base install only; GPU-only model extras (flashinfer, transformers, ...)
-          # are not needed for the narrative docs. Modules that import them at module
-          # scope yield autosummary stub pages, which is acceptable for the first site.
+          # Base install only, without the GPU-only model extras (flashinfer,
+          # transformers, ...). A module that imports one of them at module scope
+          # fails to import and gets no API page.
           pip install -e .
           pip install -r docs/requirements.txt
 
