@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 sys.path.insert(0, ".")
 
@@ -80,7 +81,7 @@ def _stub_transfer(monkeypatch):
 
 def _make_manager(
     max_num_pages: int = 16, cpu_offload_pages: int = 16,
-    layout: KVLayout = KVLayout.NHD,
+    layout: KVLayout = KVLayout.NHD, device: str = "cuda",
 ):
     mla = (dict(kv_lora_rank=3, qk_rope_head_dim=1, num_qo_heads=2)
            if layout == KVLayout.MLA else {})
@@ -97,7 +98,7 @@ def _make_manager(
     )
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
-        device=torch.device("cuda"), dtype=torch.float32,
+        device=torch.device(device), dtype=torch.float32,
     )
 
 
@@ -213,6 +214,36 @@ def test_offload_reload_round_trip(layout):
     assert len(stream.page_indices) == 3
     torch.testing.assert_close(_snapshot(mgr, stream.page_indices), expected)
     _assert_pages_conserved(mgr)
+
+
+def test_a_cache_off_cuda_copies_on_its_own_devices_streams(monkeypatch):
+    """The host pool takes its pinning, streams and events from the KV cache's device, not from CUDA: a cache on
+    another device (XPU; the CPU here) offloads, writes ahead and reloads as on CUDA. Before, its first copy raised
+    asking CUDA for a stream."""
+    # a CPU-only torch enters a CUDA stream context as a no-op, which XPU's doesn't
+    monkeypatch.setattr(torch.cuda, "stream", Mock(side_effect=AssertionError("a copy off CUDA entered a CUDA stream")))
+    mgr = _make_manager(device="cpu")
+    pool = mgr._cpu_pool
+    mgr.ingest_request("r0")
+    _grow(mgr, "r0", "main", 3 * PAGE_SIZE)
+    pages = list(_stream(mgr, "r0").page_indices)
+    _paint(mgr, pages, base=1.0)
+    expected = _snapshot(mgr, pages)
+
+    assert mgr.offload("r0") == 3
+    _scribble(mgr)
+    assert mgr.reload("r0") is True
+    torch.testing.assert_close(_snapshot(mgr, _stream(mgr, "r0").page_indices), expected)
+    _assert_pages_conserved(mgr)
+
+    # a write-ahead waits on the copies queued before it, and each queue's event lands
+    page = _stream(mgr, "r0").page_indices[0]
+    pool.copy_out(mgr.kv_cache.tensor, PageCopies(gpu=[page], cpu=[0]))
+    pool.write(mgr.kv_cache.tensor, PageCopies(gpu=[page], cpu=[1]))
+    pool.record_write().synchronize()
+    pool.record().synchronize()
+    pool.sync()
+    torch.testing.assert_close(pool.cpu_kv_cache[:, 1], expected[:, 0])
 
 
 @requires_cuda

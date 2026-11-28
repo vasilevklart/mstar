@@ -61,13 +61,18 @@ class TorchCopier(PageCopier):
     name = "torch"
 
     def copy(self, dst, dst_pages, src, src_pages, stream):
-        with torch.cuda.stream(stream):
+        with _current(stream, dst, src):
             for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
                 dst[:, dst_idx].copy_(src[:, src_idx], non_blocking=True)
 
     def copy_rows(self, dst, src, stream):
-        with torch.cuda.stream(stream):
+        with _current(stream, dst, src):
             dst.copy_(src, non_blocking=True)
+
+
+def _current(stream, dst: torch.Tensor, src: torch.Tensor):
+    """``stream`` made current on the device the copy runs on: whichever of ``src`` and ``dst`` isn't the host."""
+    return torch.get_device_module(src.device if src.device.type != "cpu" else dst.device).stream(stream)
 
 
 class _Layout(NamedTuple):

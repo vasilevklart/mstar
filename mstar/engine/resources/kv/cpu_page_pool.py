@@ -21,6 +21,7 @@ import torch
 from mstar.engine.resources.kv.cache import GroupPages, KVCache, PagedKVConfig, held_pages, on_pages
 from mstar.engine.resources.kv.page_copier import make_page_copier
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
+from mstar.utils.device import DeviceCapability
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.arena import PageArena
@@ -79,7 +80,7 @@ class CPUPagePool:
             *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
             device="cpu",
-            pin_memory=True,
+            pin_memory=DeviceCapability.of(kv_cache.device).pin_memory,
         )
 
         # {request_id: {label: OffloadedStream}}
@@ -89,7 +90,8 @@ class CPUPagePool:
         self.reserved: dict[str, int] = {}
         self._unmoved = 0
 
-        # copies run here so they don't serialize with compute
+        # copies run here so they don't serialize with compute, on streams of the cache's device
+        self._runtime = torch.get_device_module(kv_cache.device)
         self._stream: torch.cuda.Stream | None = None
         self._write_stream: torch.cuda.Stream | None = None
         self._copied_since_write = False
@@ -106,7 +108,7 @@ class CPUPagePool:
 
     def _get_stream(self) -> torch.cuda.Stream:
         if self._stream is None:
-            self._stream = torch.cuda.Stream()
+            self._stream = self._runtime.Stream()
         return self._stream
 
     def is_offloaded(self, rid: str) -> bool:
@@ -258,7 +260,7 @@ class CPUPagePool:
         # The compute stream may still be running the step that last touched
         # these pages (a commit hands pages on right after the launch). Queue
         # the copies behind it, or they could read a page mid-write.
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(self._runtime.current_stream())
         self._copied_since_write = True
         self._copier.copy(self.cpu_kv_cache, copies.cpu, gpu_kv_cache, copies.gpu, stream)
 
@@ -268,13 +270,13 @@ class CPUPagePool:
         stream = self._get_stream()
         # Same ordering as the offload: the device pages we write may have
         # been released by a commit whose kernels are still reading them.
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(self._runtime.current_stream())
         self._copied_since_write = True
         self._copier.copy(gpu_kv_cache, copies.gpu, self.cpu_kv_cache, copies.cpu, stream)
 
     def _get_write_stream(self) -> torch.cuda.Stream:
         if self._write_stream is None:
-            self._write_stream = torch.cuda.Stream()
+            self._write_stream = self._runtime.Stream()
         return self._write_stream
 
     def write(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
@@ -290,13 +292,13 @@ class CPUPagePool:
 
     def record_write(self) -> torch.cuda.Event:
         """An event that completes once every write queued so far has landed."""
-        event = torch.cuda.Event()
+        event = self._runtime.Event()
         event.record(self._get_write_stream())
         return event
 
     def record(self) -> torch.cuda.Event:
         """An event that completes once every copy queued so far has landed."""
-        event = torch.cuda.Event()
+        event = self._runtime.Event()
         event.record(self._get_stream())
         return event
 
@@ -324,7 +326,7 @@ class CPUPagePool:
         a reload the attention kernels read them.
         """
         if self._stream is not None:
-            torch.cuda.current_stream().wait_stream(self._stream)
+            self._runtime.current_stream().wait_stream(self._stream)
 
     def remove_request(self, rid: str) -> None:
         self.unreserve(rid)
