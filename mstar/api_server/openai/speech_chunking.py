@@ -10,8 +10,11 @@ starts the second piece while the first is still streaming (see
 
 from __future__ import annotations
 
+import bisect
 import re
-import unicodedata
+from operator import itemgetter
+
+from mstar.api_server.openai.unicode_marks import MARK_RANGES
 
 # One sentence: a lazy body up to a Latin terminator (with any closing quotes
 # or brackets) that precedes whitespace or the end, a CJK terminator, a
@@ -32,6 +35,19 @@ _SOFT_BREAKS = (
 )
 
 
+def _is_mark(char: str) -> bool:
+    """``unicodedata.category(char).startswith("M")`` in the Unicode version of
+    ``unicode_marks``, the table the Rust frontend reads too. This
+    interpreter's ``unicodedata`` would answer for its own version (CPython
+    3.14 carries 16.0.0, with 51 marks more), and the two frontends would cut
+    long text in different places."""
+    code = ord(char)
+    # the ranges are sorted and disjoint, so the last one starting at or below
+    # `code` is the only one that can hold it
+    after = bisect.bisect_right(MARK_RANGES, code, key=itemgetter(0))
+    return after > 0 and code <= MARK_RANGES[after - 1][1]
+
+
 def _cut_evenly(text: str, max_chars: int) -> list[str]:
     """Near-equal pieces of at most ``max_chars``, none starting on a combining mark."""
     pieces: list[str] = []
@@ -40,7 +56,7 @@ def _cut_evenly(text: str, max_chars: int) -> list[str]:
         left = len(text) - start
         n = -(-left // max_chars)  # pieces still needed
         end = cut = start + -(-left // n)
-        while cut > start and unicodedata.category(text[cut]).startswith("M"):
+        while cut > start and _is_mark(text[cut]):
             cut -= 1
         if cut == start:  # nothing but marks: cut anyway
             cut = end

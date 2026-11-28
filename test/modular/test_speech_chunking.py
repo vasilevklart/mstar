@@ -26,12 +26,13 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
-from mstar.api_server.openai import adapters  # noqa: E402
+from mstar.api_server.openai import adapters, unicode_marks  # noqa: E402
 from mstar.api_server.openai.speech_chunking import split_sentences  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MARK_TABLE = REPO_ROOT / "rust/server/src/unicode_marks.rs"
+PY_MARK_TABLE = REPO_ROOT / "mstar/api_server/openai/unicode_marks.py"
 GENERATOR = REPO_ROOT / "scripts/gen_unicode_marks.py"
 
 LONG_TEXT = (
@@ -108,41 +109,54 @@ def test_max_chars_must_be_positive():
         split_sentences("a. b.", max_chars=0)
 
 
-def test_an_even_cut_lands_where_this_interpreters_unicodedata_puts_it():
-    """A cut that falls on a combining mark moves back off it, so where this
-    input is cut depends on the table the splitter reads: U+0897 is unassigned
-    up to Unicode 15.1.0 and a mark from 16.0.0. The Rust frontend reads a
-    table generated from ``unicodedata`` so that it answers the same way
-    (``rust/server/src/unicode_marks.rs``)."""
-    text = "a" * 267 + "\u0897" + "b" * 533
-    chunks = split_sentences(text, max_chars=400, min_chars=24)
-    moves = unicodedata.category("\u0897").startswith("M")
-    assert [len(c) for c in chunks] == ([266, 268, 267] if moves else [267, 267, 267])
-    assert "".join(chunks) == text
+def test_an_even_cut_lands_where_the_mark_table_puts_it_on_every_python():
+    """A cut that falls on a combining mark moves back off it, so where these
+    inputs are cut depends on the table the splitter reads. U+0898 is a mark in
+    every Unicode version; U+0897 is unassigned up to 15.1.0 and a mark from
+    16.0.0 (CPython 3.14). The splitter reads the Unicode 15.0.0 table the Rust
+    frontend reads too (``unicode_marks``), not this interpreter's
+    ``unicodedata``, so the U+0897 cut does not move on any Python."""
+    for mark, lengths in (("\u0897", [267, 267, 267]), ("\u0898", [266, 268, 267])):
+        text = "a" * 267 + mark + "b" * 533
+        chunks = split_sentences(text, max_chars=400, min_chars=24)
+        assert [len(c) for c in chunks] == lengths, hex(ord(mark))
+        assert "".join(chunks) == text
 
 
-def test_the_rust_mark_table_is_this_interpreters_unicodedata():
-    """The Rust frontend cannot ask ``unicodedata``, so it reads a table
-    generated from it. Both frontends must call the same code points marks, or
-    they cut long text in different places; this fails when a CPython upgrade
-    moves the categories and the table has not been regenerated."""
+def test_both_frontends_read_the_same_mark_table():
+    """The Python frontend reads ``unicode_marks.py`` and the Rust one
+    ``unicode_marks.rs``. Both must call the same code points marks, or they
+    cut long text in different places."""
     source = MARK_TABLE.read_text()
     ranges = [(int(low, 16), int(high, 16))
               for low, high in re.findall(r"\(0x([0-9a-f]+), 0x([0-9a-f]+)\)", source)]
     assert len(ranges) > 100, f"no table parsed out of {MARK_TABLE}"
-    tabled = {code for low, high in ranges for code in range(low, high + 1)}
-    marks = {code for code in range(sys.maxunicode + 1)
-             if unicodedata.category(chr(code)).startswith("M")}
-    disagree = sorted(tabled ^ marks)
+    rust = {code for low, high in ranges for code in range(low, high + 1)}
+    python = {code for low, high in unicode_marks.MARK_RANGES for code in range(low, high + 1)}
+    disagree = sorted(rust ^ python)
     assert not disagree, (
-        f"{len(disagree)} code points disagree with unicodedata "
-        f"{unicodedata.unidata_version} (first {[hex(c) for c in disagree[:8]]}): regenerate "
-        f"with `python {GENERATOR.relative_to(REPO_ROOT)}`, which moves Rust cut points"
+        f"{len(disagree)} code points disagree between the two tables "
+        f"(first {[hex(c) for c in disagree[:8]]}): regenerate both "
+        f"with `python {GENERATOR.relative_to(REPO_ROOT)}`"
     )
-    # and the checked-in file is what the generator writes, so regenerating it
-    # is the whole fix when this does fail
+    # and both files are what the generator writes, so regenerating them is
+    # the whole fix when this does fail
     generator = runpy.run_path(str(GENERATOR))
-    assert source == generator["render"](generator["mark_ranges"]())
+    assert source == generator["render_rust"](ranges)
+    assert PY_MARK_TABLE.read_text() == generator["render_python"](ranges, unicode_marks.UNIDATA_VERSION)
+
+
+@pytest.mark.skipif(
+    unicodedata.unidata_version != unicode_marks.UNIDATA_VERSION,
+    reason=f"the mark table is Unicode {unicode_marks.UNIDATA_VERSION}'s and this "
+           f"interpreter carries {unicodedata.unidata_version}",
+)
+def test_the_mark_table_is_its_unicode_versions_marks():
+    """On an interpreter that carries the table's Unicode version (CPython
+    3.12, which CI runs), the table is exactly that ``unicodedata``'s marks.
+    Other interpreters skip this: the frontends no longer follow them."""
+    generator = runpy.run_path(str(GENERATOR))
+    assert generator["mark_ranges"]() == list(unicode_marks.MARK_RANGES)
 
 
 # ---------------------------------------------------------------------------

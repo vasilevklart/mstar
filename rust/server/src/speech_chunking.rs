@@ -27,9 +27,10 @@ fn is_space(c: char) -> bool {
 /// 15.0.0 on the 3.12 the repository tests on, and on 3.13). `regex`'s `\p{M}`
 /// asks the same question of the crate's own Unicode tables, which are newer
 /// and differ on 51 code points, so the two frontends would cut long text in
-/// different places whenever one of those lands on a cut.
-/// `test/modular/test_speech_chunking.py` compares the table with the running
-/// interpreter's `unicodedata`, over every code point.
+/// different places whenever one of those lands on a cut. The Python frontend
+/// reads the same table (`mstar/api_server/openai/unicode_marks.py`), not the
+/// running interpreter's `unicodedata`, and `test/modular/test_speech_chunking.py`
+/// checks that the two copies hold the same code points.
 fn is_mark(c: char) -> bool {
     let c = c as u32;
     // the ranges are sorted and disjoint, so the last one starting at or below
