@@ -83,7 +83,10 @@ class HiggsAudioModel(DeclaredDecoderModel):
 
         from transformers import AutoFeatureExtractor, AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir)
+        # The checkpoint's config.json maps AutoConfig to repo code, which AutoTokenizer
+        # loads first and, with the flag unset, asks about on stdin. The tokenizer is
+        # Qwen2Tokenizer from tokenizer_config.json either way.
+        self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, trust_remote_code=False)
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(
             self.WHISPER_PROCESSOR_ID, cache_dir=cache_dir,
         )

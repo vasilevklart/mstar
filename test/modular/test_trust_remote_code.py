@@ -5,9 +5,10 @@ Qwen3-Omni, OmniVoice and the Nemotron duplex tokenizer passed
 Qwen3-Omni and Nemotron-H are native in transformers, and ``omnivoice`` is
 registered with AutoConfig by the installed package. MiniCPM-o's tokenizer is
 Qwen2's, in the server and in its benchmark entry, and its processor is
-ported. The mocked tests pin the flag at each call site; the Nemotron and
-MiniCPM-o ones load from a directory whose repo code would leave a marker file
-if it ran.
+ported. Higgs-Audio's tokenizer left the flag unset, so transformers asked
+on stdin. The mocked tests pin the flag at each call site; the Nemotron,
+MiniCPM-o and Higgs-Audio ones load from a directory whose repo code would
+leave a marker file if it ran.
 """
 
 import importlib.util
@@ -214,3 +215,56 @@ def test_minicpm_o_benchmark_tokenizer_without_its_repo_code(monkeypatch, tmp_pa
 
     assert model.get_tokenizer() is not None
     assert not marker.exists()
+
+
+def test_higgs_audio_tokenizer_neither_asks_about_nor_runs_its_config_repo_code(monkeypatch, tmp_path, capsys):
+    """higgs-audio-v3-stt's ``config.json`` maps AutoConfig to repo code, which
+    AutoTokenizer loads before the tokenizer. With the flag unset it asked "Do
+    you wish to run the custom code? [y/N]" on stdin in every process at
+    startup, and a "y" there, typed or a line of whatever stdin was piped in,
+    ran it. Stdin here answers "y"."""
+    import io
+
+    from transformers import AutoFeatureExtractor, AutoTokenizer
+
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+
+    marker = _tokenizer_dir(
+        tmp_path,
+        {"tokenizer_class": "PreTrainedTokenizerFast"},
+        {
+            # the fields HiggsAudioModelConfig reads, and the checkpoint's auto_map
+            "config.json": json.dumps({
+                "model_type": "higgs_audio_3",
+                "auto_map": {"AutoConfig": "configuration_higgs_audio.HiggsAudio3Config"},
+                "text_config": {"model_type": "qwen3", "hidden_size": 128, "num_attention_heads": 4},
+                "audio_encoder_config": {},
+            }),
+            "configuration_higgs_audio.py": (
+                "import pathlib\n"
+                "pathlib.Path(MARKER).write_text('ran')\n"
+                "from transformers import PretrainedConfig\n"
+                "class HiggsAudio3Config(PretrainedConfig):\n"
+                "    model_type = 'higgs_audio_3'\n"
+            ),
+        },
+    )
+    stdin = io.StringIO("y\n")
+    monkeypatch.setattr(sys, "stdin", stdin)
+    loaded, load = [], AutoTokenizer.from_pretrained
+
+    def from_pretrained(*args, **kwargs):
+        loaded.append(load(*args, **kwargs))
+        return loaded[-1]
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", from_pretrained)
+    # the constructor fetches whisper-large-v3's feature extractor next: stop there
+    _patch_from_pretrained(monkeypatch, AutoFeatureExtractor, [], result=_StopLoadError)
+
+    with pytest.raises(_StopLoadError):
+        HiggsAudioModel(str(tmp_path))
+
+    assert loaded[0]("hello world")["input_ids"] == [1, 2]
+    assert not marker.exists()
+    assert stdin.read() == "y\n", "the loader read stdin"
+    assert "custom code" not in capsys.readouterr().out
