@@ -6,6 +6,7 @@ import sys
 import types
 
 import pytest
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -77,13 +78,18 @@ def test_every_rank_agrees_on_backend(tmp_path, fails, expected):
         assert leaked == "", f"rank {rank} kept {leaked}"
 
 
+# init_allreduce_fusion puts its zero residual on torch.accelerator.current_accelerator(),
+# which a CUDA build names even when CUDA_VISIBLE_DEVICES="" hides every GPU. A CPU-only
+# build has none and allocates on the CPU, so CPU Core still runs this test.
+@pytest.mark.skipif(
+    torch.accelerator.current_accelerator() is not None and not torch.accelerator.is_available(),
+    reason="needs the accelerator this torch was built for, or a build without one",
+)
 def test_a_shared_group_keeps_a_workspace_per_width_and_dtype(monkeypatch):
     """Two lockstep nodes of one instance share its group, and each sets up
     fusion for its own width and dtype. Each input takes the workspace built
     for its (dtype, hidden); one with none, or longer than its workspace,
     takes NCCL. A larger max_tokens that fails to build keeps the smaller."""
-    import torch
-
     built, used = [], []
 
     def create(group, max_tokens, hidden, dtype):
