@@ -1,0 +1,92 @@
+---
+title: "Upgrading to 0.3.0"
+description: "What breaks when a deployment, a client or out-of-tree model code moves from M* 0.2.1 to 0.3.0, and what to do about each change."
+---
+
+0.3.0 has many breaking changes since 0.2.1. This page lists the ones that need action, in the order you meet them: installing and starting the server, sending requests, comparing outputs, editing configs, and porting model code kept outside the repository. A source install of `main` already has all of them.
+
+## Install and runtime {#install-and-runtime}
+
+- **Serving needs the compiled `mstar_rust` extension.** The Python graph runtime and the pyzmq control mesh are gone, so `MSTAR_RUST_ZMQ` no longer selects anything and pyzmq is no longer a dependency. Remove `MSTAR_RUST_ZMQ` from your environment, and install pyzmq yourself if your own code imports `zmq`. On Linux x86_64 or aarch64 with CPython 3.12 to 3.14, `pip install -U mstar-ai` installs a wheel that carries the extension and `mstar-server`. Anywhere else pip installs a pure-Python wheel that imports but cannot serve; build the Rust parts from a checkout as [Installation](/installation#rust) shows.
+- **An extension of another version is refused at startup.** The extension is now version 0.2.0, and every process checks `mstar_rust.__version__` before it joins the control mesh. `maturin develop` installs a checkout's build as its own `mstar-rust` package, which shadows the wheel's copy. If you built one before, rebuild it, or run `pip uninstall mstar-rust` to use the wheel's copy. The error names the file that loaded and prints both commands. In a checkout, workers also refuse an extension built from other `rust/` sources ([Installation](/installation#rust)).
+- **`mstar serve` serves HTTP from `mstar-server`, not uvicorn and FastAPI.** `mstar serve` looks for the binary before anything loads and stops if none is usable. From a checkout, build it with `cargo build --release --manifest-path rust/server/Cargo.toml`, or point `MSTAR_SERVER_BIN` at one. `--rust-frontend` is still accepted and does nothing. The old frontend stays behind `--python-frontend`, which is deprecated and will be removed.
+- **Exit codes changed.** `mstar serve` exits with code 3 when `mstar-server` exits with an error (a crash, a kill or a lost port) and with code 1 when a worker or the conductor dies. A stop by SIGINT exits 0. Check process supervision that relied on uvicorn's exit behavior.
+- **`mstar-server` started by hand needs `MSTAR_OPENAI_ADAPTER`.** `mstar serve` sets it to the class name of the model's OpenAI adapter. If you launch the binary yourself without it, the OpenAI routes that run the model (chat, audio, images, videos and realtime transcription) answer 404, and only `/generate` serves it.
+- **Dependency floors moved.** torch is now `>=2.10,<2.13`, with torchvision `>=0.25` and torchaudio `>=2.10,!=2.11.1`. flashinfer-python is pinned to `==0.7.2` in most extras; `minicpm_o`, `cosyvoice3`, `voxcpm2` and `lingbot_world` take `>=0.6.14`. The `qwen3_omni` and `all` extras need transformers `>=5.18`. The core install needs datasets `>=3`, starlette `>=1.3.1`, h11 `>=0.16` and python-multipart `>=0.0.31`. Extras that list them need mooncake-transfer-engine `>=0.3.13.post1`, Pillow `>=12.3` and, where pinned, av `>=19`. Building from source needs setuptools `>=78.1.1`, which matters for `--no-build-isolation` installs. Upgrade the torch stack first. An environment that shares a different flashinfer pin, such as a vLLM or SGLang install, needs its own venv.
+- **The CUDA Docker images use torch 2.10 on CUDA 13**, which needs an NVIDIA r580 or newer driver. The Dockerfile's header lists the build arguments for an r570 host. The CUDA image builds `mstar_rust` but not `mstar-server`, so serve from it with `--python-frontend` ([Docker](/installation#docker)).
+- **qwen-tts left the `qwen3_tts` and `all` extras.** For Qwen3-TTS, also run `uv pip install --no-deps "qwen-tts==0.1.1"`; the CUDA images already do ([Manual installs](/installation#manual-installs)).
+- **Checkpoint loading is stricter.** Qwen3-Omni, OmniVoice and the Nemotron VoiceChat tokenizer load with `trust_remote_code=False`. The weight loader refuses a checkpoint that declares a quantization or holds quantized weight parts (FP8 scales, packed int4, AWQ or GPTQ); 0.2.1 loaded such checkpoints and served wrong output. GLM-5.2 and GLM-5.3-Flash still load their FP8 checkpoints. Point every other model at its unquantized (BF16) weights.
+- **Shared memory and IPC changed.** The SHM tensor transport always uses the shared-memory arena, sized from the free space in `/dev/shm`. The `MSTAR_SHM_ARENA` switch is gone; the `MSTAR_SHM_ARENA_*` sizing variables stay ([Environment variables](/environment_variables#communication)). Give containers more than Docker's default 64 MB of `/dev/shm` (`--shm-size`, or `--ipc=host`); with too little, tensors go through slower per-tensor files.
+- **Transport files are namespaced per launch.** The API server mints a `MSTAR_DEPLOYMENT_TOKEN` for each launch. Processes you start separately, rather than from one `mstar serve`, must all get the same token, and a new one for each launch.
+- **The default IPC socket prefix moved.** Both `mstar serve` and `mstar-serve` now default to `/tmp/mstar_<user>_<port>/` (0.2.1 used `/tmp/mstar_<user>/` and `/tmp/mstar`). Pass `--socket-path-prefix` if your tooling expects the old path.
+
+## Requests and responses {#requests-and-responses}
+
+- **Media can't name server files, and remote URLs are off by default.** A media reference must be a `data:` URL or an upload; a plain path or any other scheme is a 400 on both frontends. Remote `http(s)` URLs, which 0.2.1 fetched by default in chat messages, are refused unless the server sets `MSTAR_ALLOW_REMOTE=1`. With fetching on, a host that resolves to a loopback, private, link-local or cloud-metadata address is refused unless `MSTAR_REMOTE_ALLOWED_HOSTS` lists it, and once that variable is set, only the hosts it lists are fetched. A fetch follows at most 3 redirects, takes at most 30 s and reads at most `MSTAR_REMOTE_MAX_BYTES` (64 MiB). Send media as `data:` URLs or multipart uploads ([Environment variables](/environment_variables#serving-rust-frontend)).
+- **Size limits are on by default.** Raise a variable if your traffic needs more:
+
+  | Limit | Default | Over it | Variable |
+  |---|---|---|---|
+  | Request body (`/v1/audio/transcriptions` still takes 512 MiB uploads) | 128 MiB | 413 | `MSTAR_MAX_BODY_MB` |
+  | `n` on `/v1/images/generations` | 1 to 10 | 400 | `MSTAR_MAX_IMAGES_PER_REQUEST` |
+  | Decoded pixels of a request's images | 89,478,485 | 400 | `MSTAR_MAX_IMAGE_PIXELS` |
+  | Decoded pixels of a request's videos | 1,073,741,824 | 400 | `MSTAR_MAX_VIDEO_PIXELS` |
+  | Images, audio clips and videos in one request | 16 | 400 | `MSTAR_MAX_MEDIA_FILES` |
+  | Decoded seconds of a request's audio | 3,600 | 400 | `MSTAR_MAX_AUDIO_SECONDS` |
+
+  Images are read as PNG, JPEG, WebP or GIF. BMP and TIFF are a 400 except on FLUX.2 klein, LingBot-World and MiniMax-H3; convert them to PNG or JPEG.
+- **Validation is stricter on every route** (`/generate`, `/generate/ws` and `/v1/*`, on both frontends). An out-of-range or wrongly typed knob gets a 400 that names it, instead of being ignored or clamped. A string that spells a number, such as `"0.7"`, is read as that number. `repetition_penalty`, `min_p` or another penalty on a model whose sampler lacks it is a 400. A body that fails its schema is a 400, not a 422. A refused streaming request gets its real status instead of a 200 with an in-band error, so stream headers now arrive with the first token. Handle error statuses before reading a stream. [Generation parameters](/clients#generation-parameters) lists the rules.
+- **Fields that 0.2.1 dropped silently are now a 400.** On chat: `n` above 1, `stop`, `logprobs`, `top_logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `stop_token_ids`, `best_of` above 1, and a `response_format` other than `{"type": "text"}`. On image and video routes: a `response_format` other than `b64_json`, and `n` above 1 on `/v1/images/edits` and `/v1/videos/generations`. `/v1/images/edits` also refuses a mask or a second image. Off values such as `n: 1`, `stop: null`, `logprobs: false` and `tools: []` still pass. Remove these fields or send their off values.
+- **Chat completions refuse roles and tool calls they can't serve.** A message role other than `system`, `developer`, `user` or `assistant` is a 400, and so is a request that asks for tool calls. `tools` with `tool_choice: "none"` still passes. Replies no longer end with the token that stopped them.
+- **Output length is exact and checked.** `max_tokens`, `max_completion_tokens` and `max_new_tokens` fold into `max_output_tokens`. A request whose length, or prompt plus length, does not fit the model's context is a 400 instead of being cut short. `max_output_tokens: N` now gives N tokens; most models gave N+1. Cap `max_tokens` at the context length minus the prompt rather than sending a large number to mean "unlimited", and drop any client-side trimming of the extra token.
+- **`request_id` has rules.** A client-supplied `request_id` is at most 128 characters from `[A-Za-z0-9._:-]`, and reusing the id of a request still in flight is a 409.
+- **`/generate` takes forms only.** A JSON body is a 400; 0.2.1 submitted it as an empty request. Send `multipart/form-data` or urlencoded fields. A `/generate/ws` message may be as large as `MSTAR_MAX_BODY_MB`, or the config's `ws_max_message_mb` where set.
+- **Server faults reach clients without their text.** An unexpected error reaches the client as `internal error (error id <id>)`, and the server log holds the full error under that id. Deliberate refusals keep their message. Every media loader answers an upload it can't decode with a 400. Key on the HTTP status and the error id, not on error text.
+- **Streamed PCM speech has no header.** `/v1/audio/speech` with `stream: true` and `response_format: "pcm"` sends bare 16-bit PCM as `audio/pcm`, without a WAV header. Read raw PCM, or ask for `wav`.
+- **Long transcriptions run as parallel windows.** Whisper and Qwen3-ASR cut a long upload into 30 s windows and transcribe them at once. Send `long_form="sequential"` (Whisper) or `window_seconds=1200` (Qwen3-ASR) in `extra_body` for the 0.2.1 behavior. For a model that reports no timestamps, `verbose_json`, `srt` and `vtt` return one segment per window.
+
+## Outputs that change on purpose {#outputs}
+
+Re-baseline golden outputs after the upgrade. These changes are deliberate:
+
+- **Unset knobs take the checkpoint's `generation_config.json`.** BAGEL and Orpheus keep their own defaults. Each sampler of a request derives its own seed from the request's seed, and BAGEL prompts render per role. Set knobs explicitly where you relied on 0.2.1's defaults.
+- **The prefix cache is on by default,** BAGEL and Orpheus included; above one TP rank only with `prefix_cache_tp: true`. A cache hit can change an output slightly. For bit-reproducible output, send `prefix_cache: false` in the request's `model_kwargs`, or set `prefix_cache: false` on the KV pool under the config's `resources`.
+- **pi0.5 inputs follow openpi.** `pi05_droid` serves `lerobot/pi05_droid` and takes openpi's DROID inputs: two cameras, exterior then wrist, and a state of the 7 joint positions plus the gripper, not an end-effector pose. Base pi0.5's inputs now match openpi's too, so its actions change.
+- **Cosmos3 image-to-video center-crops the conditioning image** (`conditioning_resize: aspect_crop`). Set `conditioning_resize: stretch` in `model_kwargs` for the 0.2.1 behavior.
+- **Qwen3-Omni starts streamed audio after 12 codec frames instead of 25** (`codec_chunk_schedule: [12, 13]`). Playback stalls unless the Talker runs at least 1.5x real time over its first 50 frames; `codec_chunk_schedule: []` restores 25-frame first chunks.
+- **Wan 2.2 compiles its DiT only for the sizes in `compile_dit_sizes`,** by default the 1280x704x81 clip; other sizes run eager. List the sizes you serve as `"WxHxF"`. A request whose height x width x frames exceeds `max_video_pixels` (default 268,435,456) is a 400.
+- **Async scheduling is on by default for parallel nodes** (TP, SP and CFG). `tp_async_sched: false` in the config, or `MSTAR_TP_ASYNC_SCHED=0`, turns it off. The sampler's in-graph scatter is on too, so a node admits at most `sampler_slots` (4096) requests at once and later ones wait; `knobs: {sampler_ingraph_scatter: false}` turns it off ([knobs](/reference/config#knobs)).
+- **`autocast_dtype` can't turn autocast on.** A config whose `autocast_dtype` is not `null` for a model that runs without autocast stops at startup; drop the key or set it to `null`.
+
+## Config, environment and logging {#config}
+
+- **CUDA graph names became accelerator graph names.** The old variables are no longer read and the old Python names no longer import. Cosmos3 logs a leftover `cuda_graph:` key as ignored and keeps capturing.
+
+  | 0.2.1 | 0.3.0 |
+  |---|---|
+  | `cuda_graph:` in Cosmos3's `model_kwargs` | `accelerator_graph:` |
+  | `MSTAR_VIT_CUDA_GRAPH` | `MSTAR_VIT_ACCELERATOR_GRAPH` |
+  | `MSTAR_VIT_CG_BATCH_SIZES` | `MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES` |
+  | `COSMOS3_DISABLE_CUDA_GRAPH` | `COSMOS3_DISABLE_ACCELERATOR_GRAPH` |
+  | `COSMOS3_DISABLE_PREFILL_CUDA_GRAPH` | `COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH` |
+  | `mstar.engine.cuda_graph_config` | `mstar.engine.accelerator_graph_config` |
+  | `mstar.engine.cuda_graph_runner` | `mstar.engine.accelerator_graph_runner` |
+  | `CudaGraphConfig` | `AcceleratorGraphConfig` |
+  | `get_cuda_graph_configs` | `get_accelerator_graph_configs` |
+
+- **Prefill capture ladders moved to one top-level key,** `prefill_token_buckets: {<node>: {<walk or region>: [...]}}` ([prefill_token_buckets](/reference/config#prefill-token-buckets)). A config that still sets `prefill_token_buckets`, `prefill_batched_token_buckets`, `backbone_token_buckets` or `lm_prefill_token_buckets` under `model_kwargs` fails to load with a pointer to the new key. BAGEL's ViT ladder, `MSTAR_VIT_CG_TOKEN_BUCKETS` in 0.2.1, is now `prefill_token_buckets: {vit_encoder: {vit_block_loop: [...]}}`, and the variable is ignored without a warning. Cosmos3's `COSMOS3_PREFILL_CAPTURE_TOKENS` is now `prefill_token_buckets: {dit: {prefill: [...]}}`; the server logs a warning when the variable is set.
+- **Two VAE variables are gone.** `COSMOS3_VAE_DECODE_FP32` and `WAN22_VAE_DECODE_FP32` are no longer read. The Wan VAE that Cosmos3, Wan 2.2 and LingBot-World decode with picks its dtype itself: bf16 on CUDA from cuDNN 9.16 on, fp32 with an older cuDNN, and bf16 on ROCm.
+- **Lockstep ranks must be ascending.** A `node_groups` entry whose lockstep instance lists its ranks out of order, such as `ranks: [1, 0]` with `tp_size: 2`, fails the startup check.
+- **Per-request log lines moved to DEBUG.** The submitted, queued, admitted, done and torn-down lines now log at DEBUG on the `mstar.requests` logger, and the conductor logs a summary at INFO once a minute. `MSTAR_LOG_REQUESTS=1` brings the lines back at any `--log-level`, for dashboards or scripts that parse them.
+
+## Out-of-tree model code {#model-code}
+
+Port a custom model package with [Adding models](/adding_models), then start it once: declarations that 0.2.1 accepted and then served wrong now fail at startup.
+
+- Models declare their state on the State Contract (`mstar.engine.state`) and plan their steps with `walk_plan` ([State Contract](/contributing/state-contract)).
+- `request_kwargs()` declares the `model_kwargs` keys a model reads. A request with any other key is served, and the key is logged as ignored.
+- Per-request submodule state is keyed by the integer `fwd_info.rid_handle`, not the `request_id`.
+- `KVConfig` is abstract; use `PagedKVConfig` or `RingKVConfig`.
+- Values in `model_kwargs` and request metadata must be plain data, since pickle is off the control-plane wire. Other Python objects raise `WireError`, and tensors travel as tensor inputs.
+- `SamplerSpec.enable_repetion_penalty` is now `enable_repetition_penalty`, with no alias.
+- `capture_batch_sizes=[]` on a capture config now captures nothing; pass `None` for the runner's defaults.

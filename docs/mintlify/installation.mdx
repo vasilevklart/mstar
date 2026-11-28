@@ -70,6 +70,8 @@ uv pip install --torch-backend=auto "mstar-ai[bagel]"
 
 The distribution is `mstar-ai`; the import package is `mstar`. PyPI has 0.2.1, whose wheels have neither `mstar_rust` nor `mstar-server`, and its `mstar serve` knows 14 of the 61 model keys. Install from source until a newer release is out. The alias names `mstar-project` and `mstar-serve` forward only some extras, so install `mstar-ai`.
 
+Coming from 0.2.1? [Upgrading to 0.3.0](/upgrading) lists what breaks for a deployment, a client or out-of-tree model code, and what to do about each change.
+
 An installed package ships the default configs in `mstar/default_configs/`.
 
 ## Extras {#extras}

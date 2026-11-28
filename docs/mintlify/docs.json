@@ -17,7 +17,7 @@
     "groups": [
       {
         "group": "Get started",
-        "pages": ["index", "quickstart", "installation", "hardware"]
+        "pages": ["index", "quickstart", "installation", "upgrading", "hardware"]
       },
       {
         "group": "Models",
