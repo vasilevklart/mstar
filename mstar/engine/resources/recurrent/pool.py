@@ -43,6 +43,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import H2DMirror, PinnedStager
 
 if TYPE_CHECKING:
@@ -369,8 +370,9 @@ class RecurrentStatePool(Resource):
                 f"for a step that declared {rows.num_rows}"
             )
         # index_copy_ needs int64: cast once per step, not per block and layer. A capture
-        # records its own cast, so a replay recomputes it from that replay's plan.
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        # records its own cast, so a replay recomputes it from that replay's plan. The pool's device says whether
+        # one is running: CUDA can't see an XPU capture.
+        capturing = DeviceCapability.of(self._device).is_capturing()
         index = rows.scatter_index.get(capturing)
         if index is None:
             index = rows.scatter_index[capturing] = rows.slot_indices[: rows.num_rows].long()

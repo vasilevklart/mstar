@@ -25,6 +25,7 @@ from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentS
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep, Entry, TensorType, Value
 from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs
+from mstar.utils.device import DeviceCapability
 
 MAX_SLOTS = 6  # 5 usable, slot 0 is the sink
 SHAPE = (2, 8)
@@ -180,6 +181,31 @@ def test_replay_buffers_are_static_per_bucket_and_capture_slot():
     step, ctx = eager(["a"])
     ptrs.add(plan(pool, step, ctx).slot_indices.data_ptr())
     assert len(ptrs) == 3, "capture slots 0 and 1 and the eager path each have their own buffers"
+
+
+def test_a_capture_on_any_device_scatters_with_its_own_cast_of_the_index(monkeypatch):
+    """`scatter_` asks the pool's device whether a graph capture is running, not CUDA. Warmed up and captured over
+    one addressing, as the CUDA case below does, a capture that reused the warm-up's int64 copy of the slot indices
+    would record a tensor no replay rewrites: on XPU every replay would scatter each row to the sink the capture
+    addressed. The CPU stands in for that device here."""
+    pool = build_pool()
+    step, ctx = replay([], bs=4, capture=True)
+    plan(pool, step, ctx)
+    indices: list[torch.Tensor] = []
+    index_copy_ = torch.Tensor.index_copy_
+
+    def recorded(self, dim, index, source):
+        indices.append(index)
+        return index_copy_(self, dim, index, source)
+
+    monkeypatch.setattr(torch.Tensor, "index_copy_", recorded)
+    advance(pool, torch.zeros(4, *SHAPE))  # the warm-up, eager
+    warm = {id(index) for index in indices}
+    indices.clear()
+    monkeypatch.setattr(DeviceCapability, "is_capturing", lambda self: True)
+    advance(pool, torch.zeros(4, *SHAPE))  # the capture
+    assert indices, "the capture scattered nothing"
+    assert not warm & {id(index) for index in indices}, "the capture scattered with the warm-up's cast of the index"
 
 
 def test_padding_rows_read_and_write_only_the_sink():
