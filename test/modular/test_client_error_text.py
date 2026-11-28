@@ -401,14 +401,15 @@ def _rss_mib() -> float:
         return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
 
 
-def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_error_id(
-    monkeypatch, tmp_path, caplog,
-):
+def _post_a_frontend_decode_failure(monkeypatch, tmp_path, *, ffmpeg_missing: bool):
     """A header longer than the model's window makes the frontend decode the
-    upload (``WindowPlanner.prepare``). When that decode fails with an
-    unexpected error, here the FFmpeg fallback naming the saved upload as
-    torchcodec does, the client gets an error id and the upload is deleted."""
+    upload (``WindowPlanner.prepare``); libsndfile loses sync, and the FFmpeg
+    fallback fails naming the saved upload, as torchcodec does. Whose fault
+    that is turns on whether this process has FFmpeg
+    (``media_limits.decoding_upload``), so it is pinned here, not read from
+    the host. Returns the response and the path the fallback saw."""
     from mstar.api_server import media_io
+    from mstar.model import media_limits
 
     seen = []
 
@@ -417,17 +418,45 @@ def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_erro
         raise RuntimeError(f"Could not open input file: {path} ({SECRET})")
 
     monkeypatch.setattr(media_io, "decode_torchcodec_capped", ffmpeg_fails)
+    monkeypatch.setattr(
+        media_limits, "ffmpeg_unavailable",
+        lambda: "it found no FFmpeg shared libraries" if ffmpeg_missing else None,
+    )
     response = _openai_client(monkeypatch, "whisper_large", tmp_path).post(
         "/v1/audio/transcriptions", files={"file": ("lecture.flac", _corrupt_flac(40))},
     )
 
     assert len(seen) == 1, "the frontend decode did not run"
-    assert response.status_code == 500
     _assert_clean(response.text)
     assert SECRET not in response.text and "lecture" not in response.text
-    message = response.json()["error"]["message"]
-    assert seen[0] in _logged(caplog, _error_id(message)).getMessage()
     assert os.listdir(tmp_path) == []
+    return response, seen[0]
+
+
+def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_error_id(
+    monkeypatch, tmp_path, caplog,
+):
+    """With no FFmpeg in the process the failed decode is the server's fault
+    (#395): the client gets an error id, the log has the path under it, and
+    the upload is deleted."""
+    response, path = _post_a_frontend_decode_failure(monkeypatch, tmp_path, ffmpeg_missing=True)
+
+    assert response.status_code == 500
+    message = response.json()["error"]["message"]
+    assert message.startswith("internal error (error id ")
+    assert path in _logged(caplog, _error_id(message)).getMessage()
+
+
+def test_a_transcription_ffmpeg_refuses_in_the_frontend_answers_400_without_the_path(monkeypatch, tmp_path):
+    """With FFmpeg there, the same failure is FFmpeg refusing the file, the
+    client's fault (#395): a 400 that names neither the path nor the
+    decoder's text, and the upload is deleted."""
+    response, _ = _post_a_frontend_decode_failure(monkeypatch, tmp_path, ffmpeg_missing=False)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "could not decode the audio: the file is corrupt or truncated, or not a format this server reads"
+    )
 
 
 @pytest.mark.parametrize("name,payload", [
