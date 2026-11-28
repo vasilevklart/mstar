@@ -93,7 +93,7 @@ Read by the model's media loaders in the data worker, behind either frontend. Th
 
 | Variable | Default | Meaning |
 |----|----|----|
-| `MSTAR_MAX_IMAGE_PIXELS` | `89478485` | Pixels a request's images may decode to, checked from each header before decoding; over it, a 400. PNG, JPEG, WebP and GIF are read (FLUX.2 klein also reads BMP and TIFF); other formats get a 400. A GIF or animated WebP is read as its first frame, turned upright by its EXIF orientation. |
+| `MSTAR_MAX_IMAGE_PIXELS` | `89478485` | Pixels a request's images may decode to, checked from each header before decoding; over it, a 400. PNG, JPEG, WebP and GIF are read (FLUX.2 klein, LingBot-World and MiniMax-H3 also read BMP and TIFF); other formats get a 400. A GIF or animated WebP is read as its first frame, turned upright by its EXIF orientation. |
 | `MSTAR_MAX_VIDEO_PIXELS` | `1073741824` | Pixels a request's videos may decode to, summed over the frames the model decodes, each frame counting as at least 64x64; over it, a 400. At 1080p30 the default allows about 17 s of video on Cosmos3, which decodes every frame, and about 259 s on Qwen3-Omni and Qwen3.5, which decode 2 frames a second. |
 | `MSTAR_MAX_MEDIA_FILES` | `16` | Images, audio clips and videos one request may attach together; more get a 400 before any is decoded. Some models take fewer: Qwen3-TTS, Chatterbox, Whisper and Higgs Audio take one audio clip. |
 | `MSTAR_MAX_AUDIO_SECONDS` | `3600` | Seconds a request's audio may decode to, checked from each header and again while decoding; over it, a 400. |
